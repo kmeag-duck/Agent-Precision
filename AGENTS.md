@@ -27,6 +27,20 @@ The `anthropic` SDK honors both env vars, so no workflow code changes are requir
 
 The shim script is expected at `~/argo-shim-lite/claude-argo-proxy.py` (override with `ARGO_PROXY_SCRIPT=...`); it depends on `aiohttp`. The reference implementation this was modeled on lives at `~/Agentic-Mixed-Precision-Demo/run-argo.sh`.
 
+### Or: skip the SSH tunnel by using the local argo-proxy on :52675
+
+`argo-proxy serve` (the same daemon OpenCode's `provider.argo` already depends on) natively serves `/v1/messages` at `http://127.0.0.1:52675/v1/`. The Anthropic SDK can talk to it directly — no SSH tunnel, no per-session Duo prompt:
+
+```bash
+export ANTHROPIC_BASE_URL=http://127.0.0.1:52675/v1/
+export ANTHROPIC_AUTH_TOKEN=$USER   # any non-empty string; argo-proxy ignores it
+python -m workflow.run test-kernels/kokkos/mixed/nbody_force.cpp
+```
+
+Prereq: `argo-proxy serve` is running (check: `curl -sf http://127.0.0.1:52675/health`).
+
+Use `scripts/run-argo.sh` instead only when `argo-proxy` isn't installed on this host — that script's SSH tunnel + `claude-argo-proxy.py` shim is a self-contained fallback. Both paths terminate at the same upstream Argo service.
+
 ## Architecture (don't redesign this)
 
 - `workflow/registry.py` — `AGENTS` dict is the single source of truth for agent types. Each entry = `{system_prompt, output_schema, model}`. **Adding a new agent type = one new entry here, nothing else changes.**
@@ -38,13 +52,13 @@ Rejecting (`n`) returns `{"status": "rejected_by_user"}` to the orchestrator so 
 
 ## Model names look wrong but aren't (verify before changing)
 
-`registry.py` and `orchestrator.py` both hardcode `claude-opus-4-8`. See `orchestrator-model.txt` for context — the author deliberately picked this string. Do not "fix" it to a more familiar id without confirming the deployment actually exposes a different name.
+`registry.py` and `orchestrator.py` both hardcode `claude-opus-4-7`. See `orchestrator-model.txt` for context — the author deliberately picked this string. Do not "fix" it to a more familiar id without confirming the deployment actually exposes a different name.
 
 ## opencode.json has a trailing comment block
 
 `opencode.json` ends with `}/*  ...notes... */` (lines ~596–618). It is technically not valid JSON; opencode tolerates it. If you edit this file, preserve or remove that block cleanly — do not blindly close it, and do not let an auto-formatter touch the file.
 
-The `provider.argo` config in `opencode.json` is for OpenCode itself (it routes through a different local Argo gateway — `apiproxy` on `:52675`, OpenAI-compatible). It is unrelated to `scripts/run-argo.sh`, which routes the Python workflow's Anthropic SDK through `claude-argo-proxy.py` on `:8083`. Don't conflate the two proxies.
+The `provider.argo` config in `opencode.json` points at `argo-proxy` on `:52675` and uses its OpenAI route. The workflow can share that same daemon via its Anthropic route (see "Or: skip the SSH tunnel" above). `scripts/run-argo.sh` is a separate path entirely — it talks to `claude-argo-proxy.py` on `:8083` and only exists as a fallback for hosts where `argo-proxy` isn't installed. Don't conflate the two proxies; they speak different protocols on different ports.
 
 ## test-kernels/
 
@@ -56,7 +70,7 @@ Argonne-specific: opens an SSH tunnel through `logins.cels.anl.gov` → `homes.c
 
 ## No verifier yet
 
-The orchestrator can `spawn_rewriter` → `finish` without anyone checking correctness. Adding a verifier agent is the documented next step (`orchestrator-model.txt:107`). If you add one, follow the registry pattern — don't bypass `run_agent`.
+The orchestrator can `spawn_rewriter` → `finish` without anyone checking correctness. Adding a verifier agent is the next planned step. If you add one, follow the registry pattern: one new entry in `AGENTS`, one new tool on the orchestrator, no edits to `run_agent`.
 
 ## Conventions
 
