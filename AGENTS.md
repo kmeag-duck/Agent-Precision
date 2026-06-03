@@ -2,6 +2,8 @@
 
 Research prototype: an LLM orchestrator that rewrites numerical kernels (Kokkos C++ / CUDA) to lower-precision where safe. Single Python package (`workflow/`), Anthropic SDK, no build system, no tests, no CI.
 
+**The author is building this in deliberate baby steps as a learning exercise** in agent orchestration and tool-calling. Resist the urge to add abstractions, frameworks, or features that haven't been explicitly requested. Prefer the smallest concrete change that answers the immediate question. When in doubt, ask before expanding scope.
+
 ## Run
 
 ```bash
@@ -27,19 +29,17 @@ The `anthropic` SDK honors both env vars, so no workflow code changes are requir
 
 The shim script is expected at `~/argo-shim-lite/claude-argo-proxy.py` (override with `ARGO_PROXY_SCRIPT=...`); it depends on `aiohttp`. The reference implementation this was modeled on lives at `~/Agentic-Mixed-Precision-Demo/run-argo.sh`.
 
-### Or: skip the SSH tunnel by using the local argo-proxy on :52675
-
-`argo-proxy serve` (the same daemon OpenCode's `provider.argo` already depends on) natively serves `/v1/messages` at `http://127.0.0.1:52675/v1/`. The Anthropic SDK can talk to it directly — no SSH tunnel, no per-session Duo prompt:
+### Or: use the local argo-proxy on :52675 (no SSH tunnel, no Duo)
 
 ```bash
-export ANTHROPIC_BASE_URL=http://127.0.0.1:52675/v1/
-export ANTHROPIC_AUTH_TOKEN=$USER   # any non-empty string; argo-proxy ignores it
-python -m workflow.run test-kernels/kokkos/mixed/nbody_force.cpp
+./scripts/run-argoproxy.sh test-kernels/kokkos/mixed/nbody_force.cpp
 ```
 
-Prereq: `argo-proxy serve` is running (check: `curl -sf http://127.0.0.1:52675/health`).
+`argo-proxy serve` (the same daemon OpenCode's `provider.argo` depends on) natively exposes an Anthropic-compatible `/v1/messages` route at `http://127.0.0.1:52675/v1/`. The wrapper just `curl`s `/health`, then runs `python -m workflow.run` with `ANTHROPIC_BASE_URL=http://127.0.0.1:52675/v1/` and `ANTHROPIC_AUTH_TOKEN=$USER` (any non-empty string; argo-proxy ignores it).
 
-Use `scripts/run-argo.sh` instead only when `argo-proxy` isn't installed on this host — that script's SSH tunnel + `claude-argo-proxy.py` shim is a self-contained fallback. Both paths terminate at the same upstream Argo service.
+Prereq: `argo-proxy serve` is already running. argo-proxy has persistent auth set up at pipx-install time, so there's no per-session Duo prompt.
+
+Use `scripts/run-argo.sh` instead only when `argo-proxy` isn't installed on this host — that script's SSH tunnel + `claude-argo-proxy.py` shim is a self-contained fallback. Both paths terminate at the same upstream Argo service, but they are **not** interchangeable for model ids: `argo-proxy` normalizes model names before forwarding, while `claude-argo-proxy.py` is a transparent forwarder. The id Argo's `/v1/messages` upstream actually accepts is `claude-opus-4-7` (hyphen, no prefix); see "Model names look wrong but aren't" below.
 
 ## Architecture (don't redesign this)
 
@@ -52,13 +52,13 @@ Rejecting (`n`) returns `{"status": "rejected_by_user"}` to the orchestrator so 
 
 ## Model names look wrong but aren't (verify before changing)
 
-`registry.py` and `orchestrator.py` both hardcode `claude-opus-4-7`. See `orchestrator-model.txt` for context — the author deliberately picked this string. Do not "fix" it to a more familiar id without confirming the deployment actually exposes a different name.
+`registry.py` and `orchestrator.py` both hardcode `claude-opus-4-7` (hyphen, no prefix). This is what the upstream Argo `/v1/messages` endpoint actually accepts — verified empirically. Do not "fix" it to a more familiar id (e.g. `claude-opus-4.7`, `argo:claude-opus-4.7`, `claude-opus-4-20250514`) without testing against the real backend first. The `:52675` `argo-proxy` is forgiving and normalizes several variants; the `:8083` `claude-argo-proxy.py` shim is a transparent forwarder and will pass any string straight to Argo, which then rejects unknown ids with HTTP 400. The current id works on both paths.
 
 ## opencode.json has a trailing comment block
 
 `opencode.json` ends with `}/*  ...notes... */` (lines ~596–618). It is technically not valid JSON; opencode tolerates it. If you edit this file, preserve or remove that block cleanly — do not blindly close it, and do not let an auto-formatter touch the file.
 
-The `provider.argo` config in `opencode.json` points at `argo-proxy` on `:52675` and uses its OpenAI route. The workflow can share that same daemon via its Anthropic route (see "Or: skip the SSH tunnel" above). `scripts/run-argo.sh` is a separate path entirely — it talks to `claude-argo-proxy.py` on `:8083` and only exists as a fallback for hosts where `argo-proxy` isn't installed. Don't conflate the two proxies; they speak different protocols on different ports.
+The `provider.argo` config in `opencode.json` points at `argo-proxy` on `:52675` and uses its OpenAI route. The workflow can share that same daemon via its Anthropic route (see "Or: use the local argo-proxy on :52675" above). `scripts/run-argo.sh` is a separate path entirely — it talks to `claude-argo-proxy.py` on `:8083` and only exists as a fallback for hosts where `argo-proxy` isn't installed. Don't conflate the two proxies; they speak different protocols on different ports.
 
 ## test-kernels/
 
