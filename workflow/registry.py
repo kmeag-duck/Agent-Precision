@@ -58,6 +58,6 @@ AGENTS = {
     "rewriter": {
         "system_prompt": REWRITER_SYSTEM_PROMPT,
         "output_schema": REWRITER_OUTPUT_SCHEMA,
-        "model": "claude-opus-4-7",
+        "model": "claude-opus-4.7",
     },
 }

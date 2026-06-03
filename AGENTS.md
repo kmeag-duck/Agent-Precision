@@ -52,7 +52,7 @@ Rejecting (`n`) returns `{"status": "rejected_by_user"}` to the orchestrator so 
 
 ## Model names look wrong but aren't (verify before changing)
 
-`registry.py` and `orchestrator.py` both hardcode `claude-opus-4-7`. See `orchestrator-model.txt` for context — the author deliberately picked this string. Do not "fix" it to a more familiar id without confirming the deployment actually exposes a different name.
+`workflow/registry.py:61` (rewriter `model` field) and `workflow/orchestrator.py:19` (`ORCHESTRATOR_MODEL`) both pin `claude-opus-4.7` — dot, not hyphen. Verified against the live `/v1/models` endpoint on the local `argo-proxy`. The two constants are intentionally separate so the orchestrator can be repinned independently of the per-agent model; keep them in sync by convention. Do not "fix" the id without re-checking `/v1/models` on the target backend.
 
 ## opencode.json has a trailing comment block
 
