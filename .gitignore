@@ -7,3 +7,6 @@ orchestrator-model.txt
 # python
 __pycache__/
 *.pyc
+
+# argo-proxy failure dumps (regenerated on each upstream error)
+error_dumps/
