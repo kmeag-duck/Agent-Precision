@@ -1,0 +1,9 @@
+# scratch notes
+orchestrator-model.txt
+
+# secrets
+.env
+
+# python
+__pycache__/
+*.pyc
