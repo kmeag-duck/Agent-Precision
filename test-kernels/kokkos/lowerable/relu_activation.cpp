@@ -1,9 +1,4 @@
-// ReLU: y(i) = max(0, x(i)).
-//
-// Verdict: LOWERABLE to float (often even fp16/bf16 in ML practice).
-// Why: pure pointwise selection; no arithmetic that can lose precision.
-// Suggested test: x ~ N(0, 1), N = 1<<20. Tolerance: exact match for x > 0,
-// exact zero otherwise.
+// ReLU activation: y(i) = max(0, x(i)).
 
 #include <Kokkos_Core.hpp>
 

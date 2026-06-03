@@ -1,35 +1,6 @@
-// Direct-summation gravitational N-body: per-particle force from all others,
-// then symplectic-Euler kick + drift. Source is all-double; the table below
-// is what a correct per-variable rewriter should land on.
-//
-// Per-variable verdicts:
-//   x, y, z          (positions)             MUST stay double. Pairs of distant
-//                                            bodies subtract positions of
-//                                            magnitude ~box_size to produce
-//                                            displacements of magnitude
-//                                            ~interparticle spacing —
-//                                            catastrophic cancellation in float.
-//   m                (mass)                   FLOAT OK — bounded, no accumulation.
-//   vx, vy, vz       (velocities)             FLOAT OK for short integrations;
-//                                            stay double for long runs. The
-//                                            position update dt*v is still
-//                                            performed in double regardless.
-//   dx, dy, dz       (pairwise deltas)        FLOAT OK — these *are* the small
-//                                            differences; their dynamic range
-//                                            is set by interparticle spacing.
-//   r2, inv_r, inv_r3, s   (derived)          FLOAT OK once eps > 0 regularizes
-//                                            the singularity.
-//   ax, ay, az       (per-i force accumulator) MUST stay double. The net force
-//                                            is the small residual of large,
-//                                            opposing per-neighbor pulls;
-//                                            float accumulator loses the
-//                                            cancellation entirely.
-//   G, eps, eps2, dt (scalar parameters)      FLOAT OK.
-//
-// Verdict: MIXED.
-// Suggested test: Plummer sphere, N = 1<<14, eps = 1e-3, dt = 1e-3,
-// n_steps = 1000. Compare per-particle radius and velocity magnitude to an
-// all-double reference; require rtol = 1e-4.
+// Direct-summation gravitational N-body step: per-particle force from all
+// others (softened: F_i = sum_{j!=i} G*m_j*(r_j-r_i) / (|r_j-r_i|^2 + eps^2)^{3/2}),
+// then symplectic-Euler kick + drift.
 
 #include <Kokkos_Core.hpp>
 #include <cmath>

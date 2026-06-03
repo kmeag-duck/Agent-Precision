@@ -1,35 +1,5 @@
-// Lennard-Jones pair-force kernel. O(N^2) for simplicity; a real MD code would
-// iterate a neighbor list, but the precision question is orthogonal to that.
+// Lennard-Jones pair force (O(N^2), all-pairs):
 //   F_i = sum_{j != i, r<rcut} 24*eps * (2*(sigma/r)^12 - (sigma/r)^6) / r^2 * (r_j - r_i)
-//
-// Per-variable verdicts:
-//   x, y, z         (positions)               MUST stay double. Same argument
-//                                             as N-body: pairwise differences
-//                                             subtract nearby coordinates.
-//   xi, yi, zi      (per-i local copies)      MUST stay double (it's a
-//                                             position).
-//   dx, dy, dz      (pairwise deltas)         FLOAT OK after the subtraction.
-//   r2, inv_r2,
-//   inv_r6, inv_r12, fmag (derived locals)    FLOAT OK — bounded after the
-//                                             r < rcut filter; LJ force is
-//                                             well-conditioned once short-
-//                                             range overlaps are excluded.
-//   fxi, fyi, fzi   (per-i force accumulator) MUST stay double. Net force on
-//                                             an atom is the small residual
-//                                             of many opposing neighbor pulls;
-//                                             this is the cancellation-prone
-//                                             sum.
-//   fx_out, fy_out, fz_out (output force arrays)
-//                                             MUST stay double (downstream
-//                                             integration accumulates these
-//                                             into velocity over many steps).
-//   sigma, epsilon, rcut2, s2 (scalar params) FLOAT OK.
-//
-// Verdict: MIXED.
-// Suggested test: 32^3 LJ fluid (N = 32768) at reduced density 0.8,
-// rcut = 2.5 * sigma, configuration relaxed for 1000 NVE steps before
-// measurement. Compare per-particle force vector to an all-double reference;
-// require rtol = 1e-4.
 
 #include <math.h>
 

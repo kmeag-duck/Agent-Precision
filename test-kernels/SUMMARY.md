@@ -1,5 +1,10 @@
 # Test Kernel Verdicts — Quick Reference
 
+This file is the **sole** location for precision labels and tolerances. The
+kernel source files under `test-kernels/` are deliberately unannotated so the
+workflow must decide from code alone. Use this file only for **evaluating**
+orchestrator output; never feed it into prompts.
+
 Ground-truth labels for the 17 test kernels under `test-kernels/`. Source is
 always all-`double` (or `long double`); the verdict is what a correct
 precision-lowering rewriter should produce, and the tolerance is the bar an
@@ -18,7 +23,7 @@ ground-truth label — the workflow must decide from file content, not paths.
 | `kokkos/lowerable/vector_add.cpp`     | `z = x + y` (pointwise)                  | `x, y ~ U(-1, 1)`, `N = 1<<20`     | `rtol = 1e-6` |
 | `kokkos/lowerable/saxpy_bounded.cpp`  | `y = a*x + y`, bounded `a`, `x`, `y`     | `a = 2.5`, `x, y ~ U(-1, 1)`, `N = 1<<20` | `rtol = 1e-6` |
 | `kokkos/lowerable/relu_activation.cpp`| `y = max(0, x)`                           | `x ~ N(0, 1)`, `N = 1<<20`         | exact (no arithmetic loss) |
-| `cuda/lowerable/vector_add.cu`        | `z = x + y` (pointwise)                  | `x, y ~ U(-1, 1)`, `N = 1<<20`     | `rtol = 1e-6` |
+| `cuda/lowerable/vector_add.cu`        | `z = x + y` (pointwise)                  | `x, y ~ U(-1, 1)`, `N = 1<<20`, `block = 256` | `rtol = 1e-6` |
 | `cuda/lowerable/saxpy.cu`             | `y = a*x + y`, bounded                    | `a = 2.5`, `x, y ~ U(-1, 1)`, `N = 1<<20` | `rtol = 1e-6` |
 | `cuda/lowerable/sigmoid.cu`           | `y = 1 / (1 + exp(-x))`                   | `x ~ U(-10, 10)`, `N = 1<<20`      | `rtol = 1e-5` |
 
@@ -33,12 +38,12 @@ magnitudes bounded. Per-element relative error is bounded by `ulp(float)` ≈
 | File | Computes | Failure mode in float | Test inputs | Tolerance |
 |---|---|---|---|---|
 | `kokkos/needs_precision/naive_sum_reduce.cpp`     | `sum(x)` with `x(i) = 1/sqrt(i+1)`         | per-thread accumulator saturates; tail terms below `ulp` of partial sum | `N = 1<<23`                           | `rtol = 1e-4` vs Kahan ref |
-| `kokkos/needs_precision/two_pass_variance.cpp`    | `var = E[x²] - E[x]²`                      | catastrophic cancellation when mean ≫ spread | `x ~ U(1e6, 1e6 + 1)`, `N = 1<<20`   | absolute err < 0.01 vs Welford ref |
+| `kokkos/needs_precision/two_pass_variance.cpp`    | `var = E[x²] - E[x]²` (intentionally the unsafe formulation; Welford is the correct fix) | catastrophic cancellation when mean ≫ spread | `x ~ U(1e6, 1e6 + 1)`, `N = 1<<20`, true var ≈ 0.0833 | absolute err < 0.01 vs Welford ref |
 | `kokkos/needs_precision/euler_oscillator.cpp`     | Forward-Euler SHO, many steps              | per-step roundoff accumulates → phase/amplitude drift | `dt = 1e-4`, `n_steps = 1e6`, `N = 1<<14` | per-particle abs err < 1e-3 |
-| `kokkos/needs_precision/chebyshev_long_double.cpp`| `T_n(x)` recurrence (host, long double)    | recurrence amplifies roundoff exponentially | `x = 1 - 1e-3*U(0,1)`, `n = 10000`, `N = 1<<16` | `rtol = 1e-3` vs long-double ref |
-| `cuda/needs_precision/harmonic_sum.cu`            | `sum 1/i` via per-thread chunks            | accumulator scale grows; tail terms vanish | `N = 1<<27`, `per_thread = 1024`     | `rtol = 1e-5` vs Kahan ref |
-| `cuda/needs_precision/mandelbrot_zoom.cu`         | Mandelbrot escape-time at deep zoom        | pixel coords below `ulp(float)` of center → banding | center `(-0.7436..., 0.1318...)`, `scale = 1e-7`, `512×512` | ≥95% of pixels match exactly |
-| `cuda/needs_precision/orbit_integrator.cu`        | Symplectic-Euler Kepler orbit              | trajectory roundoff → orbit opens or spirals | `r = (1, 0)`, `v = (0, 1)`, `dt = 1e-3`, `n_steps = 1e6` | `rtol = 1e-3` on final radius |
+| `kokkos/needs_precision/chebyshev_long_double.cpp`| `T_n(x)` recurrence (host-only, long double; `long double` is not a portable Kokkos device type, hence `RangePolicy<Kokkos::Serial>` on `HostSpace`) | recurrence amplifies roundoff exponentially; at `n = 10000` float yields O(1) errors, double loses ~10 digits, long double retains ~14 | `x = 1 - 1e-3*U(0,1)`, `n = 10000`, `N = 1<<16` | `rtol = 1e-3` vs long-double ref |
+| `cuda/needs_precision/harmonic_sum.cu`            | `sum 1/i` via per-thread chunks (partials reduced on host) | accumulator scale grows; tail terms vanish | `N = 1<<27`, `per_thread = 1024`, `blockDim = 256` | `rtol = 1e-5` vs Kahan ref |
+| `cuda/needs_precision/mandelbrot_zoom.cu`         | Mandelbrot escape-time at deep zoom        | pixel coords below `ulp(float)` of center → banding; below ~`1e-15` even double fails (needs double-double) | center `(-0.7436..., 0.1318...)`, `scale = 1e-7`, `512×512`, `max_iter = 1000` | ≥95% of pixels match exactly |
+| `cuda/needs_precision/orbit_integrator.cu`        | Symplectic-Euler Kepler orbit; host driver calls kernel `n_steps` times | trajectory roundoff → orbit opens or spirals | `r = (1, 0)`, `v = (0, 1)` (vary slightly per index), `N = 1<<14`, `dt = 1e-3`, `n_steps = 1e6` | `rtol = 1e-3` on final radius |
 
 Common patterns: serial accumulation of many small terms; catastrophic
 cancellation of nearby values; long-trajectory roundoff accumulation;
@@ -83,6 +88,8 @@ for float.
 **Test:** 64³ grid, 1e6 particles uniformly distributed, origin at `(1e6, 1e6, 1e6)`. Per-cell `rtol = 1e-5`, total integrated charge `rtol = 1e-10`.
 
 ### `cuda/mixed/lj_pair_force.cu` — Lennard-Jones pair force
+
+Implemented O(N²) for simplicity; a real MD code would iterate a neighbor list, but the precision question is orthogonal to that.
 
 | Variable | Verdict |
 |---|---|

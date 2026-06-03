@@ -1,9 +1,4 @@
 // Sigmoid activation: y[i] = 1 / (1 + exp(-x[i])).
-//
-// Verdict: LOWERABLE to float (and routinely run in fp16/bf16 in ML).
-// Why: output is bounded in (0, 1); the exp itself is well-conditioned for
-// |x| <= 20 or so. Float gives ~ulp(float) relative error across the range.
-// Suggested test: x ~ U(-10, 10), N = 1<<20. rtol = 1e-5.
 
 #include <math.h>
 

@@ -1,43 +1,6 @@
 // Cloud-in-cell (CIC) charge deposition for a particle-in-cell code. Each
 // particle deposits its charge into the 8 surrounding grid cells in 3D,
 // weighted by trilinear factors derived from its fractional cell offset.
-//
-// Per-variable verdicts:
-//   px, py, pz   (particle positions)          MUST stay double. Computing the
-//                                              fractional offset requires
-//                                              subtracting the cell base
-//                                              position from the particle
-//                                              position; float would lose
-//                                              sub-cell resolution once the
-//                                              grid origin is far from zero.
-//   xp, yp, zp   (positions in cell units,
-//                 = (p - origin) * dx_inv)     MUST stay double for the same
-//                                              reason; the subtraction has
-//                                              already happened by float would
-//                                              still have lost bits if applied
-//                                              earlier.
-//   ix, iy, iz   (integer cell indices)        int.
-//   fx, fy, fz   (fractional offsets in [0,1]) FLOAT OK — bounded by
-//                                              construction.
-//   wx[2], wy[2], wz[2]   (1D CIC weights)     FLOAT OK — in [0, 1].
-//   w            (3D weight = wx*wy*wz*qp)     FLOAT OK.
-//   qp           (per-particle charge)         FLOAT OK — bounded.
-//   rho(i,j,k)   (grid charge density)         MUST stay double. Many particles
-//                                              deposit into the same cell —
-//                                              this is the classic naive-sum
-//                                              accumulator problem, made worse
-//                                              by atomic contention masking
-//                                              ordering.
-//   dx_inv, origin_{x,y,z}                     dx_inv FLOAT OK; the origin
-//                                              MUST stay double (it is the
-//                                              quantity being subtracted from
-//                                              positions).
-//
-// Verdict: MIXED.
-// Suggested test: 64^3 grid, 1e6 particles uniformly distributed, origin far
-// from zero (e.g. (1e6, 1e6, 1e6)). Compare per-cell rho and the total
-// integrated charge to an all-double reference; require rtol = 1e-5 per cell
-// and rtol = 1e-10 on the total.
 
 #include <Kokkos_Core.hpp>
 
