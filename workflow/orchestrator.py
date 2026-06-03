@@ -16,7 +16,7 @@ import anthropic
 
 from .run_agent import run_agent
 
-ORCHESTRATOR_MODEL = "claude-opus-4.7"
+ORCHESTRATOR_MODEL = "claude-opus-4-7"
 
 ORCHESTRATOR_SYSTEM_PROMPT = """You are the orchestrator of a small workflow
 whose goal is to rewrite a numerical kernel to use lower precision (typically
