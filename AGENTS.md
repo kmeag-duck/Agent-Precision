@@ -75,6 +75,6 @@ The orchestrator can `spawn_rewriter` → `finish` without anyone checking corre
 ## Conventions
 
 - No linter, formatter, or typecheck configured. Don't invent commands; ask before adding tooling.
-- Layer 1 tests (workflow plumbing) live in `tests/`; run with `python -m pytest -q`. They monkeypatch `anthropic.Anthropic` and make zero network calls. There is no Layer 2 (agent-judgment) evaluation harness yet.
+- Layer 1 tests (workflow plumbing) live in `tests/`; run with `python -m pytest -q` for a terse pass/fail, or `python -m pytest -v` to see each test's docstring appended to its node id as a self-describing checklist (a `pytest_collection_modifyitems` hook in `tests/conftest.py` does the appending). They monkeypatch `anthropic.Anthropic` and make zero network calls. There is no Layer 2 (agent-judgment) evaluation harness yet.
 - Python 3.10+ (uses `dict | None`).
 - Keep agent system prompts in `registry.py`, not scattered. Keep orchestrator prompt in `orchestrator.py`.

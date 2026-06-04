@@ -8,11 +8,13 @@ from .conftest import FakeResponse, TextBlock, ToolUseBlock
 
 
 def test_unknown_agent_type_raises():
+    """run_agent rejects an unknown agent type with ValueError."""
     with pytest.raises(ValueError, match="Unknown agent type"):
         run_agent("nonexistent", "task")
 
 
 def test_returns_submit_result_input(fake_anthropic):
+    """run_agent returns the input dict of the agent's submit_result call and forces the submit_result schema."""
     payload = {
         "variables": [
             {"name": "x", "action": "lower", "target_precision": "float", "reason": "bounded"},
@@ -41,6 +43,7 @@ def test_returns_submit_result_input(fake_anthropic):
 
 
 def test_raises_when_agent_does_not_call_submit_result(fake_anthropic):
+    """run_agent raises RuntimeError if the agent returns text instead of calling submit_result."""
     fake_anthropic([
         FakeResponse(
             content=[TextBlock(text="I refuse to call the tool.")],
@@ -53,11 +56,11 @@ def test_raises_when_agent_does_not_call_submit_result(fake_anthropic):
 
 
 def test_ignores_non_submit_result_tool_use(fake_anthropic):
-    """If the agent calls some other tool first, only submit_result counts.
+    """run_agent matches the response block by name, skipping unrelated text blocks before submit_result.
 
     In practice the only tool available is submit_result, but the runner's
     loop iterates content blocks and matches by name, so verify it actually
-    matches by name rather than just picking the first tool_use.
+    matches by name rather than just picking the first non-text block.
     """
     payload = {"rewritten_code": "code", "summary_of_changes": "changes"}
     fake_anthropic([

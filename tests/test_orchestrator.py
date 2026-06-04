@@ -35,17 +35,20 @@ def _scripted_input(monkeypatch, answers):
 
 @pytest.mark.parametrize("choice", ["y", "n", "q"])
 def test_hitl_returns_each_choice(monkeypatch, choice):
+    """_hitl_pause returns y, n, or q exactly as the user typed it."""
     _scripted_input(monkeypatch, [choice])
     assert _hitl_pause("spawn_analyst", {"kernel_source": "..."}) == choice
 
 
 def test_hitl_loops_on_invalid_then_accepts(monkeypatch):
+    """_hitl_pause re-prompts on invalid input and then accepts a valid choice."""
     _scripted_input(monkeypatch, ["maybe", "", "Y", "y"])
     # uppercase Y is accepted (the code lowercases input)
     assert _hitl_pause("spawn_rewriter", {"task_prompt": "..."}) == "y"
 
 
 def test_hitl_accepts_uppercase(monkeypatch):
+    """_hitl_pause accepts uppercase choices by lowercasing the input."""
     _scripted_input(monkeypatch, ["Q"])
     assert _hitl_pause("finish", {"rewritten_code": "x", "notes": "y"}) == "q"
 
@@ -54,11 +57,13 @@ def test_hitl_accepts_uppercase(monkeypatch):
 
 
 def test_execute_tool_unknown_raises(monkeypatch):
+    """_execute_tool raises ValueError on an unknown tool name."""
     with pytest.raises(ValueError, match="Unknown tool"):
         _execute_tool("not_a_tool", {})
 
 
 def test_execute_tool_dispatches_spawn_analyst(monkeypatch):
+    """_execute_tool routes spawn_analyst to run_agent('analyst', kernel_source) and wraps the result."""
     calls = []
 
     def stub_run_agent(type_, task):
@@ -77,6 +82,7 @@ def test_execute_tool_dispatches_spawn_analyst(monkeypatch):
 
 
 def test_execute_tool_dispatches_spawn_rewriter(monkeypatch):
+    """_execute_tool routes spawn_rewriter to run_agent('rewriter', task_prompt) and wraps the result."""
     calls = []
 
     def stub_run_agent(type_, task):
@@ -96,6 +102,7 @@ def test_execute_tool_dispatches_spawn_rewriter(monkeypatch):
 
 
 def test_run_orchestrator_happy_path(monkeypatch, fake_anthropic):
+    """run_orchestrator drives analyst -> rewriter -> finish end-to-end with HITL approvals."""
     # Three orchestrator turns: spawn_analyst, spawn_rewriter, finish.
     fake = fake_anthropic([
         FakeResponse(
@@ -164,6 +171,7 @@ def test_run_orchestrator_happy_path(monkeypatch, fake_anthropic):
 def test_run_orchestrator_rejection_feeds_back_sentinel(
     monkeypatch, fake_anthropic
 ):
+    """A HITL 'n' rejects the tool call without invoking run_agent and feeds {'status':'rejected_by_user'} back to the orchestrator."""
     fake = fake_anthropic([
         # Turn 1: orchestrator proposes spawn_analyst — user rejects.
         FakeResponse(
@@ -210,6 +218,7 @@ def test_run_orchestrator_rejection_feeds_back_sentinel(
 
 
 def test_run_orchestrator_quit_returns_none(monkeypatch, fake_anthropic):
+    """A HITL 'q' aborts the loop, skips run_agent, and returns None."""
     fake_anthropic([
         FakeResponse(
             content=[ToolUseBlock(
@@ -235,6 +244,7 @@ def test_run_orchestrator_quit_returns_none(monkeypatch, fake_anthropic):
 def test_run_orchestrator_stop_without_tool_returns_none(
     monkeypatch, fake_anthropic
 ):
+    """If the orchestrator responds with text only (no tool_use), run_orchestrator returns None."""
     fake_anthropic([
         FakeResponse(
             content=[TextBlock(text="I am just going to say words.")],

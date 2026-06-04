@@ -8,6 +8,10 @@ responses; every call to `client.messages.create(...)` pops the next one.
 
 The scripted responses are plain duck-typed objects, not `anthropic.types.*`
 instances, so the tests do not pin a particular SDK version.
+
+This conftest also installs a `pytest_collection_modifyitems` hook that
+appends each test's docstring first line to its displayed node id, so
+`python -m pytest -v` reads as a self-describing checklist.
 """
 
 from dataclasses import dataclass, field
@@ -63,6 +67,24 @@ class FakeAnthropic:
     @classmethod
     def with_responses(cls, responses: list) -> "FakeAnthropic":
         return cls(messages=FakeMessages(responses=list(responses)))
+
+
+def pytest_collection_modifyitems(items):
+    """Append each test's docstring first line to its displayed node id.
+
+    With `-v`, pytest prints node ids like
+    `tests/test_x.py::test_foo[param]`. We append ` -- <docstring>` so the
+    output reads as a self-describing checklist of what each test covers.
+    Tests without docstrings are left untouched.
+    """
+    for item in items:
+        doc = (getattr(item, "obj", None).__doc__ or "").strip()
+        if not doc:
+            continue
+        first_line = doc.splitlines()[0].strip()
+        if not first_line:
+            continue
+        item._nodeid = f"{item._nodeid} -- {first_line}"
 
 
 @pytest.fixture
