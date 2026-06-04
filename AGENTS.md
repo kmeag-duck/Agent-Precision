@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Research prototype: an LLM orchestrator that rewrites numerical kernels (Kokkos C++ / CUDA) to lower-precision where safe. Single Python package (`workflow/`), Anthropic SDK, no build system, no tests, no CI.
+Research prototype: an LLM orchestrator that rewrites numerical kernels (Kokkos C++ / CUDA) to lower-precision where safe. Single Python package (`workflow/`), Anthropic SDK, no build system, no CI.
 
 **The author is building this in deliberate baby steps as a learning exercise** in agent orchestration and tool-calling. Resist the urge to add abstractions, frameworks, or features that haven't been explicitly requested. Prefer the smallest concrete change that answers the immediate question. When in doubt, ask before expanding scope.
 
@@ -8,7 +8,7 @@ Research prototype: an LLM orchestrator that rewrites numerical kernels (Kokkos 
 
 ```bash
 set -a; source .env; set +a            # .env is NOT auto-loaded
-pip install -r requirements.txt        # only dep: anthropic>=0.40.0
+pip install -r requirements.txt        # runtime: anthropic; dev: pytest
 python -m workflow.run <kernel_file>   # e.g. test-kernels/kokkos/mixed/nbody_force.cpp
 ```
 
@@ -74,6 +74,7 @@ The orchestrator can `spawn_rewriter` → `finish` without anyone checking corre
 
 ## Conventions
 
-- No tests, linter, formatter, or typecheck configured. Don't invent commands; ask before adding tooling.
+- No linter, formatter, or typecheck configured. Don't invent commands; ask before adding tooling.
+- Layer 1 tests (workflow plumbing) live in `tests/`; run with `python -m pytest -q`. They monkeypatch `anthropic.Anthropic` and make zero network calls. There is no Layer 2 (agent-judgment) evaluation harness yet.
 - Python 3.10+ (uses `dict | None`).
 - Keep agent system prompts in `registry.py`, not scattered. Keep orchestrator prompt in `orchestrator.py`.
