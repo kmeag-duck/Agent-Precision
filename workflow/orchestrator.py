@@ -22,6 +22,12 @@ from .run_agent import run_agent
 
 ORCHESTRATOR_MODEL = "claude-opus-4-7"
 
+# Hard upper bound on orchestrator API turns per run. The HITL pause is the
+# primary safety net (the user can press 'q' at any time); this constant is a
+# backstop so a misbehaving orchestrator loop cannot run indefinitely if
+# left unattended.
+MAX_TURNS = 20
+
 ORCHESTRATOR_SYSTEM_PROMPT = """You are the orchestrator of a small
 workflow whose goal is to rewrite a numerical kernel to use lower precision
 (typically double -> float) for variables where it is safe, while keeping
@@ -32,7 +38,7 @@ You are a router and guardrail, not a numerics expert. Do not decide
 per-variable precision yourself — that is the analyst's job. Your job is
 to call the right agent at the right time and assemble their outputs.
 
-You have access to two specialist agents:
+You have access to three specialist agents:
   - analyst: takes a kernel's source and returns a structured per-variable
     verdict ({name, action: lower|keep, target_precision, reason}) plus
     overall notes.
@@ -40,6 +46,11 @@ You have access to two specialist agents:
     kernel. It will only change variables the prompt tells it to change,
     so the prompt must contain both the kernel source and the analyst's
     verdict in a form the rewriter can act on.
+  - verifier: takes the original source, the rewritten source, and the
+    analyst's verdict (as a JSON string), and returns
+    {verdict: accept|reject, per_variable: [...], concerns: [...]}.
+    It checks faithfulness of the rewrite to the verdict; it does not
+    re-judge whether the verdict was numerically correct.
 
 You also have a finish tool to emit the final answer.
 
@@ -51,10 +62,19 @@ Your job:
    each variable, what should happen to its precision. Do not editorialize
    — faithfully convey the analyst's calls.
 4. Call spawn_rewriter with that task_prompt.
-5. Review the rewriter's output. If it faithfully implements the verdict,
-   call finish with the rewritten code. If not, call spawn_rewriter again
-   with corrections (or spawn_analyst again if the verdict itself looks
-   wrong on review).
+5. Call spawn_verifier with (original_source, rewritten_source from the
+   rewriter, analyst_verdict_json). The analyst_verdict_json argument must
+   be the analyst's full result object serialized as a JSON string.
+6. If the verifier returns verdict='accept', call finish with the
+   rewritten code. If verdict='reject', either call spawn_rewriter again
+   with a task_prompt that incorporates the verifier's per-variable
+   mismatches and concerns, or — if the verifier's `concerns` implicate
+   the analyst's verdict itself — call spawn_analyst again. After any
+   re-run, you must call spawn_verifier again on the new rewrite before
+   calling finish.
+
+Hard rule: you may not call finish unless the most recent spawn_verifier
+call returned verdict='accept'.
 
 Be deliberate. Each spawn_* call costs another model call and the user
 will inspect every prompt before it runs. Prefer one well-crafted prompt
@@ -102,6 +122,47 @@ ORCHESTRATOR_TOOLS = [
                 },
             },
             "required": ["task_prompt"],
+        },
+    },
+    {
+        "name": "spawn_verifier",
+        "description": (
+            "Run the verifier agent. It compares the rewritten source to "
+            "the analyst's verdict and returns "
+            "{verdict: accept|reject, per_variable: [...], concerns: [...]}. "
+            "Must be called after spawn_rewriter and before finish."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "original_source": {
+                    "type": "string",
+                    "description": (
+                        "The original kernel source, exactly as it was given "
+                        "to the analyst."
+                    ),
+                },
+                "rewritten_source": {
+                    "type": "string",
+                    "description": (
+                        "The rewritten kernel source produced by the most "
+                        "recent spawn_rewriter call."
+                    ),
+                },
+                "analyst_verdict_json": {
+                    "type": "string",
+                    "description": (
+                        "The analyst's full result object serialized as a "
+                        "JSON string (i.e. json.dumps of the dict you got "
+                        "back from spawn_analyst)."
+                    ),
+                },
+            },
+            "required": [
+                "original_source",
+                "rewritten_source",
+                "analyst_verdict_json",
+            ],
         },
     },
     {
@@ -154,14 +215,29 @@ def _execute_tool(tool_name: str, tool_input: dict) -> dict:
     if tool_name == "spawn_rewriter":
         result = run_agent("rewriter", tool_input["task_prompt"])
         return {"status": "ok", "result": result}
+    if tool_name == "spawn_verifier":
+        task = (
+            "ORIGINAL SOURCE:\n"
+            f"{tool_input['original_source']}\n\n"
+            "REWRITTEN SOURCE:\n"
+            f"{tool_input['rewritten_source']}\n\n"
+            "ANALYST VERDICT (JSON):\n"
+            f"{tool_input['analyst_verdict_json']}\n"
+        )
+        result = run_agent("verifier", task)
+        return {"status": "ok", "result": result}
     raise ValueError(f"Unknown tool: {tool_name}")
 
 
-def run_orchestrator(kernel_path: str, kernel_source: str) -> dict | None:
+def run_orchestrator(
+    kernel_path: str,
+    kernel_source: str,
+    max_turns: int = MAX_TURNS,
+) -> dict | None:
     """Run the orchestrator loop.
 
-    Returns the final finish() arguments dict, or None if the user quit or
-    the orchestrator stopped without finishing.
+    Returns the final finish() arguments dict, or None if the user quit,
+    the orchestrator stopped without finishing, or max_turns was exhausted.
     """
     user_message = (
         f"Kernel file: {kernel_path}\n\n"
@@ -173,7 +249,14 @@ def run_orchestrator(kernel_path: str, kernel_source: str) -> dict | None:
 
     client = anthropic.Anthropic()
 
+    turns = 0
     while True:
+        if turns >= max_turns:
+            print(
+                f"\nOrchestrator hit max_turns={max_turns}. Stopping."
+            )
+            return None
+        turns += 1
         response = client.messages.create(
             model=ORCHESTRATOR_MODEL,
             max_tokens=8192,

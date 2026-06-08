@@ -4,8 +4,8 @@ from workflow.registry import AGENTS
 
 
 def test_known_agent_types():
-    """AGENTS exposes exactly the analyst and rewriter types."""
-    assert set(AGENTS) == {"analyst", "rewriter"}
+    """AGENTS exposes exactly the analyst, rewriter, and verifier types."""
+    assert set(AGENTS) == {"analyst", "rewriter", "verifier"}
 
 
 def test_each_entry_has_required_keys():
