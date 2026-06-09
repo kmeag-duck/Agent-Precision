@@ -10,8 +10,10 @@ import pytest
 
 from workflow import orchestrator
 from workflow.orchestrator import (
+    DEFAULT_TOLERANCE_ON_ADVISOR_UNKNOWN,
     ORCHESTRATOR_SYSTEM_PROMPT,
     _execute_tool,
+    _format_tolerance_block,
     _hitl_pause,
     run_orchestrator,
 )
@@ -258,7 +260,7 @@ def test_run_orchestrator_stop_without_tool_returns_none(
     assert run_orchestrator("k.cpp", "src") is None
 
 
-# ---------- Orchestrator prompt: vocabulary matches the analyst's three methods ----------
+# ---------- Orchestrator prompt: vocabulary matches the agents it routes to ----------
 
 
 def test_orchestrator_prompt_names_all_three_methods_and_rework():
@@ -267,3 +269,173 @@ def test_orchestrator_prompt_names_all_three_methods_and_rework():
         assert token in ORCHESTRATOR_SYSTEM_PROMPT, (
             f"orchestrator prompt missing {token!r}"
         )
+
+
+def test_orchestrator_prompt_names_precision_advisor_and_tolerance_kinds():
+    """The orchestrator prompt names spawn_precision_advisor, sig_figs, decimal_digits, and precision_budget so the LLM knows when to call the advisor and how to thread tolerance into downstream task prompts."""
+    for token in (
+        "spawn_precision_advisor",
+        "sig_figs",
+        "decimal_digits",
+        "precision_budget",
+    ):
+        assert token in ORCHESTRATOR_SYSTEM_PROMPT, (
+            f"orchestrator prompt missing {token!r}"
+        )
+
+
+def test_orchestrator_prompt_states_advisor_unknown_fallback():
+    """The orchestrator prompt documents the fallback to {sig_figs, 6, advisor_unknown_defaulted} when the precision_advisor returns kind='unknown', matching DEFAULT_TOLERANCE_ON_ADVISOR_UNKNOWN."""
+    assert "advisor_unknown_defaulted" in ORCHESTRATOR_SYSTEM_PROMPT
+    # The constant and the prompt must agree on the fallback shape.
+    assert DEFAULT_TOLERANCE_ON_ADVISOR_UNKNOWN == {
+        "kind": "sig_figs",
+        "value": 6,
+        "source": "advisor_unknown_defaulted",
+    }
+
+
+def test_orchestrator_prompt_forbids_finish_without_accept():
+    """The orchestrator prompt explicitly forbids calling finish unless the most recent verifier returned accept; this rule lives in the prompt, not in code."""
+    text = ORCHESTRATOR_SYSTEM_PROMPT
+    assert "may not call finish" in text or "may not call `finish`" in text
+    assert "accept" in text
+
+
+# ---------- _format_tolerance_block ----------
+
+
+def test_format_tolerance_block_none_tells_orchestrator_to_call_advisor():
+    """With tolerance=None, the rendered block instructs the orchestrator to call spawn_precision_advisor first and documents both the advisor-returns-tolerance and advisor-unknown-fallback paths."""
+    block = _format_tolerance_block(None)
+    assert "not specified" in block
+    assert "spawn_precision_advisor" in block
+    assert "advisor_unknown_defaulted" in block
+
+
+def test_format_tolerance_block_user_cli_forbids_advisor_call():
+    """With a user-supplied tolerance, the rendered block contains the kind/value/source verbatim and tells the orchestrator NOT to call spawn_precision_advisor."""
+    block = _format_tolerance_block(
+        {"kind": "sig_figs", "value": 7, "source": "user_cli"}
+    )
+    assert "sig_figs" in block
+    assert "7" in block
+    assert "user_cli" in block
+    assert "do NOT call" in block or "do not call" in block.lower()
+
+
+# ---------- _execute_tool: spawn_precision_advisor + spawn_verifier(tolerance_json) ----------
+
+
+def test_execute_tool_dispatches_spawn_precision_advisor(monkeypatch):
+    """_execute_tool routes spawn_precision_advisor to run_agent('precision_advisor', kernel_source) and wraps the result."""
+    calls = []
+
+    def stub_run_agent(type_, task):
+        calls.append((type_, task))
+        return {
+            "kind": "sig_figs",
+            "value": 6,
+            "rationale": "stubbed",
+            "confidence": "medium",
+            "alternative": "",
+        }
+
+    monkeypatch.setattr(orchestrator, "run_agent", stub_run_agent)
+
+    result = _execute_tool(
+        "spawn_precision_advisor", {"kernel_source": "SOURCE"}
+    )
+
+    assert result["status"] == "ok"
+    assert result["result"]["kind"] == "sig_figs"
+    assert calls == [("precision_advisor", "SOURCE")]
+
+
+def test_execute_tool_spawn_verifier_includes_tolerance_in_task(monkeypatch):
+    """_execute_tool builds the verifier's task string from original_source, rewritten_source, analyst_verdict_json, AND tolerance_json — so the verifier sees the same tolerance the analyst saw."""
+    captured = {}
+
+    def stub_run_agent(type_, task):
+        captured["type"] = type_
+        captured["task"] = task
+        return {"verdict": "accept", "per_variable": [], "concerns": []}
+
+    monkeypatch.setattr(orchestrator, "run_agent", stub_run_agent)
+
+    result = _execute_tool(
+        "spawn_verifier",
+        {
+            "original_source": "ORIG",
+            "rewritten_source": "REW",
+            "analyst_verdict_json": '{"variables": []}',
+            "tolerance_json": '{"kind":"sig_figs","value":6,"source":"user_cli"}',
+        },
+    )
+
+    assert result["status"] == "ok"
+    assert captured["type"] == "verifier"
+    # the task must contain all four pieces
+    assert "ORIG" in captured["task"]
+    assert "REW" in captured["task"]
+    assert "ANALYST VERDICT" in captured["task"]
+    assert "TOLERANCE" in captured["task"]
+    assert "user_cli" in captured["task"]
+
+
+# ---------- run_orchestrator: tolerance plumbing in the initial user message ----------
+
+
+def test_run_orchestrator_user_cli_tolerance_appears_in_first_user_message(
+    monkeypatch, fake_anthropic
+):
+    """When a user-supplied tolerance is passed, the first user message embeds it verbatim and the orchestrator is told NOT to call spawn_precision_advisor."""
+    fake = fake_anthropic([
+        FakeResponse(
+            content=[ToolUseBlock(
+                id="tu_1",
+                name="finish",
+                input={"rewritten_code": "X", "notes": "Y"},
+            )],
+        ),
+    ])
+    _scripted_input(monkeypatch, ["y"])  # approve finish
+
+    run_orchestrator(
+        "k.cpp",
+        "src",
+        tolerance={
+            "kind": "decimal_digits",
+            "value": 4,
+            "source": "user_cli",
+        },
+    )
+
+    first_user = fake.messages.calls[0]["messages"][0]["content"]
+    assert "decimal_digits" in first_user
+    assert "4" in first_user
+    assert "user_cli" in first_user
+    # advisor must NOT be invited when tolerance is user-supplied
+    assert "do NOT call" in first_user or "do not call" in first_user.lower()
+
+
+def test_run_orchestrator_no_tolerance_invites_advisor_in_first_user_message(
+    monkeypatch, fake_anthropic
+):
+    """When tolerance=None, the first user message instructs the orchestrator to call spawn_precision_advisor first."""
+    fake = fake_anthropic([
+        FakeResponse(
+            content=[ToolUseBlock(
+                id="tu_1",
+                name="finish",
+                input={"rewritten_code": "X", "notes": "Y"},
+            )],
+        ),
+    ])
+    _scripted_input(monkeypatch, ["y"])
+
+    run_orchestrator("k.cpp", "src", tolerance=None)
+
+    first_user = fake.messages.calls[0]["messages"][0]["content"]
+    assert "spawn_precision_advisor" in first_user
+    assert "not specified" in first_user

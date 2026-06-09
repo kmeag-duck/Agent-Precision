@@ -1,14 +1,18 @@
 """Tests for the CLI entrypoint workflow.run.main."""
 
+import pytest
+
 from workflow import run as run_module
 
 
-def test_main_wrong_arg_count_returns_2(monkeypatch, capsys):
-    """CLI prints usage and exits 2 when called with no kernel path."""
+def test_main_no_args_returns_2(monkeypatch, capsys):
+    """CLI exits 2 (argparse usage error) when called with no kernel path."""
     monkeypatch.setattr("sys.argv", ["workflow.run"])
-    assert run_module.main() == 2
+    with pytest.raises(SystemExit) as excinfo:
+        run_module.main()
+    assert excinfo.value.code == 2
     err = capsys.readouterr().err
-    assert "Usage" in err
+    assert "usage" in err.lower()
 
 
 def test_main_missing_file_returns_2(monkeypatch, tmp_path, capsys):
@@ -25,21 +29,26 @@ def test_main_orchestrator_quit_returns_1(monkeypatch, tmp_path):
     kernel = tmp_path / "k.cpp"
     kernel.write_text("// fake kernel\n")
     monkeypatch.setattr("sys.argv", ["workflow.run", str(kernel)])
-    monkeypatch.setattr(run_module, "run_orchestrator", lambda p, s: None)
+    monkeypatch.setattr(
+        run_module, "run_orchestrator", lambda p, s, tolerance=None: None
+    )
 
     assert run_module.main() == 1
 
 
-def test_main_happy_path_prints_kernel_and_notes(monkeypatch, tmp_path, capsys):
-    """CLI reads the kernel, calls run_orchestrator with (path, source), and prints rewritten_code + notes."""
+def test_main_happy_path_passes_none_tolerance_when_no_flags(
+    monkeypatch, tmp_path, capsys
+):
+    """With no tolerance flags, CLI calls run_orchestrator with tolerance=None and prints rewritten_code + notes."""
     kernel = tmp_path / "k.cpp"
     kernel.write_text("// fake kernel\n")
 
     captured = {}
 
-    def fake_orchestrator(path, source):
+    def fake_orchestrator(path, source, tolerance=None):
         captured["path"] = path
         captured["source"] = source
+        captured["tolerance"] = tolerance
         return {"rewritten_code": "REWRITTEN", "notes": "NOTES"}
 
     monkeypatch.setattr("sys.argv", ["workflow.run", str(kernel)])
@@ -51,3 +60,89 @@ def test_main_happy_path_prints_kernel_and_notes(monkeypatch, tmp_path, capsys):
     assert "NOTES" in out
     assert captured["path"] == str(kernel)
     assert captured["source"] == "// fake kernel\n"
+    assert captured["tolerance"] is None
+
+
+def test_main_sig_figs_flag_normalizes_to_user_cli_tolerance(
+    monkeypatch, tmp_path
+):
+    """--sig-figs N produces tolerance={'kind':'sig_figs','value':N,'source':'user_cli'}."""
+    kernel = tmp_path / "k.cpp"
+    kernel.write_text("// k\n")
+
+    captured = {}
+
+    def fake_orchestrator(path, source, tolerance=None):
+        captured["tolerance"] = tolerance
+        return {"rewritten_code": "X", "notes": "Y"}
+
+    monkeypatch.setattr(
+        "sys.argv", ["workflow.run", str(kernel), "--sig-figs", "8"]
+    )
+    monkeypatch.setattr(run_module, "run_orchestrator", fake_orchestrator)
+
+    assert run_module.main() == 0
+    assert captured["tolerance"] == {
+        "kind": "sig_figs",
+        "value": 8,
+        "source": "user_cli",
+    }
+
+
+def test_main_decimal_digits_flag_normalizes_to_user_cli_tolerance(
+    monkeypatch, tmp_path
+):
+    """--decimal-digits N produces tolerance={'kind':'decimal_digits','value':N,'source':'user_cli'}."""
+    kernel = tmp_path / "k.cpp"
+    kernel.write_text("// k\n")
+
+    captured = {}
+
+    def fake_orchestrator(path, source, tolerance=None):
+        captured["tolerance"] = tolerance
+        return {"rewritten_code": "X", "notes": "Y"}
+
+    monkeypatch.setattr(
+        "sys.argv", ["workflow.run", str(kernel), "--decimal-digits", "4"]
+    )
+    monkeypatch.setattr(run_module, "run_orchestrator", fake_orchestrator)
+
+    assert run_module.main() == 0
+    assert captured["tolerance"] == {
+        "kind": "decimal_digits",
+        "value": 4,
+        "source": "user_cli",
+    }
+
+
+def test_main_mutually_exclusive_tolerance_flags(monkeypatch, tmp_path, capsys):
+    """--sig-figs and --decimal-digits are mutually exclusive (argparse rejects with exit 2)."""
+    kernel = tmp_path / "k.cpp"
+    kernel.write_text("// k\n")
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "workflow.run",
+            str(kernel),
+            "--sig-figs",
+            "6",
+            "--decimal-digits",
+            "4",
+        ],
+    )
+    with pytest.raises(SystemExit) as excinfo:
+        run_module.main()
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert "not allowed" in err.lower() or "mutually exclusive" in err.lower()
+
+
+def test_main_rejects_nonpositive_sig_figs(monkeypatch, tmp_path):
+    """A non-positive --sig-figs value is rejected (SystemExit with a message)."""
+    kernel = tmp_path / "k.cpp"
+    kernel.write_text("// k\n")
+    monkeypatch.setattr(
+        "sys.argv", ["workflow.run", str(kernel), "--sig-figs", "0"]
+    )
+    with pytest.raises(SystemExit):
+        run_module.main()

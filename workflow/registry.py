@@ -5,7 +5,144 @@ structured output must conform to, and the model it runs on.
 
 Adding a new agent type = adding a new entry here. run_agent.py never has to
 change; the orchestrator only gains a new tool wrapping the new type.
+
+Output-precision tolerance vocabulary used throughout this file:
+  - "sig_figs"        — required correct *significant* figures of the
+                        kernel's numerical output (relative tolerance:
+                        N sig figs <=> relative error < 10^-N).
+  - "decimal_digits"  — required correct *decimal places* after the point
+                        (absolute tolerance: N digits <=> abs error < 10^-N).
+  - "unknown"         — the precision_advisor was unable to infer a
+                        tolerance with any confidence and is explicitly
+                        deferring to the caller. The orchestrator falls
+                        back to a hard-coded default in this case.
+These are deliberately distinct from floating-point storage precision
+(float / double / float-float etc.); a kernel may need 6 sig figs of
+output and achieve it with a mix of storage precisions internally.
 """
+
+# ---------------------------------------------------------------------------
+# Precision advisor
+# ---------------------------------------------------------------------------
+#
+# Runs *only* when the user did not pass an output-precision tolerance on
+# the command line. Reads the kernel source and guesses, from domain
+# context (typical scientific use of this kind of computation), how many
+# significant figures or decimal digits of output precision a user of
+# this kernel would reasonably need. May explicitly answer "unknown" with
+# confidence='low' rather than guess blindly; the orchestrator handles
+# that case by falling back to a documented default tolerance.
+#
+# This agent does not look at variables, does not recommend rewrites, and
+# does not see any user-supplied tolerance. Its only job is to translate
+# "no tolerance specified" into a concrete tolerance the analyst and
+# verifier can act on.
+
+PRECISION_ADVISOR_OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "kind": {
+            "type": "string",
+            "enum": ["sig_figs", "decimal_digits", "unknown"],
+            "description": (
+                "'sig_figs' = relative tolerance, expressed as required "
+                "significant figures of the kernel's output. "
+                "'decimal_digits' = absolute tolerance, expressed as "
+                "required correct digits after the decimal point. "
+                "'unknown' = you could not infer a tolerance with any "
+                "confidence from the source alone; the orchestrator will "
+                "fall back to a default. Prefer an honest 'unknown' over "
+                "a blind guess."
+            ),
+        },
+        "value": {
+            "type": "integer",
+            "description": (
+                "The numeric tolerance, interpreted according to `kind`. "
+                "When kind='sig_figs' or 'decimal_digits', a small "
+                "positive integer (typical range 3-12). When "
+                "kind='unknown', set value=0 (the orchestrator ignores "
+                "it)."
+            ),
+        },
+        "rationale": {
+            "type": "string",
+            "description": (
+                "Brief justification grounded in the kernel's apparent "
+                "domain (e.g. 'gravitational N-body force, single-step; "
+                "double-precision baseline is overkill for most "
+                "downstream integrators which only need ~6 sig figs')."
+            ),
+        },
+        "confidence": {
+            "type": "string",
+            "enum": ["high", "medium", "low"],
+            "description": (
+                "How confident you are in the inferred tolerance. Use "
+                "'low' for kind='unknown'."
+            ),
+        },
+        "alternative": {
+            "type": "string",
+            "description": (
+                "One plausible alternative tolerance the caller might "
+                "have intended (e.g. '8 sig figs if this feeds a "
+                "long-time-integration step'). Empty string if none."
+            ),
+        },
+    },
+    "required": ["kind", "value", "rationale", "confidence", "alternative"],
+}
+
+PRECISION_ADVISOR_SYSTEM_PROMPT = """You are the precision-advisor agent.
+
+The caller of this workflow did not specify an output-precision
+tolerance on the command line. Your job is to read the kernel's source
+and, from its apparent scientific domain and typical downstream use,
+infer how many significant figures (relative tolerance) or decimal
+digits after the point (absolute tolerance) of output precision a user
+of this kernel would reasonably need.
+
+You will *not* see a user-supplied tolerance, because there is none.
+You are filling that gap.
+
+Vocabulary:
+- 'sig_figs' = required correct significant figures of the kernel's
+  output values. Relative tolerance: N sig figs corresponds to
+  relative error < 10^-N. Use this when the output magnitudes vary
+  over orders (forces, fluxes, energies, log-likelihoods).
+- 'decimal_digits' = required correct decimal places after the point.
+  Absolute tolerance: N digits corresponds to absolute error < 10^-N.
+  Use this when the output magnitudes are bounded near a known scale
+  (probabilities, normalized fractions, angles in radians).
+- These are *output-precision* tolerances. They are not the same as the
+  storage precision (float / double / float-float) of variables inside
+  the kernel; the analyst will decide storage precisions separately
+  given your tolerance.
+
+How to decide:
+1. Identify what the kernel computes (force, sum, transform, density,
+   integration step, …) and the typical scientific domain that uses
+   such a kernel.
+2. Recall the order of magnitude of output precision that domain
+   typically *uses*, not the precision the kernel happens to be coded
+   in. Most scientific double-precision code is using far fewer sig
+   figs than double provides; pick the realistic working tolerance,
+   not the storage precision.
+3. If the kernel's domain is genuinely unclear from the source, or if
+   you can't bracket a reasonable tolerance to within ~2 sig figs, set
+   kind='unknown', value=0, confidence='low' and explain why in
+   rationale. The orchestrator will fall back to a documented default.
+   An honest 'unknown' is more useful than a confident guess.
+
+Field rules:
+- kind='sig_figs' or 'decimal_digits': value is a small positive
+  integer (typical range 3-12).
+- kind='unknown': value=0.
+- alternative: one plausible alternative tolerance the caller might
+  have intended given a different downstream use; empty string if none.
+
+Return your result by calling the submit_result tool."""
 
 # ---------------------------------------------------------------------------
 # Analyst
@@ -145,6 +282,70 @@ ANALYST_OUTPUT_SCHEMA = {
                 "affected_variables",
             ],
         },
+        "precision_budget": {
+            "type": "object",
+            "description": (
+                "How the per-variable verdict relates to the output-"
+                "precision tolerance you were given in the task. The "
+                "tolerance is the constraint your verdict must satisfy; "
+                "this block makes your reasoning about that constraint "
+                "explicit so the verifier and the user can audit it."
+            ),
+            "properties": {
+                "target_kind": {
+                    "type": "string",
+                    "enum": ["sig_figs", "decimal_digits"],
+                    "description": (
+                        "Copied verbatim from the tolerance in your task."
+                    ),
+                },
+                "target_value": {
+                    "type": "integer",
+                    "description": (
+                        "Copied verbatim from the tolerance in your task."
+                    ),
+                },
+                "source": {
+                    "type": "string",
+                    "description": (
+                        "Where the tolerance came from, copied from the "
+                        "task (e.g. 'user_cli', 'precision_advisor', "
+                        "'advisor_unknown_defaulted')."
+                    ),
+                },
+                "claimed_output_precision": {
+                    "type": "string",
+                    "description": (
+                        "Your best estimate of the output precision the "
+                        "rewritten kernel will actually deliver under "
+                        "your per-variable verdict, in the same units as "
+                        "target_kind (e.g. '~7 sig figs', '>=4 decimal "
+                        "digits'). Be honest if your verdict is tight "
+                        "against the target."
+                    ),
+                },
+                "headroom_argument": {
+                    "type": "string",
+                    "description": (
+                        "One or two sentences arguing why "
+                        "claimed_output_precision meets target_value: "
+                        "where the dominant rounding error in the "
+                        "rewritten kernel comes from, and why it stays "
+                        "below the tolerance. If you cannot make this "
+                        "argument, your verdict is too aggressive and "
+                        "you should mark more variables 'keep' or "
+                        "'emulate' until you can."
+                    ),
+                },
+            },
+            "required": [
+                "target_kind",
+                "target_value",
+                "source",
+                "claimed_output_precision",
+                "headroom_argument",
+            ],
+        },
         "overall_notes": {
             "type": "string",
             "description": (
@@ -153,34 +354,46 @@ ANALYST_OUTPUT_SCHEMA = {
             ),
         },
     },
-    "required": ["variables", "rework", "overall_notes"],
+    "required": ["variables", "rework", "precision_budget", "overall_notes"],
 }
 
 ANALYST_SYSTEM_PROMPT = """You are a mixed-precision analyst agent for
 numerical kernels (Kokkos C++, CUDA, or similar).
 
-You will be given a kernel's source. Your job is to decide, per variable,
-which floating-point variables should have their precision changed and
-how, so that the kernel's output precision remains acceptable while
-reducing cost where safe.
+You will be given a kernel's source AND an output-precision tolerance
+(either N significant figures of the output, or N decimal digits after
+the point). The tolerance is a hard constraint: your per-variable
+verdict must produce a rewritten kernel whose output stays within that
+tolerance of the original kernel's output.
+
+Your job is to decide, per variable, which floating-point variables
+should have their precision changed and how, so the rewritten kernel
+meets that tolerance while reducing cost where safe.
 
 You have three rewrite methods available per variable, in rough order of
 preference:
 
 1. downcast — replace the variable's declared type with a narrower one
-   (e.g. double -> float). Cheapest and most portable. Prefer this when
-   the variable's numerics tolerate the reduced range and precision.
+   (e.g. double -> float). This is the throughput win: modern GPU and
+   accelerator hardware runs fp32 (and narrower) at multiples of fp64
+   throughput, and fp64 throughput has stagnated. Prefer downcast
+   whenever the tolerance can absorb the narrower precision.
 
 2. emulate — keep the variable's *effective* precision using a software-
    emulated wider type built from narrower hardware types (e.g. a
-   float-float pair to approximate double). Choose this when the
-   numerics demand the wider precision but you want the hardware type
-   lowered (e.g. to free up double-precision units, or to target
-   hardware with weak native doubles). State the emulation_type
-   explicitly (e.g. 'float-float').
+   float-float pair to approximate double). Emulation is
+   throughput-NEGATIVE: a float-float operation costs several fp32 ops
+   and is typically slower than a single native fp64 op. Only choose
+   emulate when downcast would violate the tolerance AND the target
+   hardware has weak or absent native double-precision support (so the
+   emulated wider type is the only way to get the needed precision at
+   any speed). If native doubles are available and meet the tolerance,
+   'keep' beats 'emulate'. State the emulation_type explicitly (e.g.
+   'float-float').
 
 3. keep — leave the variable at its original precision. Choose this
-   when neither downcast nor emulate is safe.
+   when downcast would violate the tolerance and native double already
+   provides the needed precision at native throughput.
 
 Orthogonal to the per-variable verdict, you may also suggest a single
 kernel-shape rework: a structural transformation that improves the
@@ -219,9 +432,22 @@ For the rework block: always submit it. If you have no rework to
 suggest, set suggested=false and leave transformation, rationale, and
 affected_variables empty.
 
+For the precision_budget block: copy target_kind, target_value, and
+source verbatim from the tolerance in your task. Then state your best
+honest estimate of the output precision the rewritten kernel will
+actually deliver under your per-variable verdict (claimed_output_
+precision), and give a one- or two-sentence headroom_argument naming
+where the dominant rounding error in the rewritten kernel will come
+from and why it stays below the tolerance. If you cannot construct
+that argument, your verdict is too aggressive — flip more variables to
+'keep' (or 'emulate', subject to the throughput caveat above) until
+you can.
+
 Return your result by calling the submit_result tool with:
 - variables: the per-variable list described above.
 - rework: the rework object (suggested=false when none).
+- precision_budget: the budget object linking your verdict to the
+  tolerance.
 - overall_notes: brief cross-cutting observations that shaped your calls.
 
 You do not rewrite code. Another agent will do that based on your verdict."""
@@ -331,7 +557,15 @@ Hard requirements on your output:
    code that calls this kernel; that is expected and acceptable here.
 2. Only change precision on variables the task instruction tells you to
    change, and only via the method it specifies. Do not lower or
-   emulate other variables unilaterally.
+   emulate other variables unilaterally. Critically: do NOT silently
+   substitute one method for another. If the instruction says
+   'downcast' for a variable, do not 'emulate' it because you think
+   emulate is safer; if it says 'emulate', do not 'downcast' it
+   because you think emulate is too expensive. The analyst chose the
+   method deliberately and the verifier will check method-by-method.
+   If you genuinely believe a method choice is wrong, still apply it
+   as instructed and say so in summary_of_changes — the orchestrator
+   will route any disagreement back to the analyst.
 3. Insert explicit casts at boundaries where precisions meet, so the
    compiler does not silently promote or demote.
 4. Preserve all comments unless they contradict the new precision; in
@@ -449,12 +683,16 @@ VERIFIER_OUTPUT_SCHEMA = {
 VERIFIER_SYSTEM_PROMPT = """You are a static-review verifier agent for
 mixed-precision kernel rewrites.
 
-You will be given three things in your task message:
+You will be given four things in your task message:
 1. The original kernel source (all-double or all-long-double).
 2. The rewritten kernel source produced by a separate rewriter agent.
 3. The analyst agent's verdict, as JSON, describing what should have
    happened to each variable's precision and whether a kernel-shape
    rework was suggested.
+4. The output-precision tolerance the analyst was working against
+   (either N significant figures or N decimal digits, plus its source).
+   You do not re-derive the tolerance; the analyst was given it as a
+   constraint and you are given it for context.
 
 Your job is to decide whether the rewritten source faithfully implements
 the analyst's verdict and is internally consistent. You do not re-judge
@@ -512,10 +750,21 @@ Borderline-numerics worries (e.g. "this variable was marked downcast
 but I think long runs might lose accuracy") belong in `concerns`, not
 in per_variable ok=false. ok is strictly a faithfulness check.
 
+If the analyst's precision_budget claims output precision that is
+tight against the tolerance you were given, or if the analyst's
+headroom_argument is missing or unconvincing, raise that in
+`concerns`. Do not flip per_variable ok on that basis — faithfulness
+is still a separate axis from whether the budget is realistic.
+
 Return your result by calling the submit_result tool with verdict,
 per_variable, and concerns."""
 
 AGENTS = {
+    "precision_advisor": {
+        "system_prompt": PRECISION_ADVISOR_SYSTEM_PROMPT,
+        "output_schema": PRECISION_ADVISOR_OUTPUT_SCHEMA,
+        "model": "claude-opus-4-7",
+    },
     "analyst": {
         "system_prompt": ANALYST_SYSTEM_PROMPT,
         "output_schema": ANALYST_OUTPUT_SCHEMA,

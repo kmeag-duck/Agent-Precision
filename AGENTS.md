@@ -9,10 +9,13 @@ Research prototype: an LLM orchestrator that rewrites numerical kernels (Kokkos 
 ```bash
 set -a; source .env; set +a            # .env is NOT auto-loaded
 pip install -r requirements.txt        # runtime: anthropic; dev: pytest
-python -m workflow.run <kernel_file>   # e.g. test-kernels/kokkos/mixed/nbody_force.cpp
+python -m workflow.run <kernel_file> [--sig-figs N | --decimal-digits N]
+# e.g. python -m workflow.run test-kernels/kokkos/mixed/nbody_force.cpp --sig-figs 6
 ```
 
 `ANTHROPIC_API_KEY` is read from the environment by the `anthropic` client. There is no other config file for the workflow.
+
+`--sig-figs` and `--decimal-digits` are mutually exclusive and both optional. When neither is given, the orchestrator calls the `precision_advisor` agent to infer one; if the advisor returns `kind='unknown'`, the orchestrator falls back to `{kind:'sig_figs', value:6, source:'advisor_unknown_defaulted'}` (the constant `DEFAULT_TOLERANCE_ON_ADVISOR_UNKNOWN` in `orchestrator.py`). Both Argo wrapper scripts (`run-argo.sh`, `run-argoproxy.sh`) forward `"$@"` so flags pass through unchanged.
 
 ### Running via Argo (Argonne) instead of api.anthropic.com
 
@@ -45,14 +48,34 @@ Use `scripts/run-argo.sh` instead only when `argo-proxy` isn't installed on this
 
 - `workflow/registry.py` — `AGENTS` dict is the single source of truth for agent types. Each entry = `{system_prompt, output_schema, model}`. **Adding a new agent type = one new entry here, nothing else changes.**
 - `workflow/run_agent.py` — generic `run_agent(type, task) -> dict`. Forces the agent to call a `submit_result` tool whose schema is the registry's `output_schema`. Never edit this when adding agent types.
-- `workflow/orchestrator.py` — itself a Claude conversation. Tools are one-per-agent-type (`spawn_analyst`, `spawn_rewriter`, `spawn_verifier`) plus `finish`. Contains the **human-in-the-loop pause** (`_hitl_pause`): every tool call is shown and the user must approve `y/n/q` before it runs. This pause is the whole point of v0 — do not remove it or auto-approve. A `MAX_TURNS=20` backstop guards against runaway loops if the HITL is left unattended; don't raise it casually.
-- `workflow/run.py` — thin CLI; takes one path argument, prints final code + notes.
+- `workflow/orchestrator.py` — itself a Claude conversation. Tools are one-per-agent-type (`spawn_precision_advisor`, `spawn_analyst`, `spawn_rewriter`, `spawn_verifier`) plus `finish`. Contains the **human-in-the-loop pause** (`_hitl_pause`): every tool call is shown and the user must approve `y/n/q` before it runs. This pause is the whole point of v0 — do not remove it or auto-approve. A `MAX_TURNS=20` backstop guards against runaway loops if the HITL is left unattended; don't raise it casually.
+- `workflow/run.py` — thin CLI; takes a kernel path plus optional `--sig-figs N` / `--decimal-digits N`, normalizes either flag into `{kind, value, source:'user_cli'}` (or `None`), passes that as the `tolerance` kwarg to `run_orchestrator`, then prints final code + notes.
 
 Rejecting (`n`) returns `{"status": "rejected_by_user"}` to the orchestrator so it can self-correct without burning an agent API call — that behavior is intentional.
 
-The orchestrator system prompt enforces the pipeline `analyst -> rewriter -> verifier -> finish`, and explicitly forbids calling `finish` unless the most recent `spawn_verifier` returned `verdict='accept'`. That rule lives in the prompt, not in code — the orchestrator is trusted to obey it. If you add a hard guard, do it in `orchestrator.py` and keep the prompt in sync.
+The orchestrator system prompt enforces the pipeline `(precision_advisor ->)? analyst -> rewriter -> verifier -> finish`, and explicitly forbids calling `finish` unless the most recent `spawn_verifier` returned `verdict='accept'`. It also forbids calling `spawn_precision_advisor` when the user supplied a tolerance on the command line, and forbids calling it more than once. Those rules live in the prompt, not in code — the orchestrator is trusted to obey them. If you add a hard guard, do it in `orchestrator.py` and keep the prompt in sync.
 
-The analyst's per-variable `action` enum is `{downcast, emulate, keep}`. `downcast` replaces a type with a narrower hardware type (e.g. `double` -> `float`) and uses `target_precision`; `emulate` replaces a type with a software-emulated pair (currently float-float / Dekker, written inline as `struct ff_t {float hi, lo;}` per the rewriter prompt) and uses `emulation_type`; `keep` leaves the variable alone. The analyst's top-level result also includes a required `rework` object (`{suggested, transformation, rationale, affected_variables}`) for kernel-shape changes such as Kahan summation; when no rework is warranted the analyst still returns the object with `suggested=false` and empty fields rather than omitting it. The verifier's `expected_action` enum mirrors the analyst's; its `observed_action` enum adds `unclear`. If you rename any of these tokens, update `registry.py`, `orchestrator.py`'s system prompt, and the tests in `tests/test_registry.py` / `tests/test_orchestrator.py` together — they are deliberately coupled.
+### Tolerance vocabulary and plumbing
+
+There are three distinct precision concepts kept deliberately separate in this code, prompts, and tests:
+
+- **`sig_figs` (significant figures)** — relative tolerance on the kernel's *output*.
+- **`decimal_digits` (decimal places after the point)** — absolute tolerance on the output.
+- **Floating-point storage precision** (`float`, `double`, `float-float`, …) — the *mechanism* the analyst chooses per variable. A kernel can hit a 6-sig-fig output target using a mix of internal storage precisions.
+
+The tolerance is a single dict `{kind, value, source}` flowing through the run:
+
+- `kind ∈ {sig_figs, decimal_digits}` once fixed; the advisor's `unknown` is never propagated downstream — it triggers the documented fallback.
+- `value` is a small positive integer (`int > 0`; non-positive values are rejected by `workflow/run.py`).
+- `source ∈ {user_cli, precision_advisor, advisor_unknown_defaulted}` — records which path set the tolerance, so logs and the analyst's `precision_budget` block can carry the provenance.
+
+Plumbing: `run_orchestrator(kernel_path, kernel_source, tolerance=None)` embeds the tolerance verbatim into the first user message via `_format_tolerance_block()`. The orchestrator LLM is then responsible for (a) calling `spawn_precision_advisor` first if and only if `tolerance` was `None`, and (b) inlining the agreed tolerance into the `kernel_source` argument of `spawn_analyst` (as a labeled block the analyst echoes into its `precision_budget` output), into the `task_prompt` of `spawn_rewriter`, and as the separate `tolerance_json` argument of `spawn_verifier` (which `_execute_tool` joins into a labeled TOLERANCE (JSON) section of the verifier's task string).
+
+The analyst is told, in its system prompt, that the tolerance is a hard constraint and that `emulate` is throughput-negative — preferred only when `downcast` would violate tolerance. The rewriter prompt forbids silently substituting one method for another. Both rules are LLM-side, not Python-enforced.
+
+### Per-variable action enums
+
+The analyst's per-variable `action` enum is `{downcast, emulate, keep}`. `downcast` replaces a type with a narrower hardware type (e.g. `double` -> `float`) and uses `target_precision`; `emulate` replaces a type with a software-emulated pair (currently float-float / Dekker, written inline as `struct ff_t {float hi, lo;}` per the rewriter prompt) and uses `emulation_type`; `keep` leaves the variable alone. The analyst's top-level result also includes a required `rework` object (`{suggested, transformation, rationale, affected_variables}`) for kernel-shape changes such as Kahan summation (when none is warranted, the analyst still returns the object with `suggested=false` and empty fields rather than omitting it), and a required `precision_budget` object (`{target_kind, target_value, source, claimed_output_precision, headroom_argument}`) that links the verdict back to the tolerance. The verifier's `expected_action` enum mirrors the analyst's; its `observed_action` enum adds `unclear`. If you rename any of these tokens, update `registry.py`, `orchestrator.py`'s system prompt, and the tests in `tests/test_registry.py` / `tests/test_orchestrator.py` together — they are deliberately coupled.
 
 ## Model names look wrong but aren't (verify before changing)
 

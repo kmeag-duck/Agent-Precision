@@ -28,28 +28,63 @@ ORCHESTRATOR_MODEL = "claude-opus-4-7"
 # left unattended.
 MAX_TURNS = 20
 
+# Fallback tolerance applied when the user did not pass --sig-figs or
+# --decimal-digits AND the precision_advisor returned kind='unknown'. 6
+# sig figs is the conventional working precision of single-precision
+# scientific computation and is what most kernels coded in double are
+# actually using in practice.
+DEFAULT_TOLERANCE_ON_ADVISOR_UNKNOWN = {
+    "kind": "sig_figs",
+    "value": 6,
+    "source": "advisor_unknown_defaulted",
+}
+
 ORCHESTRATOR_SYSTEM_PROMPT = """You are the orchestrator of a small
 workflow whose goal is to rewrite a numerical kernel to reduce precision
 cost where safe (typically double -> float, or a software-emulated wider
 type on top of a narrower hardware type), while keeping the original
 precision where it is not safe to reduce, so that the kernel's output
-precision remains acceptable.
+precision remains within a tolerance.
+
+The tolerance is expressed either as 'sig_figs' (required correct
+significant figures of the kernel's output — relative tolerance) or as
+'decimal_digits' (required correct decimal places after the point —
+absolute tolerance). These are output-precision targets and are
+distinct from floating-point storage precision (float / double /
+float-float etc.); a kernel can satisfy a 6-sig-fig tolerance with a
+mix of storage precisions internally.
 
 You are a router and guardrail, not a numerics expert. Do not decide
-per-variable precision yourself — that is the analyst's job. Your job is
-to call the right agent at the right time and assemble their outputs.
+per-variable precision yourself — that is the analyst's job. Do not
+decide the output-precision tolerance yourself — that is the user's job,
+or, when the user did not specify one, the precision_advisor's job.
+Your job is to call the right agent at the right time, thread the
+tolerance and verdicts through their task prompts faithfully, and
+assemble their outputs.
 
-You have access to three specialist agents:
-  - analyst: takes a kernel's source and returns a structured per-variable
-    verdict plus an optional kernel-shape rework block and overall notes.
-    Per-variable entries are
+You have access to four specialist agents:
+  - precision_advisor: called *only* when the user did not pass an
+    output-precision tolerance on the command line. Takes the kernel
+    source and returns
+      {kind, value, rationale, confidence, alternative}
+    where kind is one of 'sig_figs', 'decimal_digits', or 'unknown'.
+    Call this exactly once and only at the start, before spawn_analyst,
+    and only when the user message tells you no tolerance was provided.
+
+  - analyst: takes the kernel source AND the agreed tolerance, and
+    returns a structured per-variable verdict plus an optional
+    kernel-shape rework block, a precision_budget block, and overall
+    notes. Per-variable entries are
       {name, action, target_precision, emulation_type, reason}
     where action is one of:
       * 'downcast' — replace the declared type with a narrower one
         (target_precision says which, e.g. 'float'); emulation_type empty.
+        This is the throughput win.
       * 'emulate'  — replace the declared type with a software-emulated
         pair type (emulation_type says which, e.g. 'float-float');
-        target_precision empty.
+        target_precision empty. Note: emulate is throughput-NEGATIVE
+        and is only justified when downcast violates tolerance AND
+        native double is unavailable or weak on the target hardware.
       * 'keep'     — leave the variable unchanged; both target_precision
         and emulation_type empty.
     The rework block is
@@ -57,6 +92,10 @@ You have access to three specialist agents:
     and, when suggested=true, names a single kernel-shape transformation
     (e.g. Kahan summation in an accumulator loop) that complements the
     per-variable verdict.
+    The precision_budget block is
+      {target_kind, target_value, source, claimed_output_precision,
+       headroom_argument}
+    and links the verdict back to the tolerance.
 
   - rewriter: takes a single task_prompt string and returns the rewritten
     kernel. It will only change variables the prompt tells it to change
@@ -64,41 +103,66 @@ You have access to three specialist agents:
     contain both the kernel source and the analyst's full verdict in a
     form the rewriter can act on.
 
-  - verifier: takes the original source, the rewritten source, and the
-    analyst's verdict (as a JSON string), and returns
+  - verifier: takes the original source, the rewritten source, the
+    analyst's verdict (as a JSON string), and the tolerance, and returns
     {verdict: accept|reject, per_variable: [...], concerns: [...]}.
     It checks faithfulness of the rewrite to the verdict (including any
-    suggested rework); it does not re-judge whether the verdict was
-    numerically correct.
+    suggested rework) and flags concerns when the analyst's precision
+    budget looks tight against the tolerance. It does not re-judge
+    whether the verdict was numerically correct.
 
 You also have a finish tool to emit the final answer.
 
-Your job:
-1. Read the kernel given to you in the user message.
-2. Call spawn_analyst with the kernel source to get a verdict.
-3. Translate the analyst's verdict into a self-contained task_prompt for
-   the rewriter. The prompt must include the full kernel source and, for
-   each variable, the analyst's chosen method (downcast / emulate / keep)
-   together with target_precision or emulation_type as applicable. If
-   the analyst's rework.suggested is true, include the transformation,
-   rationale, and affected_variables verbatim and tell the rewriter to
-   apply that transformation in addition to the per-variable changes.
-   Do not editorialize — faithfully convey the analyst's calls and do
-   not choose a method the analyst did not ask for.
-4. Call spawn_rewriter with that task_prompt.
-5. Call spawn_verifier with (original_source, rewritten_source from the
-   rewriter, analyst_verdict_json). The analyst_verdict_json argument must
-   be the analyst's full result object serialized as a JSON string.
-6. If the verifier returns verdict='accept', call finish with the
+Tolerance handling:
+- The user message will tell you either a concrete tolerance
+  ({kind, value, source='user_cli'}) or that no tolerance was given.
+- If no tolerance was given: call spawn_precision_advisor first. If the
+  advisor returns kind='sig_figs' or 'decimal_digits', use that value
+  with source='precision_advisor' as the agreed tolerance for the rest
+  of the run. If the advisor returns kind='unknown', fall back to the
+  default {kind:'sig_figs', value:6, source:'advisor_unknown_defaulted'}
+  and use that as the agreed tolerance.
+- Once an agreed tolerance is fixed, thread it verbatim into the
+  task prompts of analyst, rewriter, and verifier. The analyst MUST
+  see {target_kind, target_value, source}; the rewriter SHOULD see the
+  tolerance for context; the verifier MUST see the same tolerance the
+  analyst saw so it can audit the precision_budget block.
+
+Your job after the tolerance is fixed:
+1. Call spawn_analyst with a kernel_source argument that contains the
+   kernel and a clearly-labeled tolerance block (target_kind,
+   target_value, source). The analyst will fill precision_budget from
+   that block.
+2. Translate the analyst's verdict into a self-contained task_prompt for
+   the rewriter. The prompt must include the full kernel source, the
+   agreed tolerance, and, for each variable, the analyst's chosen
+   method (downcast / emulate / keep) together with target_precision or
+   emulation_type as applicable. If the analyst's rework.suggested is
+   true, include the transformation, rationale, and affected_variables
+   verbatim and tell the rewriter to apply that transformation in
+   addition to the per-variable changes. Do not editorialize —
+   faithfully convey the analyst's calls and do not choose a method the
+   analyst did not ask for.
+3. Call spawn_rewriter with that task_prompt.
+4. Call spawn_verifier with (original_source, rewritten_source from the
+   rewriter, analyst_verdict_json, tolerance_json). The
+   analyst_verdict_json argument must be the analyst's full result
+   object serialized as a JSON string. The tolerance_json argument
+   must be the agreed tolerance serialized as a JSON string.
+5. If the verifier returns verdict='accept', call finish with the
    rewritten code. If verdict='reject', either call spawn_rewriter again
    with a task_prompt that incorporates the verifier's per-variable
    mismatches and concerns, or — if the verifier's `concerns` implicate
-   the analyst's verdict itself — call spawn_analyst again. After any
-   re-run, you must call spawn_verifier again on the new rewrite before
-   calling finish.
+   the analyst's verdict itself — call spawn_analyst again with the
+   same tolerance. After any re-run, you must call spawn_verifier again
+   on the new rewrite before calling finish.
 
-Hard rule: you may not call finish unless the most recent spawn_verifier
-call returned verdict='accept'.
+Hard rules:
+- You may not call finish unless the most recent spawn_verifier call
+  returned verdict='accept'.
+- You may not call spawn_precision_advisor if the user message
+  provided a tolerance. You may not call spawn_precision_advisor more
+  than once.
 
 Be deliberate. Each spawn_* call costs another model call and the user
 will inspect every prompt before it runs. Prefer one well-crafted prompt
@@ -106,11 +170,12 @@ over several short ones."""
 
 ORCHESTRATOR_TOOLS = [
     {
-        "name": "spawn_analyst",
+        "name": "spawn_precision_advisor",
         "description": (
-            "Run the analyst agent on a kernel source. "
-            "Returns {variables: [{name, action, target_precision, reason}], "
-            "overall_notes}."
+            "Run the precision_advisor agent on a kernel source to infer "
+            "an output-precision tolerance. Use only when the user did not "
+            "specify a tolerance on the command line. Returns "
+            "{kind, value, rationale, confidence, alternative}."
         ),
         "input_schema": {
             "type": "object",
@@ -118,9 +183,36 @@ ORCHESTRATOR_TOOLS = [
                 "kernel_source": {
                     "type": "string",
                     "description": (
-                        "The full kernel source to analyze. Do not include "
-                        "file paths, framing hints, or any other text — the "
-                        "analyst should see only the source."
+                        "The full kernel source. Do not include file paths, "
+                        "framing hints, or any other text — the advisor "
+                        "should see only the source."
+                    ),
+                },
+            },
+            "required": ["kernel_source"],
+        },
+    },
+    {
+        "name": "spawn_analyst",
+        "description": (
+            "Run the analyst agent on a kernel source AND a tolerance. "
+            "The kernel_source argument must contain both the kernel and a "
+            "clearly-labeled tolerance block (target_kind, target_value, "
+            "source). Returns the analyst's per-variable verdict, rework "
+            "block, precision_budget, and overall_notes."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "kernel_source": {
+                    "type": "string",
+                    "description": (
+                        "The full kernel source with a clearly-labeled "
+                        "tolerance block prepended or appended (containing "
+                        "target_kind, target_value, source). The analyst "
+                        "must see the tolerance so it can fill in "
+                        "precision_budget. Do not include file paths or "
+                        "other framing."
                     ),
                 },
             },
@@ -152,7 +244,8 @@ ORCHESTRATOR_TOOLS = [
         "name": "spawn_verifier",
         "description": (
             "Run the verifier agent. It compares the rewritten source to "
-            "the analyst's verdict and returns "
+            "the analyst's verdict, audits the precision_budget against "
+            "the tolerance, and returns "
             "{verdict: accept|reject, per_variable: [...], concerns: [...]}. "
             "Must be called after spawn_rewriter and before finish."
         ),
@@ -163,7 +256,8 @@ ORCHESTRATOR_TOOLS = [
                     "type": "string",
                     "description": (
                         "The original kernel source, exactly as it was given "
-                        "to the analyst."
+                        "to the analyst (without the tolerance block; the "
+                        "verifier reconstructs that from tolerance_json)."
                     ),
                 },
                 "rewritten_source": {
@@ -181,11 +275,22 @@ ORCHESTRATOR_TOOLS = [
                         "back from spawn_analyst)."
                     ),
                 },
+                "tolerance_json": {
+                    "type": "string",
+                    "description": (
+                        "The agreed output-precision tolerance as a JSON "
+                        "string with keys {kind, value, source}, matching "
+                        "what the analyst was given. Use kind='sig_figs' "
+                        "or 'decimal_digits'; source is 'user_cli', "
+                        "'precision_advisor', or 'advisor_unknown_defaulted'."
+                    ),
+                },
             },
             "required": [
                 "original_source",
                 "rewritten_source",
                 "analyst_verdict_json",
+                "tolerance_json",
             ],
         },
     },
@@ -233,6 +338,9 @@ def _hitl_pause(tool_name: str, tool_input: dict) -> str:
 
 def _execute_tool(tool_name: str, tool_input: dict) -> dict:
     """Actually run the requested tool. Returns the result to feed back."""
+    if tool_name == "spawn_precision_advisor":
+        result = run_agent("precision_advisor", tool_input["kernel_source"])
+        return {"status": "ok", "result": result}
     if tool_name == "spawn_analyst":
         result = run_agent("analyst", tool_input["kernel_source"])
         return {"status": "ok", "result": result}
@@ -246,29 +354,73 @@ def _execute_tool(tool_name: str, tool_input: dict) -> dict:
             "REWRITTEN SOURCE:\n"
             f"{tool_input['rewritten_source']}\n\n"
             "ANALYST VERDICT (JSON):\n"
-            f"{tool_input['analyst_verdict_json']}\n"
+            f"{tool_input['analyst_verdict_json']}\n\n"
+            "TOLERANCE (JSON):\n"
+            f"{tool_input['tolerance_json']}\n"
         )
         result = run_agent("verifier", task)
         return {"status": "ok", "result": result}
     raise ValueError(f"Unknown tool: {tool_name}")
 
 
+def _format_tolerance_block(tolerance: dict | None) -> str:
+    """Render the tolerance block embedded in the initial user message.
+
+    `tolerance` is either None (no user-supplied tolerance; the
+    orchestrator must call spawn_precision_advisor first) or a dict
+    with keys {kind, value, source}.
+    """
+    if tolerance is None:
+        return (
+            "OUTPUT-PRECISION TOLERANCE: not specified by the user.\n"
+            "You MUST call spawn_precision_advisor first with the kernel "
+            "source. Then:\n"
+            "  - if the advisor returns kind='sig_figs' or "
+            "'decimal_digits', use {kind, value, source='precision_advisor'} "
+            "as the agreed tolerance;\n"
+            "  - if the advisor returns kind='unknown', use the documented "
+            "fallback {kind:'sig_figs', value:6, "
+            "source:'advisor_unknown_defaulted'} as the agreed tolerance.\n"
+            "Thread the agreed tolerance verbatim into the analyst, "
+            "rewriter, and verifier task prompts."
+        )
+    return (
+        "OUTPUT-PRECISION TOLERANCE (user-supplied; do NOT call "
+        "spawn_precision_advisor):\n"
+        f"  kind:   {tolerance['kind']}\n"
+        f"  value:  {tolerance['value']}\n"
+        f"  source: {tolerance['source']}\n"
+        "Thread this tolerance verbatim into the analyst, rewriter, and "
+        "verifier task prompts."
+    )
+
+
 def run_orchestrator(
     kernel_path: str,
     kernel_source: str,
+    tolerance: dict | None = None,
     max_turns: int = MAX_TURNS,
 ) -> dict | None:
     """Run the orchestrator loop.
 
+    `tolerance` is either None (no user-supplied tolerance; the
+    orchestrator will be instructed to call spawn_precision_advisor
+    first) or a dict {kind, value, source} where kind is one of
+    'sig_figs' or 'decimal_digits', value is a small positive integer,
+    and source is 'user_cli'.
+
     Returns the final finish() arguments dict, or None if the user quit,
     the orchestrator stopped without finishing, or max_turns was exhausted.
     """
+    tolerance_block = _format_tolerance_block(tolerance)
     user_message = (
         f"Kernel file: {kernel_path}\n\n"
         f"Kernel source:\n```\n{kernel_source}\n```\n\n"
+        f"{tolerance_block}\n\n"
         "Rewrite this kernel to reduce precision cost where safe (via "
         "downcast, emulation, or — if warranted — a kernel-shape rework), "
-        "preserving output precision where it is not."
+        "so that the rewritten kernel's output stays within the agreed "
+        "tolerance above."
     )
     messages: list[dict] = [{"role": "user", "content": user_message}]
 

@@ -31,6 +31,13 @@ def test_returns_submit_result_input(fake_anthropic):
             "rationale": "",
             "affected_variables": [],
         },
+        "precision_budget": {
+            "target_kind": "sig_figs",
+            "target_value": 6,
+            "source": "user_cli",
+            "claimed_output_precision": "~7 sig figs",
+            "headroom_argument": "dominant rounding is in the sum",
+        },
         "overall_notes": "ok",
     }
     fake = fake_anthropic([
@@ -54,6 +61,7 @@ def test_returns_submit_result_input(fake_anthropic):
     assert tools[0]["input_schema"]["required"] == [
         "variables",
         "rework",
+        "precision_budget",
         "overall_notes",
     ]
 
