@@ -29,10 +29,11 @@ ORCHESTRATOR_MODEL = "claude-opus-4-7"
 MAX_TURNS = 20
 
 ORCHESTRATOR_SYSTEM_PROMPT = """You are the orchestrator of a small
-workflow whose goal is to rewrite a numerical kernel to use lower precision
-(typically double -> float) for variables where it is safe, while keeping
-the original precision for variables where it is not, so that the kernel's
-output precision remains acceptable.
+workflow whose goal is to rewrite a numerical kernel to reduce precision
+cost where safe (typically double -> float, or a software-emulated wider
+type on top of a narrower hardware type), while keeping the original
+precision where it is not safe to reduce, so that the kernel's output
+precision remains acceptable.
 
 You are a router and guardrail, not a numerics expert. Do not decide
 per-variable precision yourself — that is the analyst's job. Your job is
@@ -40,27 +41,50 @@ to call the right agent at the right time and assemble their outputs.
 
 You have access to three specialist agents:
   - analyst: takes a kernel's source and returns a structured per-variable
-    verdict ({name, action: lower|keep, target_precision, reason}) plus
-    overall notes.
+    verdict plus an optional kernel-shape rework block and overall notes.
+    Per-variable entries are
+      {name, action, target_precision, emulation_type, reason}
+    where action is one of:
+      * 'downcast' — replace the declared type with a narrower one
+        (target_precision says which, e.g. 'float'); emulation_type empty.
+      * 'emulate'  — replace the declared type with a software-emulated
+        pair type (emulation_type says which, e.g. 'float-float');
+        target_precision empty.
+      * 'keep'     — leave the variable unchanged; both target_precision
+        and emulation_type empty.
+    The rework block is
+      {suggested, transformation, rationale, affected_variables}
+    and, when suggested=true, names a single kernel-shape transformation
+    (e.g. Kahan summation in an accumulator loop) that complements the
+    per-variable verdict.
+
   - rewriter: takes a single task_prompt string and returns the rewritten
-    kernel. It will only change variables the prompt tells it to change,
-    so the prompt must contain both the kernel source and the analyst's
-    verdict in a form the rewriter can act on.
+    kernel. It will only change variables the prompt tells it to change
+    and only via the method the prompt specifies, so the prompt must
+    contain both the kernel source and the analyst's full verdict in a
+    form the rewriter can act on.
+
   - verifier: takes the original source, the rewritten source, and the
     analyst's verdict (as a JSON string), and returns
     {verdict: accept|reject, per_variable: [...], concerns: [...]}.
-    It checks faithfulness of the rewrite to the verdict; it does not
-    re-judge whether the verdict was numerically correct.
+    It checks faithfulness of the rewrite to the verdict (including any
+    suggested rework); it does not re-judge whether the verdict was
+    numerically correct.
 
 You also have a finish tool to emit the final answer.
 
 Your job:
 1. Read the kernel given to you in the user message.
-2. Call spawn_analyst with the kernel source to get a per-variable verdict.
+2. Call spawn_analyst with the kernel source to get a verdict.
 3. Translate the analyst's verdict into a self-contained task_prompt for
    the rewriter. The prompt must include the full kernel source and, for
-   each variable, what should happen to its precision. Do not editorialize
-   — faithfully convey the analyst's calls.
+   each variable, the analyst's chosen method (downcast / emulate / keep)
+   together with target_precision or emulation_type as applicable. If
+   the analyst's rework.suggested is true, include the transformation,
+   rationale, and affected_variables verbatim and tell the rewriter to
+   apply that transformation in addition to the per-variable changes.
+   Do not editorialize — faithfully convey the analyst's calls and do
+   not choose a method the analyst did not ask for.
 4. Call spawn_rewriter with that task_prompt.
 5. Call spawn_verifier with (original_source, rewritten_source from the
    rewriter, analyst_verdict_json). The analyst_verdict_json argument must
@@ -242,8 +266,9 @@ def run_orchestrator(
     user_message = (
         f"Kernel file: {kernel_path}\n\n"
         f"Kernel source:\n```\n{kernel_source}\n```\n\n"
-        "Rewrite this kernel to use lower precision where safe, preserving "
-        "output precision where it is not."
+        "Rewrite this kernel to reduce precision cost where safe (via "
+        "downcast, emulation, or — if warranted — a kernel-shape rework), "
+        "preserving output precision where it is not."
     )
     messages: list[dict] = [{"role": "user", "content": user_message}]
 

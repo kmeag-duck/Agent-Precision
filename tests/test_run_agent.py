@@ -17,8 +17,20 @@ def test_returns_submit_result_input(fake_anthropic):
     """run_agent returns the input dict of the agent's submit_result call and forces the submit_result schema."""
     payload = {
         "variables": [
-            {"name": "x", "action": "lower", "target_precision": "float", "reason": "bounded"},
+            {
+                "name": "x",
+                "action": "downcast",
+                "target_precision": "float",
+                "emulation_type": "",
+                "reason": "bounded",
+            },
         ],
+        "rework": {
+            "suggested": False,
+            "transformation": "",
+            "rationale": "",
+            "affected_variables": [],
+        },
         "overall_notes": "ok",
     }
     fake = fake_anthropic([
@@ -39,7 +51,11 @@ def test_returns_submit_result_input(fake_anthropic):
     tools = call["tools"]
     assert len(tools) == 1
     assert tools[0]["name"] == "submit_result"
-    assert tools[0]["input_schema"]["required"] == ["variables", "overall_notes"]
+    assert tools[0]["input_schema"]["required"] == [
+        "variables",
+        "rework",
+        "overall_notes",
+    ]
 
 
 def test_raises_when_agent_does_not_call_submit_result(fake_anthropic):

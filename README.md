@@ -19,7 +19,14 @@ otherwise burn you.
 
 What works today:
 
-- Two-agent pipeline: **analyst → rewriter**, driven by an LLM orchestrator.
+- Three-agent pipeline: **analyst → rewriter → verifier**, driven by an LLM
+  orchestrator. The orchestrator's system prompt forbids calling `finish`
+  unless the most recent verifier returned `verdict='accept'`.
+- Analyst can choose between three per-variable methods —
+  `downcast` (replace with a narrower hardware type, e.g. `double → float`),
+  `emulate` (replace with a software-emulated pair, currently float-float /
+  Dekker written inline as `struct ff_t {float hi, lo;}`), or `keep` — and
+  can additionally suggest a kernel-shape `rework` such as Kahan summation.
 - Human-in-the-loop pause before every agent call (`y` / `n` / `q`).
   Rejections are fed back to the orchestrator as
   `{"status": "rejected_by_user"}`, so it can self-correct without burning
@@ -31,8 +38,9 @@ What works today:
 
 What is intentionally **not** here yet:
 
-- No verifier agent. The orchestrator can `spawn_rewriter → finish` without
-  anyone checking correctness.
+- The verifier is a **static / textual** check: it compares the rewritten
+  code against the analyst's verdict for faithfulness. No mechanical
+  verification.
 - No compilation check, no accuracy check, no benchmark runner.
 - No automated evaluation across the `test-kernels/` corpus.
 - No framework (LangGraph etc.). See "Design notes" and "Roadmap" below.
@@ -82,15 +90,22 @@ tools are one per agent type plus a `finish` tool.
 flowchart TD
   U["python -m workflow.run &lt;kernel&gt;"] --> O["Orchestrator (Claude)"]
   O -- "tool_use" --> H{"HITL pause<br/>y / n / q"}
-  H -- "n" --> O
+  H -- "n: {status: rejected_by_user}" --> O
   H -- "q" --> X(["exit"])
   H -- "y" --> D{"which tool?"}
   D -- "spawn_analyst" --> A["Analyst agent"]
   D -- "spawn_rewriter" --> R["Rewriter agent"]
+  D -- "spawn_verifier" --> V["Verifier agent"]
   D -- "finish" --> F(["print final kernel + notes"])
-  A -- "{variables, overall_notes}" --> O
+  A -- "{variables, rework, overall_notes}" --> O
   R -- "{rewritten_code, summary_of_changes}" --> O
+  V -- "{verdict, per_variable, concerns}" --> O
 ```
+
+Edge enforcement: the `analyst → rewriter → verifier → finish` order and
+the "no `finish` without `verdict='accept'`" rule live in the
+orchestrator's **system prompt**, not in code. The HITL pause and the
+`MAX_TURNS=20` backstop are the only code-level guardrails.
 
 Intended happy path through the conversation:
 
@@ -100,27 +115,39 @@ sequenceDiagram
   participant Orch as Orchestrator
   participant An as Analyst
   participant Rw as Rewriter
+  participant Vf as Verifier
   User->>Orch: kernel source
   Orch->>User: HITL: spawn_analyst(kernel_source)?
   User->>Orch: y
   Orch->>An: kernel_source
-  An-->>Orch: per-variable verdict
+  An-->>Orch: per-variable verdict + rework
   Orch->>User: HITL: spawn_rewriter(task_prompt)?
   User->>Orch: y
-  Orch->>Rw: task_prompt (source + verdict)
+  Orch->>Rw: task_prompt (source + verdict + rework)
   Rw-->>Orch: rewritten_code
+  Orch->>User: HITL: spawn_verifier(original, rewritten, verdict_json)?
+  User->>Orch: y
+  Orch->>Vf: (original, rewritten, verdict_json)
+  Vf-->>Orch: {verdict: accept, per_variable, concerns}
   Orch->>User: HITL: finish(rewritten_code, notes)?
   User->>Orch: y
   Orch-->>User: final kernel
 ```
 
+On `verdict='reject'`, the orchestrator either re-spawns the rewriter
+with a task prompt that incorporates the verifier's mismatches and
+concerns, or — if those concerns implicate the analyst's verdict itself
+— re-spawns the analyst. Either way, a fresh `spawn_verifier` must
+return `accept` before `finish` is allowed.
+
 ## Agents
 
-| Agent          | Model             | Input                                                | Output (schema keys)                                                       | Defined in                |
-| -------------- | ----------------- | ---------------------------------------------------- | -------------------------------------------------------------------------- | ------------------------- |
-| `analyst`      | `claude-opus-4-7` | kernel source only                                   | `variables[{name, action, target_precision, reason}]`, `overall_notes`     | `workflow/registry.py`    |
-| `rewriter`     | `claude-opus-4-7` | `task_prompt` (source + verdict, composed by orch.)  | `rewritten_code`, `summary_of_changes`                                     | `workflow/registry.py`    |
-| `orchestrator` | `claude-opus-4-7` | kernel path + source                                 | one `finish(rewritten_code, notes)` call                                   | `workflow/orchestrator.py` |
+| Agent          | Model             | Input                                                              | Output (schema keys)                                                                                                                                                                 | Defined in                 |
+| -------------- | ----------------- | ------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------- |
+| `analyst`      | `claude-opus-4-7` | kernel source only                                                 | `variables[{name, action, target_precision, emulation_type, reason}]`, `rework{suggested, transformation, rationale, affected_variables}`, `overall_notes`                           | `workflow/registry.py`     |
+| `rewriter`     | `claude-opus-4-7` | `task_prompt` (source + verdict + any rework, composed by orch.)   | `rewritten_code`, `summary_of_changes`                                                                                                                                               | `workflow/registry.py`     |
+| `verifier`     | `claude-opus-4-7` | original source, rewritten source, analyst verdict (JSON string)   | `verdict` (`accept`/`reject`), `per_variable[{name, expected_action, observed_action, ok}]`, `concerns`                                                                         | `workflow/registry.py`     |
+| `orchestrator` | `claude-opus-4-7` | kernel path + source                                               | one `finish(rewritten_code, notes)` call                                                                                                                                             | `workflow/orchestrator.py` |
 
 The analyst receives the kernel source only — no file path, no orchestrator
 hints — so that ground-truth labels encoded in directory names cannot leak
@@ -128,11 +155,12 @@ into the verdict.
 
 ## Orchestrator tools
 
-| Tool             | Purpose             | Input                       | Returns to orchestrator                                       |
-| ---------------- | ------------------- | --------------------------- | ------------------------------------------------------------- |
-| `spawn_analyst`  | dispatch to analyst | `kernel_source: string`     | analyst's structured output, or `{"status":"rejected_by_user"}` |
-| `spawn_rewriter` | dispatch to rewriter | `task_prompt: string`       | rewriter's structured output, or `{"status":"rejected_by_user"}` |
-| `finish`         | end the workflow    | `rewritten_code`, `notes`   | (terminates; nothing fed back)                                |
+| Tool             | Purpose              | Input                                                                       | Returns to orchestrator                                          |
+| ---------------- | -------------------- | --------------------------------------------------------------------------- | ---------------------------------------------------------------- |
+| `spawn_analyst`  | dispatch to analyst  | `kernel_source: string`                                                     | analyst's structured output, or `{"status":"rejected_by_user"}`  |
+| `spawn_rewriter` | dispatch to rewriter | `task_prompt: string`                                                       | rewriter's structured output, or `{"status":"rejected_by_user"}` |
+| `spawn_verifier` | dispatch to verifier | `original_source: string`, `rewritten_source: string`, `analyst_verdict_json: string` | verifier's structured output, or `{"status":"rejected_by_user"}` |
+| `finish`         | end the workflow     | `rewritten_code`, `notes`                                                   | (terminates; nothing fed back)                                   |
 
 ## Repo layout
 
@@ -163,8 +191,15 @@ into the verdict.
 rewriter mechanical — it transforms code to match an explicit verdict and
 does not exercise numerical judgment. Makes the HITL pause informative,
 because the verdict is human-readable structured data before any code is
-touched. And it gives a future verifier a structured artifact to check
+touched. And it gives the verifier a structured artifact to check
 against, separate from the code diff.
+
+**Why the verifier is a separate (static) agent.** Faithfulness of the
+rewrite to the verdict is a textual check the rewriter cannot honestly
+self-report. Splitting it out also draws a clean line for future
+mechanical verifiers (compile, run, compare): those will be orchestrator
+**tools**, not new agents, because they are deterministic and shouldn't
+burn an LLM call.
 
 **Why HITL on every tool call.** This is a learning-by-watching tool, not
 a production system. Seeing the exact prompt that is about to be sent to
@@ -179,18 +214,39 @@ prototype small as new agent types are added.
 
 **Why no framework (LangGraph etc.) yet.** Not enough nodes or edges to
 justify it. The orchestrator is a single Claude conversation with a HITL
-gate; that is easier to read in ~230 lines of Python than as a graph
-config. Revisit once a verifier exists and there are real cycles.
+gate; that is easier to read in ~340 lines of Python than as a graph
+config. Revisit only if we get parallel branches (e.g. multiple rewrite
+candidates evaluated concurrently), async/durable state across long jobs
+(see "JLSE / async toolchain" in `AGENTS.md`), or a non-CLI frontend.
+Intermediate alternatives to try first: an explicit `OrchestratorState`
+dataclass, or pickled-message resume.
 
 ## Roadmap
 
-1. **Verifier agent** — compile the rewritten kernel and check accuracy
-   against a reference run, using the same registry pattern (one new entry
-   in `AGENTS`, one new tool on the orchestrator).
-2. **Corpus evaluation** — run the workflow across all 17 kernels in
-   `test-kernels/` and compare its per-variable verdicts to
-   `test-kernels/SUMMARY.md`.
-3. **Reconsider framework choice** — once node count and edge complexity
-   (retries, verifier feedback loops, branching) warrant it, evaluate
-   LangGraph or similar. Likely direction if it happens: LangGraph for the
-   runtime, raw Anthropic SDK inside nodes, no LangChain.
+Authoritative list lives in `AGENTS.md` under "Planned next steps"; this
+is a reader-facing summary.
+
+1. **Dynamic verification stack.** Mechanical verifiers — compile the
+   rewritten kernel, run it against a baseline, compare outputs within
+   tolerance — exposed to the orchestrator as new **tools** (not new
+   agents), with a `{status, stdout, stderr, artifacts}` return shape so
+   the same interface survives migration to a remote batch system. Will
+   likely require raising `MAX_TURNS` past 20.
+2. **Baseline harness agent.** A one-shot LLM agent that, given the
+   original kernel, writes a small driver + reference inputs + expected
+   outputs. The mechanical verifier above runs the harness against both
+   original and rewritten kernels. Generated once per kernel, reused on
+   every rewrite attempt.
+3. **JLSE / async toolchain migration.** Move compile/run from the local
+   host to a remote scheduler. The verifier tool interfaces in (1) are
+   designed so the orchestrator loop doesn't change when "run" becomes
+   "submit job, poll, fetch artifacts".
+4. **Emulation library upgrade.** v0 writes `struct ff_t {float hi, lo;}`
+   plus Dekker two-sum/two-prod inline. Vendoring a real float-float
+   header becomes safe once mechanical verification can catch regressions.
+5. **Corpus evaluation.** Run the workflow across all 17 kernels in
+   `test-kernels/` and compare its per-variable verdicts and rework
+   suggestions to `test-kernels/SUMMARY.md`.
+
+Explicitly **not** on the roadmap (see `AGENTS.md` for rationale):
+multiple per-method analysts, and adopting LangGraph at this scale.

@@ -45,10 +45,14 @@ Use `scripts/run-argo.sh` instead only when `argo-proxy` isn't installed on this
 
 - `workflow/registry.py` — `AGENTS` dict is the single source of truth for agent types. Each entry = `{system_prompt, output_schema, model}`. **Adding a new agent type = one new entry here, nothing else changes.**
 - `workflow/run_agent.py` — generic `run_agent(type, task) -> dict`. Forces the agent to call a `submit_result` tool whose schema is the registry's `output_schema`. Never edit this when adding agent types.
-- `workflow/orchestrator.py` — itself a Claude conversation. Tools are one-per-agent-type (`spawn_rewriter`) plus `finish`. Contains the **human-in-the-loop pause** (`_hitl_pause`): every tool call is shown and the user must approve `y/n/q` before it runs. This pause is the whole point of v0 — do not remove it or auto-approve.
+- `workflow/orchestrator.py` — itself a Claude conversation. Tools are one-per-agent-type (`spawn_analyst`, `spawn_rewriter`, `spawn_verifier`) plus `finish`. Contains the **human-in-the-loop pause** (`_hitl_pause`): every tool call is shown and the user must approve `y/n/q` before it runs. This pause is the whole point of v0 — do not remove it or auto-approve. A `MAX_TURNS=20` backstop guards against runaway loops if the HITL is left unattended; don't raise it casually.
 - `workflow/run.py` — thin CLI; takes one path argument, prints final code + notes.
 
 Rejecting (`n`) returns `{"status": "rejected_by_user"}` to the orchestrator so it can self-correct without burning an agent API call — that behavior is intentional.
+
+The orchestrator system prompt enforces the pipeline `analyst -> rewriter -> verifier -> finish`, and explicitly forbids calling `finish` unless the most recent `spawn_verifier` returned `verdict='accept'`. That rule lives in the prompt, not in code — the orchestrator is trusted to obey it. If you add a hard guard, do it in `orchestrator.py` and keep the prompt in sync.
+
+The analyst's per-variable `action` enum is `{downcast, emulate, keep}`. `downcast` replaces a type with a narrower hardware type (e.g. `double` -> `float`) and uses `target_precision`; `emulate` replaces a type with a software-emulated pair (currently float-float / Dekker, written inline as `struct ff_t {float hi, lo;}` per the rewriter prompt) and uses `emulation_type`; `keep` leaves the variable alone. The analyst's top-level result also includes a required `rework` object (`{suggested, transformation, rationale, affected_variables}`) for kernel-shape changes such as Kahan summation; when no rework is warranted the analyst still returns the object with `suggested=false` and empty fields rather than omitting it. The verifier's `expected_action` enum mirrors the analyst's; its `observed_action` enum adds `unclear`. If you rename any of these tokens, update `registry.py`, `orchestrator.py`'s system prompt, and the tests in `tests/test_registry.py` / `tests/test_orchestrator.py` together — they are deliberately coupled.
 
 ## Model names look wrong but aren't (verify before changing)
 
@@ -68,13 +72,20 @@ The `provider.argo` config in `opencode.json` points at `argo-proxy` on `:52675`
 
 Argonne-specific: opens an SSH tunnel through `logins.cels.anl.gov` → `homes.cels.anl.gov` and runs `~/lmtools-main/bin/apiproxy` remotely. Requires Duo. Only relevant when using OpenCode itself against Argo from JLSE; unrelated to running the Python workflow.
 
-## No verifier yet
-
-The orchestrator can `spawn_rewriter` → `finish` without anyone checking correctness. Adding a verifier agent is the next planned step. If you add one, follow the registry pattern: one new entry in `AGENTS`, one new tool on the orchestrator, no edits to `run_agent`.
-
 ## Conventions
 
 - No linter, formatter, or typecheck configured. Don't invent commands; ask before adding tooling.
 - Layer 1 tests (workflow plumbing) live in `tests/`; run with `python -m pytest -q` for a terse pass/fail, or `python -m pytest -v` to see each test's docstring appended to its node id as a self-describing checklist (a `pytest_collection_modifyitems` hook in `tests/conftest.py` does the appending). They monkeypatch `anthropic.Anthropic` and make zero network calls. There is no Layer 2 (agent-judgment) evaluation harness yet.
 - Python 3.10+ (uses `dict | None`).
 - Keep agent system prompts in `registry.py`, not scattered. Keep orchestrator prompt in `orchestrator.py`.
+
+## Planned next steps (not yet implemented)
+
+Documented here so future sessions don't relitigate decisions or accidentally double-implement them. None of these are in the code today.
+
+- **Dynamic verification stack.** The current `verifier` agent only checks faithfulness of the rewrite to the analyst's verdict (a static / textual check). The plan is to add *mechanical* verifiers — compile the rewritten kernel, run it against a baseline, compare outputs within tolerance — exposed to the orchestrator as new tools (not new agents), because they are deterministic and shouldn't burn an LLM call. Tool return shape should be `{status, stdout, stderr, artifacts}` from day one so the same interface survives migration from local Kokkos+CUDA to a remote batch system (see "JLSE/async toolchain" below). Landing this will likely require raising `MAX_TURNS` past 20.
+- **Baseline harness agent.** A one-shot LLM agent that, given the original kernel, writes a small driver + reference inputs + expected outputs. The mechanical verifier above then runs the harness against both original and rewritten kernels. The harness is generated *once* per kernel and reused on every rewrite attempt.
+- **JLSE / async toolchain migration.** Current host has Kokkos+CUDA locally; future runs will submit compile/run jobs to a remote scheduler. Designing the verifier tool interfaces around `{status, stdout, stderr, artifacts}` now means the orchestrator loop doesn't change when "run" becomes "submit job, poll, fetch artifacts".
+- **Emulation library upgrade.** v0 writes `struct ff_t {float hi, lo;}` plus Dekker two-sum/two-prod inline (per the rewriter prompt) rather than vendoring a real float-float library. Replacing this with a proper header is straightforward once we have mechanical verification to catch regressions.
+- **Rejected: multiple per-method analysts.** Considered splitting the analyst into priority-ordered specialists (downcast-first, then emulate, then rework). Rejected: more moving parts, breaks the "one entry in `AGENTS` per agent type" invariant, and gives no clear win over a single analyst with a richer output schema. Revisit only if a single analyst proves to systematically under-explore one method.
+- **Rejected: LangGraph (or similar framework).** Considered for state management as the pipeline grows. Rejected for v0: adds a dependency and an abstraction layer for a workflow that is still linear and synchronous. Revisit only if we get *parallel* branches (e.g. multiple rewrite candidates evaluated concurrently), async/durable state across long jobs, or a non-CLI frontend. Intermediate alternatives to try first: an explicit `OrchestratorState` dataclass, or pickled-message resume.

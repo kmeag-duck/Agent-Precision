@@ -10,6 +10,7 @@ import pytest
 
 from workflow import orchestrator
 from workflow.orchestrator import (
+    ORCHESTRATOR_SYSTEM_PROMPT,
     _execute_tool,
     _hitl_pause,
     run_orchestrator,
@@ -255,3 +256,14 @@ def test_run_orchestrator_stop_without_tool_returns_none(
     _scripted_input(monkeypatch, [])
 
     assert run_orchestrator("k.cpp", "src") is None
+
+
+# ---------- Orchestrator prompt: vocabulary matches the analyst's three methods ----------
+
+
+def test_orchestrator_prompt_names_all_three_methods_and_rework():
+    """The orchestrator prompt names downcast, emulate, keep, and the rework block, so its task-prompt translation step has the right vocabulary to pass to the rewriter."""
+    for token in ("downcast", "emulate", "keep", "rework"):
+        assert token in ORCHESTRATOR_SYSTEM_PROMPT, (
+            f"orchestrator prompt missing {token!r}"
+        )

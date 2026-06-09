@@ -1,6 +1,6 @@
 """Registry shape tests. No mocks, no network."""
 
-from workflow.registry import AGENTS
+from workflow.registry import AGENTS, ANALYST_OUTPUT_SCHEMA, VERIFIER_OUTPUT_SCHEMA
 
 
 def test_known_agent_types():
@@ -46,3 +46,83 @@ def test_output_schemas_are_object_schemas():
             assert req_key in schema["properties"], (
                 f"{name} required key {req_key!r} not in properties"
             )
+
+
+# ---------- Analyst schema: three-method action enum + rework block ----------
+
+
+def test_analyst_action_enum_is_downcast_emulate_keep():
+    """The analyst's per-variable action enum is exactly {downcast, emulate, keep}."""
+    item = ANALYST_OUTPUT_SCHEMA["properties"]["variables"]["items"]
+    assert set(item["properties"]["action"]["enum"]) == {"downcast", "emulate", "keep"}
+
+
+def test_analyst_variable_item_requires_emulation_type():
+    """Each per-variable entry requires emulation_type (alongside target_precision) so the rewriter sees both fields explicitly even for 'keep'."""
+    item = ANALYST_OUTPUT_SCHEMA["properties"]["variables"]["items"]
+    assert "emulation_type" in item["properties"]
+    assert "emulation_type" in item["required"]
+    assert "target_precision" in item["required"]
+
+
+def test_analyst_schema_requires_rework_block():
+    """The analyst top-level schema requires a rework object so the analyst is forced to give an explicit 'no rework' answer rather than omitting the field."""
+    assert "rework" in ANALYST_OUTPUT_SCHEMA["required"]
+    rework = ANALYST_OUTPUT_SCHEMA["properties"]["rework"]
+    assert rework["type"] == "object"
+    assert set(rework["required"]) == {
+        "suggested",
+        "transformation",
+        "rationale",
+        "affected_variables",
+    }
+    assert rework["properties"]["suggested"]["type"] == "boolean"
+    assert rework["properties"]["affected_variables"]["type"] == "array"
+
+
+# ---------- Verifier schema: enums track the analyst's three methods ----------
+
+
+def test_verifier_expected_action_enum_matches_analyst():
+    """The verifier's expected_action enum mirrors the analyst's action enum."""
+    item = VERIFIER_OUTPUT_SCHEMA["properties"]["per_variable"]["items"]
+    assert set(item["properties"]["expected_action"]["enum"]) == {
+        "downcast",
+        "emulate",
+        "keep",
+    }
+
+
+def test_verifier_observed_action_enum_adds_unclear():
+    """The verifier's observed_action enum is the analyst's three methods plus 'unclear'."""
+    item = VERIFIER_OUTPUT_SCHEMA["properties"]["per_variable"]["items"]
+    assert set(item["properties"]["observed_action"]["enum"]) == {
+        "downcast",
+        "emulate",
+        "keep",
+        "unclear",
+    }
+
+
+# ---------- Prompts mention the three methods (smoke check, not exhaustive) ----------
+
+
+def test_analyst_prompt_mentions_all_three_methods():
+    """The analyst prompt explicitly names downcast, emulate, and keep so the model knows the full action vocabulary."""
+    prompt = AGENTS["analyst"]["system_prompt"]
+    for method in ("downcast", "emulate", "keep"):
+        assert method in prompt, f"analyst prompt missing {method!r}"
+
+
+def test_rewriter_prompt_mentions_all_three_methods_and_emulation_struct():
+    """The rewriter prompt names all three methods and includes the inline ff_t emulation convention so it has a concrete representation to use."""
+    prompt = AGENTS["rewriter"]["system_prompt"]
+    for method in ("downcast", "emulate", "keep"):
+        assert method in prompt, f"rewriter prompt missing {method!r}"
+    assert "ff_t" in prompt, "rewriter prompt missing the ff_t emulation convention"
+
+
+def test_verifier_prompt_mentions_rework_check():
+    """The verifier prompt tells the verifier to check whether a suggested rework was actually applied (or that an unrequested rework was not silently added)."""
+    prompt = AGENTS["verifier"]["system_prompt"]
+    assert "rework" in prompt.lower()
