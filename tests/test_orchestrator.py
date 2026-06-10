@@ -12,7 +12,9 @@ from workflow import orchestrator
 from workflow.orchestrator import (
     DEFAULT_TOLERANCE_ON_ADVISOR_UNKNOWN,
     ORCHESTRATOR_SYSTEM_PROMPT,
+    ORCHESTRATOR_TOOLS,
     _execute_tool,
+    _format_baseline_block,
     _format_tolerance_block,
     _hitl_pause,
     run_orchestrator,
@@ -439,3 +441,209 @@ def test_run_orchestrator_no_tolerance_invites_advisor_in_first_user_message(
     first_user = fake.messages.calls[0]["messages"][0]["content"]
     assert "spawn_precision_advisor" in first_user
     assert "not specified" in first_user
+
+
+# ---------- Baseline harness: tool schema + prompt + dispatch + user message ----------
+
+
+def test_orchestrator_tools_include_spawn_baseline_harness():
+    """ORCHESTRATOR_TOOLS exposes spawn_baseline_harness with kernel_source and kernel_stem as required string inputs."""
+    by_name = {t["name"]: t for t in ORCHESTRATOR_TOOLS}
+    assert "spawn_baseline_harness" in by_name
+    tool = by_name["spawn_baseline_harness"]
+    props = tool["input_schema"]["properties"]
+    assert "kernel_source" in props
+    assert "kernel_stem" in props
+    assert props["kernel_source"]["type"] == "string"
+    assert props["kernel_stem"]["type"] == "string"
+    assert set(tool["input_schema"]["required"]) == {
+        "kernel_source",
+        "kernel_stem",
+    }
+
+
+def test_orchestrator_prompt_mentions_baseline_harness_and_side_artifact():
+    """The orchestrator prompt names baseline_harness, the BASELINE STEP block, and explicitly marks the baseline as a side artifact that is not a precondition for finish."""
+    text = ORCHESTRATOR_SYSTEM_PROMPT
+    assert "baseline_harness" in text
+    assert "BASELINE STEP" in text
+    lower = text.lower()
+    assert "side artifact" in lower
+    # The baseline must not gate finish; the analyst->rewriter->verifier
+    # pipeline still does. Surface this as an explicit assertion so a
+    # future prompt edit can't silently flip the semantics.
+    assert "not a precondition for finish" in lower
+
+
+def test_execute_tool_dispatches_spawn_baseline_harness(monkeypatch, tmp_path):
+    """_execute_tool routes spawn_baseline_harness to run_agent('baseline_harness', kernel_source), writes the driver to baselines/<stem>/driver.cpp, and returns the driver_path alongside the result."""
+    monkeypatch.chdir(tmp_path)
+    calls = []
+
+    driver_text = "// driver\nint main(){return 0;}\n"
+
+    def stub_run_agent(type_, task):
+        calls.append((type_, task))
+        return {
+            "driver_source": driver_text,
+            "kernel_function_name": "vector_add",
+            "inputs_summary": "N=16384, seed=42",
+            "output_arrays": ["z"],
+        }
+
+    monkeypatch.setattr(orchestrator, "run_agent", stub_run_agent)
+
+    result = _execute_tool(
+        "spawn_baseline_harness",
+        {"kernel_source": "KSRC", "kernel_stem": "vector_add"},
+    )
+
+    assert result["status"] == "ok"
+    assert result["result"]["kernel_function_name"] == "vector_add"
+    assert calls == [("baseline_harness", "KSRC")]
+
+    # The driver must land at baselines/<stem>/driver.cpp under CWD
+    # (the orchestrator writes via a *relative* Path; under
+    # monkeypatch.chdir(tmp_path) that resolves to tmp_path/baselines/...).
+    driver_path = tmp_path / "baselines" / "vector_add" / "driver.cpp"
+    assert driver_path.exists()
+    assert driver_path.read_text() == driver_text
+    assert result["driver_path"] == "baselines/vector_add/driver.cpp"
+
+
+def test_execute_tool_spawn_baseline_harness_overwrites_existing(
+    monkeypatch, tmp_path
+):
+    """A second spawn_baseline_harness call for the same stem overwrites the previous driver.cpp (parents=True, exist_ok=True; write_text replaces)."""
+    monkeypatch.chdir(tmp_path)
+    # Pre-create an old driver to be overwritten.
+    old_dir = tmp_path / "baselines" / "vector_add"
+    old_dir.mkdir(parents=True)
+    (old_dir / "driver.cpp").write_text("OLD CONTENT")
+
+    def stub_run_agent(type_, task):
+        return {
+            "driver_source": "NEW CONTENT",
+            "kernel_function_name": "vector_add",
+            "inputs_summary": "...",
+            "output_arrays": ["z"],
+        }
+
+    monkeypatch.setattr(orchestrator, "run_agent", stub_run_agent)
+
+    _execute_tool(
+        "spawn_baseline_harness",
+        {"kernel_source": "KSRC", "kernel_stem": "vector_add"},
+    )
+
+    assert (tmp_path / "baselines" / "vector_add" / "driver.cpp").read_text() \
+        == "NEW CONTENT"
+
+
+# ---------- _format_baseline_block ----------
+
+
+def test_format_baseline_block_cpp_no_kernel_name_invites_call():
+    """For a .cpp kernel without an explicit kernel_name, the block invites spawn_baseline_harness, surfaces the file stem as KERNEL STEM, and emits no 'TARGET KERNEL: <name>' value line (the agent infers the function)."""
+    block = _format_baseline_block("test-kernels/kokkos/mixed/nbody_force.cpp", None)
+    assert "BASELINE STEP" in block
+    assert "spawn_baseline_harness" in block
+    assert "KERNEL STEM: nbody_force" in block
+    # The boilerplate may mention 'TARGET KERNEL:' as a hint to the
+    # orchestrator about what it MAY prepend; what must NOT appear is an
+    # actual 'TARGET KERNEL: <name>' value line (it would be empty/wrong).
+    for line in block.splitlines():
+        assert not line.startswith("TARGET KERNEL:"), line
+
+
+def test_format_baseline_block_cpp_with_kernel_name_includes_target_line():
+    """When kernel_name is given, the block adds a TARGET KERNEL: <name> line so the orchestrator can prepend it to the harness's kernel_source argument."""
+    block = _format_baseline_block(
+        "test-kernels/kokkos/lowerable/vector_add.cpp", "vector_add"
+    )
+    assert "KERNEL STEM: vector_add" in block
+    assert "TARGET KERNEL: vector_add" in block
+
+
+def test_format_baseline_block_cu_tells_orchestrator_to_skip():
+    """For a CUDA .cu kernel, the block explicitly tells the orchestrator NOT to call spawn_baseline_harness (v0 is Kokkos-only)."""
+    block = _format_baseline_block(
+        "test-kernels/cuda/lowerable/vector_add.cu", None
+    )
+    assert "skipped" in block.lower()
+    assert "Do NOT call spawn_baseline_harness" in block
+    # No KERNEL STEM line either; nothing to do.
+    assert "spawn_baseline_harness" in block  # only in the negation
+
+
+# ---------- run_orchestrator: baseline block in initial user message ----------
+
+
+def test_run_orchestrator_cpp_kernel_invites_baseline_in_first_user_message(
+    monkeypatch, fake_anthropic
+):
+    """For a .cpp kernel, the first user message embeds the BASELINE STEP block with the file stem so the orchestrator can decide whether to call spawn_baseline_harness."""
+    fake = fake_anthropic([
+        FakeResponse(
+            content=[ToolUseBlock(
+                id="tu_1",
+                name="finish",
+                input={"rewritten_code": "X", "notes": "Y"},
+            )],
+        ),
+    ])
+    _scripted_input(monkeypatch, ["y"])
+
+    run_orchestrator("path/to/nbody_force.cpp", "src")
+
+    first_user = fake.messages.calls[0]["messages"][0]["content"]
+    assert "BASELINE STEP" in first_user
+    assert "KERNEL STEM: nbody_force" in first_user
+    assert "spawn_baseline_harness" in first_user
+
+
+def test_run_orchestrator_cpp_with_kernel_name_includes_target_kernel_line(
+    monkeypatch, fake_anthropic
+):
+    """When kernel_name is passed to run_orchestrator, the first user message adds a TARGET KERNEL: <name> line to the BASELINE STEP block."""
+    fake = fake_anthropic([
+        FakeResponse(
+            content=[ToolUseBlock(
+                id="tu_1",
+                name="finish",
+                input={"rewritten_code": "X", "notes": "Y"},
+            )],
+        ),
+    ])
+    _scripted_input(monkeypatch, ["y"])
+
+    run_orchestrator(
+        "path/to/vector_add.cpp", "src", kernel_name="vector_add"
+    )
+
+    first_user = fake.messages.calls[0]["messages"][0]["content"]
+    assert "TARGET KERNEL: vector_add" in first_user
+    assert "KERNEL STEM: vector_add" in first_user
+
+
+def test_run_orchestrator_cu_kernel_skips_baseline_in_first_user_message(
+    monkeypatch, fake_anthropic
+):
+    """For a CUDA .cu kernel, the first user message's BASELINE STEP block tells the orchestrator not to call spawn_baseline_harness (v0 is Kokkos-only)."""
+    fake = fake_anthropic([
+        FakeResponse(
+            content=[ToolUseBlock(
+                id="tu_1",
+                name="finish",
+                input={"rewritten_code": "X", "notes": "Y"},
+            )],
+        ),
+    ])
+    _scripted_input(monkeypatch, ["y"])
+
+    run_orchestrator("path/to/vector_add.cu", "src")
+
+    first_user = fake.messages.calls[0]["messages"][0]["content"]
+    assert "BASELINE STEP" in first_user
+    assert "skipped" in first_user.lower()
+    assert "Do NOT call spawn_baseline_harness" in first_user

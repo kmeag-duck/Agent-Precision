@@ -15,6 +15,7 @@ per-variable precision decisions — that is the analyst's job.
 """
 
 import json
+from pathlib import Path
 
 import anthropic
 
@@ -62,7 +63,7 @@ Your job is to call the right agent at the right time, thread the
 tolerance and verdicts through their task prompts faithfully, and
 assemble their outputs.
 
-You have access to four specialist agents:
+You have access to five specialist agents:
   - precision_advisor: called *only* when the user did not pass an
     output-precision tolerance on the command line. Takes the kernel
     source and returns
@@ -110,6 +111,18 @@ You have access to four specialist agents:
     suggested rework) and flags concerns when the analyst's precision
     budget looks tight against the tolerance. It does not re-judge
     whether the verdict was numerically correct.
+
+  - baseline_harness: takes the original Kokkos C++ kernel source and a
+    short kernel_stem string, and returns a self-contained C++ driver
+    program that, when later compiled and run by the operator, exercises
+    the kernel on fixed inputs and writes a reproducible reference
+    output to ./reference.json. This is a SIDE ARTIFACT for a future
+    mechanical comparator — it is not consumed by the analyst, rewriter,
+    or verifier in this run, and it is not a precondition for finish.
+    Call it at most once per run, and only when the user message's
+    BASELINE STEP block invites you to (it only does so for Kokkos C++
+    kernels). On approval, the orchestrator writes the driver to
+    baselines/<kernel_stem>/driver.cpp; you do not need to manage that.
 
 You also have a finish tool to emit the final answer.
 
@@ -295,6 +308,49 @@ ORCHESTRATOR_TOOLS = [
         },
     },
     {
+        "name": "spawn_baseline_harness",
+        "description": (
+            "Run the baseline_harness agent to generate a self-contained "
+            "Kokkos C++ driver that, when later compiled and run by the "
+            "operator, exercises the kernel on fixed inputs and writes a "
+            "reproducible reference output to ./reference.json. Side "
+            "artifact for a future mechanical comparator; not consumed by "
+            "the other agents in this run, not a precondition for finish. "
+            "Call at most once per run, and only when the user message's "
+            "BASELINE STEP block invites you to. On HITL approval, the "
+            "orchestrator writes the driver to "
+            "baselines/<kernel_stem>/driver.cpp."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "kernel_source": {
+                    "type": "string",
+                    "description": (
+                        "The full original kernel source. Do not include "
+                        "the tolerance block, file paths, or other "
+                        "framing — the harness agent should see only the "
+                        "kernel code (optionally preceded by a single "
+                        "TARGET KERNEL: line if you need to disambiguate "
+                        "which function to call)."
+                    ),
+                },
+                "kernel_stem": {
+                    "type": "string",
+                    "description": (
+                        "Filesystem-safe short name for this kernel "
+                        "(typically the input file stem, e.g. "
+                        "'nbody_force'). The orchestrator writes the "
+                        "approved driver to baselines/<kernel_stem>/"
+                        "driver.cpp. Use exactly the KERNEL STEM value "
+                        "given in the user message."
+                    ),
+                },
+            },
+            "required": ["kernel_source", "kernel_stem"],
+        },
+    },
+    {
         "name": "finish",
         "description": "Terminate the workflow with the final rewritten kernel.",
         "input_schema": {
@@ -360,6 +416,24 @@ def _execute_tool(tool_name: str, tool_input: dict) -> dict:
         )
         result = run_agent("verifier", task)
         return {"status": "ok", "result": result}
+    if tool_name == "spawn_baseline_harness":
+        result = run_agent("baseline_harness", tool_input["kernel_source"])
+        # Side artifact: persist the driver next to its kernel stem so the
+        # operator can `cd baselines/<stem>/` and compile it. This is the
+        # first _execute_tool branch that touches the filesystem; the path
+        # is computed from the orchestrator-supplied kernel_stem (not from
+        # the agent's output) so a misbehaving agent cannot redirect the
+        # write.
+        kernel_stem = tool_input["kernel_stem"]
+        driver_dir = Path("baselines") / kernel_stem
+        driver_dir.mkdir(parents=True, exist_ok=True)
+        driver_path = driver_dir / "driver.cpp"
+        driver_path.write_text(result["driver_source"])
+        return {
+            "status": "ok",
+            "result": result,
+            "driver_path": str(driver_path),
+        }
     raise ValueError(f"Unknown tool: {tool_name}")
 
 
@@ -395,10 +469,48 @@ def _format_tolerance_block(tolerance: dict | None) -> str:
     )
 
 
+def _format_baseline_block(kernel_path: str, kernel_name: str | None) -> str:
+    """Render the BASELINE STEP block embedded in the initial user message.
+
+    The baseline_harness agent v0 is Kokkos-only: the orchestrator is
+    invited to call spawn_baseline_harness only when the kernel file is
+    a .cpp. For .cu (CUDA) inputs, the block tells the orchestrator
+    explicitly not to call it. The block also surfaces the kernel_stem
+    the orchestrator must pass to the tool (so the driver lands at
+    baselines/<stem>/driver.cpp), and, if the caller provided one, the
+    target kernel function name.
+    """
+    stem = Path(kernel_path).stem
+    suffix = Path(kernel_path).suffix.lower()
+    if suffix != ".cpp":
+        return (
+            "BASELINE STEP: skipped for this kernel (not a Kokkos .cpp "
+            "file). Do NOT call spawn_baseline_harness."
+        )
+    target_line = (
+        f"TARGET KERNEL: {kernel_name}\n" if kernel_name else ""
+    )
+    return (
+        "BASELINE STEP: this is a Kokkos C++ kernel, so you MAY call "
+        "spawn_baseline_harness exactly once to generate a reference "
+        "driver. This is a side artifact for a future mechanical "
+        "comparator; it is NOT consumed by the analyst, rewriter, or "
+        "verifier in this run, and it is NOT a precondition for finish. "
+        "Skip it if it seems unhelpful.\n"
+        f"KERNEL STEM: {stem}\n"
+        f"{target_line}"
+        "When you call spawn_baseline_harness, pass the original kernel "
+        "source as kernel_source (no tolerance block; you MAY prepend a "
+        "single TARGET KERNEL: line if one is given above) and the "
+        "KERNEL STEM verbatim as kernel_stem."
+    )
+
+
 def run_orchestrator(
     kernel_path: str,
     kernel_source: str,
     tolerance: dict | None = None,
+    kernel_name: str | None = None,
     max_turns: int = MAX_TURNS,
 ) -> dict | None:
     """Run the orchestrator loop.
@@ -409,14 +521,22 @@ def run_orchestrator(
     'sig_figs' or 'decimal_digits', value is a small positive integer,
     and source is 'user_cli'.
 
+    `kernel_name` is an optional explicit name of the kernel function
+    inside `kernel_source` for the baseline_harness agent to target.
+    When None (the common case in v0), the orchestrator tells the
+    harness agent to infer the function from the source. CLI does not
+    expose this yet.
+
     Returns the final finish() arguments dict, or None if the user quit,
     the orchestrator stopped without finishing, or max_turns was exhausted.
     """
     tolerance_block = _format_tolerance_block(tolerance)
+    baseline_block = _format_baseline_block(kernel_path, kernel_name)
     user_message = (
         f"Kernel file: {kernel_path}\n\n"
         f"Kernel source:\n```\n{kernel_source}\n```\n\n"
         f"{tolerance_block}\n\n"
+        f"{baseline_block}\n\n"
         "Rewrite this kernel to reduce precision cost where safe (via "
         "downcast, emulation, or — if warranted — a kernel-shape rework), "
         "so that the rewritten kernel's output stays within the agreed "

@@ -11,3 +11,6 @@ __pycache__/
 # argo-proxy failure dumps (regenerated on each upstream error)
 error_dumps/
 .opencode
+
+# runs
+baselines/

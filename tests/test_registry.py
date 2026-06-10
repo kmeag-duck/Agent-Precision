@@ -3,18 +3,20 @@
 from workflow.registry import (
     AGENTS,
     ANALYST_OUTPUT_SCHEMA,
+    BASELINE_HARNESS_OUTPUT_SCHEMA,
     PRECISION_ADVISOR_OUTPUT_SCHEMA,
     VERIFIER_OUTPUT_SCHEMA,
 )
 
 
 def test_known_agent_types():
-    """AGENTS exposes exactly the precision_advisor, analyst, rewriter, and verifier types."""
+    """AGENTS exposes exactly the precision_advisor, analyst, rewriter, verifier, and baseline_harness types."""
     assert set(AGENTS) == {
         "precision_advisor",
         "analyst",
         "rewriter",
         "verifier",
+        "baseline_harness",
     }
 
 
@@ -228,3 +230,53 @@ def test_verifier_prompt_mentions_tolerance_and_precision_budget():
     prompt = AGENTS["verifier"]["system_prompt"].lower()
     assert "tolerance" in prompt
     assert "precision_budget" in prompt
+
+
+# ---------- Baseline harness: schema + prompt ----------
+
+
+def test_baseline_harness_schema_required_fields():
+    """The baseline_harness schema requires driver_source, kernel_function_name, inputs_summary, and output_arrays so a future mechanical comparator has everything it needs to compile, run, and read back the reference."""
+    assert set(BASELINE_HARNESS_OUTPUT_SCHEMA["required"]) == {
+        "driver_source",
+        "kernel_function_name",
+        "inputs_summary",
+        "output_arrays",
+    }
+
+
+def test_baseline_harness_output_arrays_is_array_of_strings():
+    """output_arrays is a JSON array of strings; the comparator iterates these names against the 'outputs' key of reference.json."""
+    out = BASELINE_HARNESS_OUTPUT_SCHEMA["properties"]["output_arrays"]
+    assert out["type"] == "array"
+    assert out["items"]["type"] == "string"
+
+
+def test_baseline_harness_prompt_mentions_kokkos_serial_reproducibility():
+    """The baseline_harness prompt names Kokkos::initialize and Kokkos::Serial (the v0 reproducibility constraint) so the model knows to run the reference on the deterministic host execution space."""
+    prompt = AGENTS["baseline_harness"]["system_prompt"]
+    assert "Kokkos::initialize" in prompt
+    assert "Kokkos::Serial" in prompt
+
+
+def test_baseline_harness_prompt_mentions_reference_json_and_fixed_seed():
+    """The baseline_harness prompt names reference.json (the output file) and tells the agent to seed any RNG with a fixed integer so the reference is reproducible across runs."""
+    prompt = AGENTS["baseline_harness"]["system_prompt"]
+    assert "reference.json" in prompt
+    lower = prompt.lower()
+    assert "seed" in lower
+    assert "fixed" in lower or "reproducible" in lower
+
+
+def test_baseline_harness_prompt_mentions_target_kernel_and_no_invented_values():
+    """The baseline_harness prompt names TARGET KERNEL (the disambiguator the orchestrator may prepend) and forbids inventing numerical output values (the whole point is to capture the original kernel's output)."""
+    prompt = AGENTS["baseline_harness"]["system_prompt"]
+    assert "TARGET KERNEL" in prompt
+    lower = prompt.lower()
+    assert "do not invent" in lower or "not invent" in lower or "never invent" in lower
+
+
+def test_baseline_harness_prompt_mentions_high_precision_format():
+    """The baseline_harness prompt requires %.17g formatting so the reference output preserves full double precision."""
+    prompt = AGENTS["baseline_harness"]["system_prompt"]
+    assert "%.17g" in prompt

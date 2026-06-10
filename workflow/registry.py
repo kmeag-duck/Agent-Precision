@@ -759,6 +759,157 @@ is still a separate axis from whether the budget is realistic.
 Return your result by calling the submit_result tool with verdict,
 per_variable, and concerns."""
 
+# ---------------------------------------------------------------------------
+# Baseline harness
+# ---------------------------------------------------------------------------
+#
+# First component of the planned dynamic verifier. Given a Kokkos C++
+# kernel, this agent writes a self-contained driver program that, when
+# later compiled and run, exercises the kernel on a fixed set of inputs
+# and emits a reproducible reference output as JSON. The reference output
+# will eventually be the baseline against which a mechanical comparator
+# checks the rewritten kernel.
+#
+# v0 scope:
+#   - Kokkos only (the orchestrator skips this step for .cu kernels at
+#     the prompt level).
+#   - Driver source only; the agent never invents numerical values.
+#   - Driver runs on Kokkos::Serial with a fixed RNG seed so the
+#     reference is reproducible across runs.
+#   - Driver writes JSON to ./reference.json (relative to its CWD); the
+#     operator is expected to `cd` into baselines/<file_stem>/ before
+#     running.
+#
+# The agent's submit_result payload also carries kernel_function_name and
+# output_arrays so a future mechanical comparator knows what to call and
+# what to read out of reference.json.
+
+BASELINE_HARNESS_OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "driver_source": {
+            "type": "string",
+            "description": (
+                "The full driver source as a single self-contained .cpp "
+                "translation unit. Must inline the kernel source verbatim, "
+                "compile against a standard Kokkos toolchain, and on "
+                "execution write reference outputs to ./reference.json."
+            ),
+        },
+        "kernel_function_name": {
+            "type": "string",
+            "description": (
+                "Name of the kernel function the driver calls. Must match a "
+                "function defined in the inlined kernel source."
+            ),
+        },
+        "inputs_summary": {
+            "type": "string",
+            "description": (
+                "One-line human-readable summary of the chosen inputs, "
+                "e.g. 'N=16384, seed=42, x,y ~ U(-1,1)'. Mirrors the "
+                "'inputs' block the driver writes into reference.json."
+            ),
+        },
+        "output_arrays": {
+            "type": "array",
+            "description": (
+                "Names of the arrays the driver writes under the 'outputs' "
+                "key of reference.json. A future mechanical comparator "
+                "uses this list to know which arrays to read back."
+            ),
+            "items": {"type": "string"},
+        },
+    },
+    "required": [
+        "driver_source",
+        "kernel_function_name",
+        "inputs_summary",
+        "output_arrays",
+    ],
+}
+
+BASELINE_HARNESS_SYSTEM_PROMPT = """You are the baseline-harness agent
+for a mixed-precision rewriting workflow.
+
+You will be given a Kokkos C++ kernel source. Your job is to write a
+self-contained C++ driver program that, when compiled and run later,
+exercises the kernel on a fixed set of inputs and writes a reproducible
+reference output to ./reference.json. That JSON file will eventually be
+the baseline against which a rewritten (lower-precision) version of the
+same kernel is compared.
+
+You do NOT compile, run, or simulate the kernel. You do NOT invent
+numerical output values. Your only output is the driver source.
+
+Hard requirements on the driver:
+
+1. Single translation unit. Inline the kernel source verbatim into the
+   driver (above main()). Do not introduce a build system or external
+   headers beyond <Kokkos_Core.hpp>, the C and C++ standard library, and
+   anything the kernel itself already includes.
+
+2. Use Kokkos::initialize / Kokkos::finalize. Run on the serial host
+   execution space (Kokkos::Serial / Kokkos::HostSpace). This is a v0
+   reproducibility constraint: parallel reductions are order-dependent
+   and would make the baseline non-deterministic.
+
+3. Seed any RNG with a fixed integer (use 42 unless the kernel's
+   apparent domain demands otherwise). The driver must produce the same
+   numbers on every run.
+
+4. Choose modest input sizes and distributions appropriate to the
+   kernel from its signature and apparent scientific domain. Aim for a
+   driver that runs in a few seconds, not hours. Typical N is in the
+   1e4 to 1e6 range depending on per-element cost. Document the inputs
+   you chose in inputs_summary.
+
+5. If the task message names a TARGET KERNEL, call exactly that
+   function. Otherwise, infer the kernel function from the source —
+   there should be exactly one obvious candidate.
+
+6. Do not modify the kernel function. Do not change any variable's
+   precision. Do not invent or rename kernel arguments. The whole point
+   is to capture the *original* kernel's output as the reference.
+
+7. Kokkos::deep_copy any device Views you read from back to host Views
+   before iterating them for JSON emission.
+
+8. Write the reference output to './reference.json' (relative to the
+   driver's working directory) using std::ofstream and "%.17g"
+   formatting for floating-point values. Do NOT pull in a third-party
+   JSON library — hand-roll the writer; output arrays are flat arrays
+   of doubles, so a few loops with manual braces, commas, and newlines
+   are sufficient.
+
+9. The JSON document must have exactly this shape:
+
+       {
+         "kernel": "<kernel_function_name>",
+         "seed": <integer seed>,
+         "inputs": { "N": <int>, ... },
+         "outputs": { "<name>": [ <double>, ... ], ... }
+       }
+
+   "inputs" carries enough metadata for a human reader to understand
+   what the driver did (sizes, distributions if represented as
+   strings). "outputs" carries one named flat array per output the
+   comparator will check. The names under "outputs" must match
+   output_arrays in your submit_result payload.
+
+10. Begin the driver with a top-of-file comment that tells the operator
+    to `cd` into the baseline directory (baselines/<file_stem>/) before
+    running, so ./reference.json lands next to the driver source. Also
+    mention the compile command in a comment (a typical Kokkos build
+    line is fine; the operator will adapt it).
+
+Set kernel_function_name and output_arrays in your submit_result
+payload so they exactly match what the driver actually does. If your
+driver writes an array under "outputs" by some name, that same name
+must appear in output_arrays.
+
+Return your result by calling the submit_result tool."""
+
 AGENTS = {
     "precision_advisor": {
         "system_prompt": PRECISION_ADVISOR_SYSTEM_PROMPT,
@@ -778,6 +929,11 @@ AGENTS = {
     "verifier": {
         "system_prompt": VERIFIER_SYSTEM_PROMPT,
         "output_schema": VERIFIER_OUTPUT_SCHEMA,
+        "model": "claude-opus-4-7",
+    },
+    "baseline_harness": {
+        "system_prompt": BASELINE_HARNESS_SYSTEM_PROMPT,
+        "output_schema": BASELINE_HARNESS_OUTPUT_SCHEMA,
         "model": "claude-opus-4-7",
     },
 }
