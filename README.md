@@ -41,7 +41,8 @@ vocabulary and plumbing".
 
 What works today:
 
-- Four-agent pipeline `(precision_advisor →)? analyst → rewriter → verifier`; orchestrator forbids `finish` without `verdict='accept'`.
+- Core pipeline `(precision_advisor →)? analyst → rewriter → verifier`; orchestrator forbids `finish` without `verdict='accept'`.
+- Side artifact: `baseline_harness` — a fifth agent that, for Kokkos `.cpp` kernels only, emits a self-contained C++ driver to `baselines/<kernel_stem>/driver.cpp` that (when later compiled and run) writes a deterministic reference output to `./reference.json`. Not consumed by any other agent in this run; reserved for a future mechanical comparator. Not a precondition for `finish`.
 - Tolerance from `--sig-figs` / `--decimal-digits`, else inferred by the advisor; advisor may return `kind='unknown'`, which triggers fallback `{sig_figs: 6, source: 'advisor_unknown_defaulted'}`.
 - Tolerance threaded verbatim to analyst, rewriter, and verifier; analyst returns a `precision_budget` block; verifier audits it.
 - Per-variable methods: `downcast` (narrower hardware type — the throughput win), `emulate` (software pair, currently inline float-float / Dekker — throughput-NEGATIVE; only when downcast violates tolerance), or `keep`. Analyst can additionally suggest a kernel-shape `rework` such as Kahan summation.
@@ -51,7 +52,7 @@ What works today:
 
 What is intentionally **not** here yet:
 
-- Verifier is a **static / textual** check (faithfulness of code to verdict); no mechanical verification, no compile, no run, no benchmark.
+- Verifier is a **static / textual** check (faithfulness of code to verdict); no mechanical verification, no compile, no run, no benchmark. The baseline_harness emits the driver source but does not compile or execute it; a downstream mechanical comparator is still to come.
 - No automated evaluation across the `test-kernels/` corpus.
 - No framework (LangGraph etc.). See "Design notes" and "Roadmap".
 
@@ -153,7 +154,8 @@ return `accept` before `finish` is allowed.
 | `analyst`            | `claude-opus-4-7` | kernel source + tolerance block (`target_kind`, `target_value`, `source`)                   | `variables[{name, action, target_precision, emulation_type, reason}]`, `rework{suggested, transformation, rationale, affected_variables}`, `precision_budget{target_kind, target_value, source, claimed_output_precision, headroom_argument}`, `overall_notes` | `workflow/registry.py`     |
 | `rewriter`           | `claude-opus-4-7` | `task_prompt` (source + verdict + any rework + tolerance, composed by orch.)                | `rewritten_code`, `summary_of_changes`                                                                                                                                                                                                                          | `workflow/registry.py`     |
 | `verifier`           | `claude-opus-4-7` | original source, rewritten source, analyst verdict (JSON string), tolerance (JSON string)   | `verdict` (`accept`/`reject`), `per_variable[{name, expected_action, observed_action, ok}]`, `concerns`                                                                                                                                                         | `workflow/registry.py`     |
-| `orchestrator`       | `claude-opus-4-7` | kernel path + source + optional tolerance (from CLI)                                        | one `finish(rewritten_code, notes)` call                                                                                                                                                                                                                        | `workflow/orchestrator.py` |
+| `baseline_harness`   | `claude-opus-4-7` | original Kokkos C++ kernel source (Kokkos `.cpp` only; orchestrator skips for `.cu`)        | `driver_source`, `kernel_function_name`, `inputs_summary`, `output_arrays`                                                                                                                                                                                      | `workflow/registry.py`     |
+| `orchestrator`       | `claude-opus-4-7` | kernel path + source + optional tolerance (from CLI) + optional `kernel_name`               | one `finish(rewritten_code, notes)` call                                                                                                                                                                                                                        | `workflow/orchestrator.py` |
 
 The analyst receives the kernel source only — no file path, no orchestrator
 hints — so that ground-truth labels encoded in directory names cannot leak
@@ -165,6 +167,14 @@ violate that tolerance. The rewriter is forbidden from silently
 substituting one method for another (e.g. downcasting when asked to
 emulate), so the verifier's per-variable `ok` check has actual meaning.
 
+The `baseline_harness` is orthogonal to the analyst → rewriter → verifier
+pipeline: it is invited (by the initial user message's BASELINE STEP
+block) for Kokkos `.cpp` inputs only, called at most once per run, and
+its output is a driver source that the operator compiles and runs out of
+band. The driver pins `Kokkos::Serial` and a fixed RNG seed (42 by
+default) so the reference output is reproducible. See `AGENTS.md`
+("Baseline harness (side artifact)") for the full scope.
+
 ## Orchestrator tools
 
 | Tool                       | Purpose                       | Input                                                                                                                          | Returns to orchestrator                                                  |
@@ -173,12 +183,18 @@ emulate), so the verifier's per-variable `ok` check has actual meaning.
 | `spawn_analyst`            | dispatch to analyst           | `kernel_source: string` (must contain a labeled tolerance block: `target_kind`, `target_value`, `source`)                      | analyst's structured output, or `{"status":"rejected_by_user"}`          |
 | `spawn_rewriter`           | dispatch to rewriter          | `task_prompt: string`                                                                                                          | rewriter's structured output, or `{"status":"rejected_by_user"}`         |
 | `spawn_verifier`           | dispatch to verifier          | `original_source: string`, `rewritten_source: string`, `analyst_verdict_json: string`, `tolerance_json: string`                | verifier's structured output, or `{"status":"rejected_by_user"}`         |
+| `spawn_baseline_harness`   | dispatch to baseline_harness  | `kernel_source: string`, `kernel_stem: string` (Kokkos `.cpp` only; at most once per run)                                      | harness output + `driver_path` (orchestrator writes `baselines/<kernel_stem>/driver.cpp`), or `{"status":"rejected_by_user"}` |
 | `finish`                   | end the workflow              | `rewritten_code`, `notes`                                                                                                      | (terminates; nothing fed back)                                           |
 
 The orchestrator's system prompt enforces that `spawn_precision_advisor`
 is called at most once, only when the CLI passed no tolerance, and only
-before `spawn_analyst`. The Python `_execute_tool` does not police any
-of this — it is trusted to the orchestrator LLM.
+before `spawn_analyst`; and that `spawn_baseline_harness` is called at
+most once and only for Kokkos `.cpp` inputs. The Python `_execute_tool`
+does not police any of this — it is trusted to the orchestrator LLM. The
+one exception is the filesystem write for `spawn_baseline_harness`: the
+driver path is computed from the orchestrator-supplied `kernel_stem`
+(not from the agent's output), so a misbehaving agent cannot redirect
+the write.
 
 ## Repo layout
 
@@ -200,6 +216,9 @@ of this — it is trusted to the orchestrator LLM.
   variable expected verdicts and test tolerances live in
   `test-kernels/SUMMARY.md` and are used for evaluating orchestrator
   output, not as input to it.
+- `baselines/` — generated per-kernel driver sources from
+  `baseline_harness` runs (`baselines/<kernel_stem>/driver.cpp`).
+  Gitignored.
 - `scripts/` — Argo backend wrappers (`run-argoproxy.sh`, `run-argo.sh`).
 - `flowchart.md` — high-level orchestrator flowchart (HITL branches,
   tool dispatch); a companion to the sequence diagram above.
@@ -245,8 +264,8 @@ in "Roadmap" below; see `AGENTS.md` for the full rationale.
 Authoritative list lives in `AGENTS.md` under "Planned next steps"; this
 is a reader-facing summary.
 
-1. **Dynamic verification stack** — mechanical compile/run/compare as orchestrator tools.
-2. **Baseline harness agent** — one-shot agent that generates driver + reference IO per kernel.
+1. **Dynamic verification stack** — mechanical compile/run/compare as orchestrator tools, consuming the `baseline_harness` driver as the reference.
+2. **Kernel-extractor agent** — slice a single target kernel out of a multi-kernel translation unit before analyst + baseline_harness run.
 3. **JLSE / async toolchain migration** — move compile/run to a remote scheduler.
 4. **Emulation library upgrade** — replace inline Dekker float-float with a vendored header.
 5. **Corpus evaluation** — run the workflow across all 17 `test-kernels/`, feeding each kernel's expected tolerance from `test-kernels/SUMMARY.md`, and compare verdicts against ground-truth labels.
