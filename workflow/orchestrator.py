@@ -20,15 +20,21 @@ from pathlib import Path
 import anthropic
 
 from .run_agent import run_agent
-from .tools import compile_baseline_driver, run_baseline_driver
+from .tools import (
+    compile_baseline_driver,
+    run_baseline_driver,
+    splice_rewritten_kernel,
+)
 
 ORCHESTRATOR_MODEL = "claude-opus-4-7"
 
 # Hard upper bound on orchestrator API turns per run. The HITL pause is the
 # primary safety net (the user can press 'q' at any time); this constant is a
 # backstop so a misbehaving orchestrator loop cannot run indefinitely if
-# left unattended.
-MAX_TURNS = 20
+# left unattended. Raised from 20 to 40 to accommodate the dynamic-
+# verification chain (splice -> compile_rewritten -> run_rewritten ->
+# compare) appended after the analyst -> rewriter -> verifier loop.
+MAX_TURNS = 40
 
 # Fallback tolerance applied when the user did not pass --sig-figs or
 # --decimal-digits AND the precision_advisor returned kind='unknown'. 6
@@ -150,6 +156,22 @@ You also have two deterministic (non-LLM) tools:
     The reference output is another side artifact: it is not a
     precondition for finish, and a run error there must NOT block the
     analyst -> rewriter -> verifier pipeline.
+
+  - splice_rewritten_kernel: takes a kernel_stem and the rewriter's
+    rewritten kernel source. Reads baselines/<kernel_stem>/driver.cpp
+    (the baseline driver written by spawn_baseline_harness), replaces
+    the text strictly between the '// ---- KERNEL BEGIN ----' and
+    '// ---- KERNEL END ----' sentinel lines with the rewritten source,
+    and writes the result to baselines/<kernel_stem>/rewritten/
+    driver.cpp. Returns {status, stdout, stderr, artifacts}. Call this
+    at most once per accepted verifier verdict, immediately after a
+    successful run_baseline_driver call AND a successful spawn_verifier
+    call with verdict='accept', using the same kernel_stem. Do not call
+    it if any prior step in the baseline chain (spawn_baseline_harness,
+    compile_baseline_driver, run_baseline_driver) was skipped, rejected,
+    or returned an error. The spliced driver is a precursor for a
+    future mechanical comparator; like the baseline chain, a splice
+    error must NOT block finish on its own.
 
 You also have a finish tool to emit the final answer.
 
@@ -438,6 +460,49 @@ ORCHESTRATOR_TOOLS = [
         },
     },
     {
+        "name": "splice_rewritten_kernel",
+        "description": (
+            "Deterministic (non-LLM) tool. Reads "
+            "baselines/<kernel_stem>/driver.cpp (produced by a prior "
+            "spawn_baseline_harness call), replaces the text strictly "
+            "between the '// ---- KERNEL BEGIN ----' and "
+            "'// ---- KERNEL END ----' sentinel lines with the supplied "
+            "rewritten_kernel_source, and writes the spliced result to "
+            "baselines/<kernel_stem>/rewritten/driver.cpp. Returns "
+            "{status, stdout, stderr, artifacts}. Call at most once per "
+            "accepted verifier verdict, immediately after a successful "
+            "run_baseline_driver AND a successful spawn_verifier with "
+            "verdict='accept', using the same kernel_stem. The spliced "
+            "driver is a precursor for a future mechanical comparator "
+            "and is not a precondition for finish."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "kernel_stem": {
+                    "type": "string",
+                    "description": (
+                        "Filesystem-safe short name for this kernel; "
+                        "MUST match the kernel_stem passed to the "
+                        "preceding spawn_baseline_harness call."
+                    ),
+                },
+                "rewritten_kernel_source": {
+                    "type": "string",
+                    "description": (
+                        "The rewritten kernel source produced by the "
+                        "most recent spawn_rewriter call that the "
+                        "verifier accepted. This text replaces the "
+                        "baseline kernel body between the splice "
+                        "sentinels; do not include the sentinel lines "
+                        "themselves, and do not wrap in code fences."
+                    ),
+                },
+            },
+            "required": ["kernel_stem", "rewritten_kernel_source"],
+        },
+    },
+    {
         "name": "finish",
         "description": "Terminate the workflow with the final rewritten kernel.",
         "input_schema": {
@@ -535,6 +600,16 @@ def _execute_tool(tool_name: str, tool_input: dict) -> dict:
         # AGENT_PRECISION_RUN_TIMEOUT_SEC. Returns the same
         # {status, stdout, stderr, artifacts} shape verbatim.
         return run_baseline_driver(tool_input["kernel_stem"])
+    if tool_name == "splice_rewritten_kernel":
+        # Deterministic tool (no LLM call): pure text I/O. Splices the
+        # rewriter's kernel source into a copy of the baseline driver
+        # between the KERNEL BEGIN / KERNEL END sentinels and writes
+        # baselines/<stem>/rewritten/driver.cpp. Returns the same
+        # {status, stdout, stderr, artifacts} shape verbatim.
+        return splice_rewritten_kernel(
+            tool_input["kernel_stem"],
+            tool_input["rewritten_kernel_source"],
+        )
     raise ValueError(f"Unknown tool: {tool_name}")
 
 
@@ -609,7 +684,12 @@ def _format_baseline_block(kernel_path: str, kernel_name: str | None) -> str:
         "KERNEL STEM. If (and only if) compile_baseline_driver returns "
         "status='ok', follow it immediately with a single call to "
         "run_baseline_driver using the same KERNEL STEM. A non-zero "
-        "compile or run result must NOT block the rest of the pipeline."
+        "compile or run result must NOT block the rest of the pipeline.\n"
+        "Later, after spawn_verifier returns verdict='accept' AND the "
+        "preceding run_baseline_driver returned status='ok', call "
+        "splice_rewritten_kernel exactly once with the same KERNEL STEM "
+        "and the rewriter's accepted rewritten kernel source as "
+        "rewritten_kernel_source. A splice error must NOT block finish."
     )
 
 
