@@ -4,8 +4,11 @@ Covers compile_baseline_driver — env-var handling, missing source file,
 g++ command shape, and the success / error result schema — and
 run_baseline_driver — env-var parsing, missing/non-executable binary,
 clean run + reference.json validation, non-zero exit, timeout, and
-the same uniform result schema. All tests monkeypatch subprocess.run
-so no real compiler or driver invocation happens.
+the same uniform result schema. Also covers splice_rewritten_kernel —
+sentinel discovery, error cases, round-trip identity, byte-preservation
+outside the sentinels, and the same uniform result schema. All tests
+monkeypatch subprocess.run so no real compiler or driver invocation
+happens.
 """
 
 import json
@@ -16,10 +19,13 @@ import subprocess
 from workflow import tools
 from workflow.tools import (
     DEFAULT_RUN_TIMEOUT_SEC,
+    KERNEL_BEGIN_SENTINEL,
+    KERNEL_END_SENTINEL,
     KOKKOS_ROOT_ENV,
     RUN_TIMEOUT_ENV,
     compile_baseline_driver,
     run_baseline_driver,
+    splice_rewritten_kernel,
 )
 
 
@@ -639,3 +645,361 @@ def test_run_baseline_driver_result_keys_are_stable(monkeypatch, tmp_path):
 
     monkeypatch.setattr(subprocess, "run", raise_timeout)
     assert set(run_baseline_driver("x").keys()) == expected_keys
+
+
+# ---------- splice_rewritten_kernel ----------
+
+
+# A minimal-but-realistic baseline driver template used by the splice
+# tests. The content between the sentinels stands in for the
+# baseline_harness agent's inlined kernel. The exact bytes outside the
+# sentinels are what the tool must preserve byte-for-byte.
+_BASELINE_DRIVER_TEMPLATE = (
+    "// driver.cpp -- baseline harness driver\n"
+    "#include <Kokkos_Core.hpp>\n"
+    "#include <cstdio>\n"
+    "\n"
+    "// ---- KERNEL BEGIN ----\n"
+    "void kernel(double* x, int n) {\n"
+    "  for (int i = 0; i < n; ++i) x[i] = x[i] * 2.0;\n"
+    "}\n"
+    "// ---- KERNEL END ----\n"
+    "\n"
+    "int main(int argc, char** argv) {\n"
+    "  Kokkos::initialize(argc, argv);\n"
+    "  Kokkos::finalize();\n"
+    "  return 0;\n"
+    "}\n"
+)
+_ORIGINAL_KERNEL_BODY = (
+    "void kernel(double* x, int n) {\n"
+    "  for (int i = 0; i < n; ++i) x[i] = x[i] * 2.0;\n"
+    "}\n"
+)
+
+
+def _stage_baseline_driver(tmp_path, stem, body=_BASELINE_DRIVER_TEMPLATE):
+    """Write a baseline driver.cpp at baselines/<stem>/ under tmp_path."""
+    d = tmp_path / "baselines" / stem
+    d.mkdir(parents=True)
+    (d / "driver.cpp").write_text(body)
+    return d
+
+
+def _ban_subprocess(monkeypatch):
+    """Make any subprocess.run call from splice_rewritten_kernel fail loudly."""
+
+    def fail_run(*a, **kw):
+        raise AssertionError(
+            "splice_rewritten_kernel must not invoke subprocess.run "
+            "(it is pure text I/O)"
+        )
+
+    monkeypatch.setattr(subprocess, "run", fail_run)
+
+
+def test_splice_rewritten_kernel_success_writes_rewritten_driver(
+    monkeypatch, tmp_path
+):
+    """On success splice_rewritten_kernel returns status='ok' with the rewritten driver path in artifacts and writes a file at baselines/<stem>/rewritten/driver.cpp."""
+    monkeypatch.chdir(tmp_path)
+    _stage_baseline_driver(tmp_path, "k")
+    _ban_subprocess(monkeypatch)
+
+    new_kernel = (
+        "void kernel(float* x, int n) {\n"
+        "  for (int i = 0; i < n; ++i) x[i] = x[i] * 2.0f;\n"
+        "}\n"
+    )
+
+    result = splice_rewritten_kernel("k", new_kernel)
+
+    assert result["status"] == "ok"
+    assert result["stdout"] == ""
+    assert result["stderr"] == ""
+    assert result["artifacts"] == ["baselines/k/rewritten/driver.cpp"]
+
+    out_path = tmp_path / "baselines" / "k" / "rewritten" / "driver.cpp"
+    assert out_path.is_file()
+    text = out_path.read_text()
+    # Both sentinels still present, exactly once each, each on its own
+    # line.
+    out_lines = text.split("\n")
+    assert out_lines.count(KERNEL_BEGIN_SENTINEL) == 1
+    assert out_lines.count(KERNEL_END_SENTINEL) == 1
+    # The new kernel body landed strictly between them.
+    begin = out_lines.index(KERNEL_BEGIN_SENTINEL)
+    end = out_lines.index(KERNEL_END_SENTINEL)
+    spliced = "\n".join(out_lines[begin + 1 : end])
+    assert spliced == new_kernel.rstrip("\n")
+
+
+def test_splice_rewritten_kernel_does_not_touch_baseline(monkeypatch, tmp_path):
+    """splice_rewritten_kernel must never modify baselines/<stem>/driver.cpp; the rewritten copy goes under rewritten/."""
+    monkeypatch.chdir(tmp_path)
+    driver_dir = _stage_baseline_driver(tmp_path, "k")
+    _ban_subprocess(monkeypatch)
+    before = (driver_dir / "driver.cpp").read_bytes()
+
+    splice_rewritten_kernel("k", "void kernel() {}\n")
+
+    after = (driver_dir / "driver.cpp").read_bytes()
+    assert before == after
+
+
+def test_splice_rewritten_kernel_preserves_bytes_outside_sentinels(
+    monkeypatch, tmp_path
+):
+    """Lines outside the sentinel region in the spliced driver must be byte-identical to the baseline (only the kernel region changes)."""
+    monkeypatch.chdir(tmp_path)
+    _stage_baseline_driver(tmp_path, "k")
+    _ban_subprocess(monkeypatch)
+
+    splice_rewritten_kernel("k", "void kernel() { /* new */ }\n")
+
+    baseline = (tmp_path / "baselines" / "k" / "driver.cpp").read_text()
+    rewritten = (
+        tmp_path / "baselines" / "k" / "rewritten" / "driver.cpp"
+    ).read_text()
+
+    baseline_lines = baseline.split("\n")
+    rewritten_lines = rewritten.split("\n")
+    b_begin = baseline_lines.index(KERNEL_BEGIN_SENTINEL)
+    b_end = baseline_lines.index(KERNEL_END_SENTINEL)
+    r_begin = rewritten_lines.index(KERNEL_BEGIN_SENTINEL)
+    r_end = rewritten_lines.index(KERNEL_END_SENTINEL)
+
+    # Prefix up to and including BEGIN: identical.
+    assert baseline_lines[: b_begin + 1] == rewritten_lines[: r_begin + 1]
+    # Suffix from END onward: identical.
+    assert baseline_lines[b_end:] == rewritten_lines[r_end:]
+
+
+def test_splice_rewritten_kernel_round_trip_is_byte_identical(
+    monkeypatch, tmp_path
+):
+    """Splicing the ORIGINAL kernel body back in must yield a file byte-identical to the baseline driver — strong proof that splice touches only the kernel region."""
+    monkeypatch.chdir(tmp_path)
+    _stage_baseline_driver(tmp_path, "k")
+    _ban_subprocess(monkeypatch)
+
+    result = splice_rewritten_kernel("k", _ORIGINAL_KERNEL_BODY)
+
+    assert result["status"] == "ok"
+    baseline = (tmp_path / "baselines" / "k" / "driver.cpp").read_bytes()
+    rewritten = (
+        tmp_path / "baselines" / "k" / "rewritten" / "driver.cpp"
+    ).read_bytes()
+    assert baseline == rewritten
+
+
+def test_splice_rewritten_kernel_overwrites_prior_rewritten(
+    monkeypatch, tmp_path
+):
+    """A second call to splice_rewritten_kernel must overwrite an earlier rewritten/driver.cpp without complaint (chain can re-fire on each new verifier accept)."""
+    monkeypatch.chdir(tmp_path)
+    _stage_baseline_driver(tmp_path, "k")
+    _ban_subprocess(monkeypatch)
+
+    r1 = splice_rewritten_kernel("k", "void kernel() { /* v1 */ }\n")
+    assert r1["status"] == "ok"
+    first = (tmp_path / "baselines" / "k" / "rewritten" / "driver.cpp").read_text()
+    assert "v1" in first
+
+    r2 = splice_rewritten_kernel("k", "void kernel() { /* v2 */ }\n")
+    assert r2["status"] == "ok"
+    second = (tmp_path / "baselines" / "k" / "rewritten" / "driver.cpp").read_text()
+    assert "v2" in second
+    assert "v1" not in second
+
+
+def test_splice_rewritten_kernel_errors_when_baseline_missing(
+    monkeypatch, tmp_path
+):
+    """If baselines/<stem>/driver.cpp does not exist, splice_rewritten_kernel returns status='error' (and the rewritten/ directory is NOT created)."""
+    monkeypatch.chdir(tmp_path)
+    _ban_subprocess(monkeypatch)
+
+    result = splice_rewritten_kernel("k", "void kernel() {}\n")
+
+    assert result["status"] == "error"
+    assert "driver.cpp" in result["stderr"]
+    assert result["artifacts"] == []
+    assert not (tmp_path / "baselines" / "k" / "rewritten").exists()
+
+
+def test_splice_rewritten_kernel_errors_when_rewritten_source_empty(
+    monkeypatch, tmp_path
+):
+    """An empty rewritten_kernel_source is a programming error and is rejected without touching the filesystem."""
+    monkeypatch.chdir(tmp_path)
+    _stage_baseline_driver(tmp_path, "k")
+    _ban_subprocess(monkeypatch)
+
+    result = splice_rewritten_kernel("k", "")
+
+    assert result["status"] == "error"
+    assert result["artifacts"] == []
+    assert not (tmp_path / "baselines" / "k" / "rewritten").exists()
+
+
+def test_splice_rewritten_kernel_errors_when_begin_sentinel_missing(
+    monkeypatch, tmp_path
+):
+    """Zero KERNEL BEGIN sentinels in the baseline is an error (sentinel uniqueness is part of the contract)."""
+    monkeypatch.chdir(tmp_path)
+    bad = _BASELINE_DRIVER_TEMPLATE.replace(KERNEL_BEGIN_SENTINEL, "// nope")
+    _stage_baseline_driver(tmp_path, "k", body=bad)
+    _ban_subprocess(monkeypatch)
+
+    result = splice_rewritten_kernel("k", "void kernel() {}\n")
+
+    assert result["status"] == "error"
+    assert KERNEL_BEGIN_SENTINEL in result["stderr"]
+    assert result["artifacts"] == []
+
+
+def test_splice_rewritten_kernel_errors_when_end_sentinel_missing(
+    monkeypatch, tmp_path
+):
+    """Zero KERNEL END sentinels in the baseline is an error."""
+    monkeypatch.chdir(tmp_path)
+    bad = _BASELINE_DRIVER_TEMPLATE.replace(KERNEL_END_SENTINEL, "// nope")
+    _stage_baseline_driver(tmp_path, "k", body=bad)
+    _ban_subprocess(monkeypatch)
+
+    result = splice_rewritten_kernel("k", "void kernel() {}\n")
+
+    assert result["status"] == "error"
+    assert KERNEL_END_SENTINEL in result["stderr"]
+    assert result["artifacts"] == []
+
+
+def test_splice_rewritten_kernel_errors_when_begin_sentinel_duplicated(
+    monkeypatch, tmp_path
+):
+    """More than one KERNEL BEGIN sentinel line is an error (sentinel uniqueness contract)."""
+    monkeypatch.chdir(tmp_path)
+    bad = _BASELINE_DRIVER_TEMPLATE + KERNEL_BEGIN_SENTINEL + "\n"
+    _stage_baseline_driver(tmp_path, "k", body=bad)
+    _ban_subprocess(monkeypatch)
+
+    result = splice_rewritten_kernel("k", "void kernel() {}\n")
+
+    assert result["status"] == "error"
+    assert KERNEL_BEGIN_SENTINEL in result["stderr"]
+    assert result["artifacts"] == []
+
+
+def test_splice_rewritten_kernel_errors_when_end_sentinel_duplicated(
+    monkeypatch, tmp_path
+):
+    """More than one KERNEL END sentinel line is an error."""
+    monkeypatch.chdir(tmp_path)
+    bad = _BASELINE_DRIVER_TEMPLATE + KERNEL_END_SENTINEL + "\n"
+    _stage_baseline_driver(tmp_path, "k", body=bad)
+    _ban_subprocess(monkeypatch)
+
+    result = splice_rewritten_kernel("k", "void kernel() {}\n")
+
+    assert result["status"] == "error"
+    assert KERNEL_END_SENTINEL in result["stderr"]
+    assert result["artifacts"] == []
+
+
+def test_splice_rewritten_kernel_errors_when_sentinels_out_of_order(
+    monkeypatch, tmp_path
+):
+    """If KERNEL END appears before KERNEL BEGIN, splice_rewritten_kernel returns status='error' rather than producing a garbled spliced file."""
+    monkeypatch.chdir(tmp_path)
+    # Build a driver where the END sentinel sits above the BEGIN sentinel.
+    bad = (
+        "// driver.cpp\n"
+        "#include <Kokkos_Core.hpp>\n"
+        "\n"
+        f"{KERNEL_END_SENTINEL}\n"
+        "void kernel() {}\n"
+        f"{KERNEL_BEGIN_SENTINEL}\n"
+        "\n"
+        "int main() { return 0; }\n"
+    )
+    _stage_baseline_driver(tmp_path, "k", body=bad)
+    _ban_subprocess(monkeypatch)
+
+    result = splice_rewritten_kernel("k", "void kernel() {}\n")
+
+    assert result["status"] == "error"
+    # Both sentinel strings should be named in the diagnostic.
+    assert KERNEL_BEGIN_SENTINEL in result["stderr"]
+    assert KERNEL_END_SENTINEL in result["stderr"]
+    assert result["artifacts"] == []
+    assert not (tmp_path / "baselines" / "k" / "rewritten").exists()
+
+
+def test_splice_rewritten_kernel_rejects_indented_sentinel(monkeypatch, tmp_path):
+    """A sentinel line that is indented (or has trailing whitespace) is NOT a valid sentinel; splice_rewritten_kernel must reject the baseline rather than silently splicing into the wrong line."""
+    monkeypatch.chdir(tmp_path)
+    bad = _BASELINE_DRIVER_TEMPLATE.replace(
+        KERNEL_BEGIN_SENTINEL, "  " + KERNEL_BEGIN_SENTINEL  # leading spaces
+    )
+    _stage_baseline_driver(tmp_path, "k", body=bad)
+    _ban_subprocess(monkeypatch)
+
+    result = splice_rewritten_kernel("k", "void kernel() {}\n")
+
+    assert result["status"] == "error"
+    assert KERNEL_BEGIN_SENTINEL in result["stderr"]
+    assert result["artifacts"] == []
+
+
+def test_splice_rewritten_kernel_rejects_trailing_whitespace_sentinel(
+    monkeypatch, tmp_path
+):
+    """Trailing whitespace after a sentinel string also disqualifies the line (byte-exact contract)."""
+    monkeypatch.chdir(tmp_path)
+    bad = _BASELINE_DRIVER_TEMPLATE.replace(
+        KERNEL_END_SENTINEL + "\n", KERNEL_END_SENTINEL + "   \n"
+    )
+    _stage_baseline_driver(tmp_path, "k", body=bad)
+    _ban_subprocess(monkeypatch)
+
+    result = splice_rewritten_kernel("k", "void kernel() {}\n")
+
+    assert result["status"] == "error"
+    assert KERNEL_END_SENTINEL in result["stderr"]
+    assert result["artifacts"] == []
+
+
+def test_splice_rewritten_kernel_result_keys_are_stable(monkeypatch, tmp_path):
+    """Every code path returns a dict with exactly the keys {status, stdout, stderr, artifacts} — the same shape compile_baseline_driver / run_baseline_driver / planned remote-batch verifier tools share."""
+    expected_keys = {"status", "stdout", "stderr", "artifacts"}
+    monkeypatch.chdir(tmp_path)
+    _ban_subprocess(monkeypatch)
+
+    # 1) empty rewritten source
+    assert set(splice_rewritten_kernel("k", "").keys()) == expected_keys
+
+    # 2) missing baseline
+    assert (
+        set(splice_rewritten_kernel("k", "void kernel() {}\n").keys())
+        == expected_keys
+    )
+
+    # 3) success
+    _stage_baseline_driver(tmp_path, "k")
+    assert (
+        set(splice_rewritten_kernel("k", "void kernel() {}\n").keys())
+        == expected_keys
+    )
+
+    # 4) malformed baseline (sentinel missing)
+    bad_stem = "bad"
+    _stage_baseline_driver(
+        tmp_path,
+        bad_stem,
+        body=_BASELINE_DRIVER_TEMPLATE.replace(KERNEL_BEGIN_SENTINEL, "// x"),
+    )
+    assert (
+        set(splice_rewritten_kernel(bad_stem, "void kernel() {}\n").keys())
+        == expected_keys
+    )

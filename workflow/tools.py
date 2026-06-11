@@ -24,6 +24,13 @@ Currently exposes:
     parseable baselines/<kernel_stem>/reference.json. Subject to a
     per-run wall-clock timeout configured via the
     AGENT_PRECISION_RUN_TIMEOUT_SEC environment variable (default 60s).
+
+  - splice_rewritten_kernel(kernel_stem, rewritten_kernel_source): read
+    the baseline driver at baselines/<kernel_stem>/driver.cpp, replace
+    the region strictly between the KERNEL BEGIN / KERNEL END sentinels
+    with the supplied rewritten kernel source, and write the result to
+    baselines/<kernel_stem>/rewritten/driver.cpp. Pure text I/O; never
+    invokes a subprocess and never modifies the baseline file in place.
 """
 
 from __future__ import annotations
@@ -58,6 +65,18 @@ CXX_STD = "-std=c++20"
 OPT_FLAGS = ["-O2", "-fopenmp"]
 KOKKOS_LIBS = ["-lkokkoscore", "-lkokkoscontainers"]
 EXTRA_LIBS = ["-lpthread", "-ldl"]
+
+# Splice sentinels. These exact byte strings are mandated by the
+# baseline_harness agent's system prompt (see BASELINE_HARNESS_SYSTEM_PROMPT
+# in workflow/registry.py): the inlined kernel in baselines/<stem>/driver.cpp
+# is bracketed by these two lines, each on its own line with no
+# surrounding indentation. splice_rewritten_kernel relies on that exact
+# contract to identify the region to replace. If you ever change either
+# string here, you MUST also update the literal sentinel lines spelled
+# out in the harness prompt; LLM prompts cannot reference Python
+# identifiers, so the prompt deliberately re-states the bytes.
+KERNEL_BEGIN_SENTINEL = "// ---- KERNEL BEGIN ----"
+KERNEL_END_SENTINEL = "// ---- KERNEL END ----"
 
 
 def _error(stderr: str) -> dict:
@@ -276,4 +295,126 @@ def run_baseline_driver(kernel_stem: str) -> dict:
         "stdout": proc.stdout,
         "stderr": proc.stderr,
         "artifacts": [str(reference_path)],
+    }
+
+
+def _find_unique_sentinel_line(lines: list[str], sentinel: str) -> int | None:
+    """Return the index of the unique line equal to `sentinel`, or None.
+
+    Returns None if the sentinel appears zero times or more than once.
+    Comparison is byte-exact: a line with leading or trailing whitespace
+    around the sentinel does NOT match (the sentinel contract requires
+    each sentinel on its own line with no surrounding indentation).
+    """
+    matches = [i for i, line in enumerate(lines) if line == sentinel]
+    if len(matches) != 1:
+        return None
+    return matches[0]
+
+
+def splice_rewritten_kernel(
+    kernel_stem: str, rewritten_kernel_source: str
+) -> dict:
+    """Splice `rewritten_kernel_source` into the baseline driver template.
+
+    Reads baselines/<kernel_stem>/driver.cpp, locates the unique
+    KERNEL BEGIN / KERNEL END sentinel lines (byte-exact, each on its
+    own line with no surrounding indentation), replaces the text
+    strictly BETWEEN them (sentinels themselves preserved) with
+    `rewritten_kernel_source`, and writes the result to
+    baselines/<kernel_stem>/rewritten/driver.cpp. The directory is
+    created if needed. The baseline driver.cpp is never modified.
+
+    The result has the uniform `{status, stdout, stderr, artifacts}`
+    shape shared with compile_baseline_driver and run_baseline_driver:
+
+      - On success: status='ok', stdout='', stderr='',
+        artifacts=['baselines/<stem>/rewritten/driver.cpp'].
+      - On any error: status='error', stdout='', a descriptive stderr,
+        and artifacts=[].
+
+    This is pure text I/O. It never invokes a subprocess.
+    """
+    if not rewritten_kernel_source:
+        return _error(
+            "rewritten_kernel_source is empty; nothing to splice."
+        )
+
+    baseline_path = Path("baselines") / kernel_stem / "driver.cpp"
+    if not baseline_path.is_file():
+        return _error(
+            f"Baseline driver source not found at {baseline_path}. Did "
+            f"spawn_baseline_harness run and get approved for this "
+            f"kernel_stem?"
+        )
+
+    try:
+        baseline_text = baseline_path.read_text()
+    except OSError as exc:
+        return _error(f"Failed to read {baseline_path}: {exc}")
+
+    # splitlines(keepends=False) so we can do byte-exact line comparisons
+    # against the sentinel constants without worrying about \n on the
+    # right-hand side. We rejoin with "\n" below.
+    lines = baseline_text.splitlines()
+
+    begin_idx = _find_unique_sentinel_line(lines, KERNEL_BEGIN_SENTINEL)
+    if begin_idx is None:
+        return _error(
+            f"Baseline driver at {baseline_path} does not contain "
+            f"exactly one {KERNEL_BEGIN_SENTINEL!r} line on its own "
+            f"(no surrounding indentation or whitespace)."
+        )
+
+    end_idx = _find_unique_sentinel_line(lines, KERNEL_END_SENTINEL)
+    if end_idx is None:
+        return _error(
+            f"Baseline driver at {baseline_path} does not contain "
+            f"exactly one {KERNEL_END_SENTINEL!r} line on its own "
+            f"(no surrounding indentation or whitespace)."
+        )
+
+    if begin_idx >= end_idx:
+        return _error(
+            f"Baseline driver at {baseline_path} has "
+            f"{KERNEL_END_SENTINEL!r} at or before "
+            f"{KERNEL_BEGIN_SENTINEL!r} (line {end_idx + 1} vs line "
+            f"{begin_idx + 1}); cannot splice."
+        )
+
+    # Splice: keep everything up to and including BEGIN, drop the
+    # current kernel body, insert the rewritten kernel source (stripped
+    # of a single trailing newline so we don't double up when rejoining
+    # with "\n"), then keep END and everything after.
+    rewritten_body = rewritten_kernel_source
+    if rewritten_body.endswith("\n"):
+        rewritten_body = rewritten_body[:-1]
+    rewritten_lines = rewritten_body.split("\n")
+
+    new_lines = (
+        lines[: begin_idx + 1]
+        + rewritten_lines
+        + lines[end_idx:]
+    )
+
+    # Preserve a trailing newline iff the baseline had one (it normally
+    # does). Use "\n" joins so we don't accidentally inherit "\r\n" from
+    # a Windows-authored baseline; the baseline_harness emits Unix line
+    # endings by convention.
+    trailing_newline = "\n" if baseline_text.endswith("\n") else ""
+    new_text = "\n".join(new_lines) + trailing_newline
+
+    out_dir = Path("baselines") / kernel_stem / "rewritten"
+    out_path = out_dir / "driver.cpp"
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(new_text)
+    except OSError as exc:
+        return _error(f"Failed to write {out_path}: {exc}")
+
+    return {
+        "status": "ok",
+        "stdout": "",
+        "stderr": "",
+        "artifacts": [str(out_path)],
     }
