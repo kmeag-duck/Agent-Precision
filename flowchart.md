@@ -20,6 +20,7 @@ flowchart TD
   D -- "spawn_verifier" --> V["Verifier agent"]
   D -- "spawn_baseline_harness<br/>(Kokkos .cpp only; side artifact)" --> B["Baseline-harness agent"]
   D -- "compile_baseline_driver<br/>(deterministic; after baseline_harness)" --> C["g++ subprocess<br/>(AGENT_PRECISION_KOKKOS_ROOT)"]
+  D -- "run_baseline_driver<br/>(deterministic; after compile_baseline_driver)" --> N["./driver subprocess<br/>(AGENT_PRECISION_RUN_TIMEOUT_SEC)<br/>writes baselines/&lt;stem&gt;/reference.json"]
   D -- "finish" --> F(["print final kernel + notes"])
   P -- "{kind, value, rationale, confidence, alternative}" --> O
   A -- "{variables, rework, precision_budget, overall_notes}" --> O
@@ -27,6 +28,7 @@ flowchart TD
   V -- "{verdict, per_variable, concerns}" --> O
   B -- "{driver_source, ...} -> baselines/&lt;stem&gt;/driver.cpp" --> O
   C -- "{status, stdout, stderr, artifacts}" --> O
+  N -- "{status, stdout, stderr, artifacts}" --> O
 ```
 
 For the intended happy-path *sequence* through the conversation (who

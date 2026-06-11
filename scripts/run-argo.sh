@@ -32,6 +32,12 @@
 #                                 install) if unset and that directory exists;
 #                                 otherwise left unset and the compile tool
 #                                 returns a non-fatal error.
+#   AGENT_PRECISION_RUN_TIMEOUT_SEC
+#                                 Wall-clock seconds the run_baseline_driver
+#                                 tool will wait for the compiled driver to
+#                                 finish. Defaults to 60 if unset; raise this
+#                                 as kernels grow (e.g. once deployment-scale
+#                                 inputs land).
 
 set -euo pipefail
 
@@ -120,6 +126,13 @@ fi
 if [ -z "${AGENT_PRECISION_KOKKOS_ROOT:-}" ] && [ -d "${PWD}/kokkos/include" ] && [ -d "${PWD}/kokkos/lib" ]; then
     export AGENT_PRECISION_KOKKOS_ROOT="${PWD}/kokkos"
     echo -e "${GREEN}AGENT_PRECISION_KOKKOS_ROOT defaulted to ${AGENT_PRECISION_KOKKOS_ROOT}${NC}"
+fi
+
+# Default AGENT_PRECISION_RUN_TIMEOUT_SEC to 60 if the caller did not set it.
+# Matches the default baked into workflow.tools.run_baseline_driver; declared
+# explicitly here so the value is visible at the wrapper-script level.
+if [ -z "${AGENT_PRECISION_RUN_TIMEOUT_SEC:-}" ]; then
+    export AGENT_PRECISION_RUN_TIMEOUT_SEC=60
 fi
 
 echo -e "${GREEN}Running workflow via Argo...${NC}"

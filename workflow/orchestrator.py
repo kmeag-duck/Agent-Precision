@@ -20,7 +20,7 @@ from pathlib import Path
 import anthropic
 
 from .run_agent import run_agent
-from .tools import compile_baseline_driver
+from .tools import compile_baseline_driver, run_baseline_driver
 
 ORCHESTRATOR_MODEL = "claude-opus-4-7"
 
@@ -125,7 +125,7 @@ You have access to five specialist agents:
     kernels). On approval, the orchestrator writes the driver to
     baselines/<kernel_stem>/driver.cpp; you do not need to manage that.
 
-You also have one deterministic (non-LLM) tool:
+You also have two deterministic (non-LLM) tools:
   - compile_baseline_driver: takes a kernel_stem and compiles
     baselines/<kernel_stem>/driver.cpp into baselines/<kernel_stem>/
     driver using the local Kokkos install named by the
@@ -137,6 +137,19 @@ You also have one deterministic (non-LLM) tool:
     driver is a side artifact: it is not a precondition for finish, and
     a compile error there must NOT block the analyst -> rewriter ->
     verifier pipeline.
+
+  - run_baseline_driver: takes a kernel_stem and executes
+    baselines/<kernel_stem>/driver, then verifies that it produced a
+    parseable baselines/<kernel_stem>/reference.json. Subject to a
+    wall-clock timeout configured via the
+    AGENT_PRECISION_RUN_TIMEOUT_SEC environment variable (default 60s).
+    Returns {status, stdout, stderr, artifacts}. Call this exactly
+    once, immediately after a successful compile_baseline_driver call,
+    and using the same kernel_stem. Do not call it if
+    compile_baseline_driver was skipped, rejected, or returned an error.
+    The reference output is another side artifact: it is not a
+    precondition for finish, and a run error there must NOT block the
+    analyst -> rewriter -> verifier pipeline.
 
 You also have a finish tool to emit the final answer.
 
@@ -394,6 +407,37 @@ ORCHESTRATOR_TOOLS = [
         },
     },
     {
+        "name": "run_baseline_driver",
+        "description": (
+            "Deterministic (non-LLM) tool. Executes "
+            "baselines/<kernel_stem>/driver (produced by a prior "
+            "compile_baseline_driver call) with cwd set to "
+            "baselines/<kernel_stem>/, so the driver writes "
+            "./reference.json next to itself. Validates that the "
+            "resulting reference.json is parseable JSON. Subject to a "
+            "wall-clock timeout from AGENT_PRECISION_RUN_TIMEOUT_SEC "
+            "(default 60s). Returns {status, stdout, stderr, "
+            "artifacts}. Call exactly once per run, immediately after "
+            "a successful compile_baseline_driver, with the same "
+            "kernel_stem. The reference output is a side artifact and "
+            "not a precondition for finish."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "kernel_stem": {
+                    "type": "string",
+                    "description": (
+                        "Filesystem-safe short name for this kernel; "
+                        "MUST match the kernel_stem passed to the "
+                        "preceding compile_baseline_driver call."
+                    ),
+                },
+            },
+            "required": ["kernel_stem"],
+        },
+    },
+    {
         "name": "finish",
         "description": "Terminate the workflow with the final rewritten kernel.",
         "input_schema": {
@@ -484,6 +528,13 @@ def _execute_tool(tool_name: str, tool_input: dict) -> dict:
         # (no extra wrapping), so the orchestrator sees the same shape
         # future remote-batch verifier tools will return.
         return compile_baseline_driver(tool_input["kernel_stem"])
+    if tool_name == "run_baseline_driver":
+        # Deterministic tool (no LLM call): executes the previously-
+        # compiled baselines/<stem>/driver with cwd set to that
+        # directory so ./reference.json lands beside it. Subject to
+        # AGENT_PRECISION_RUN_TIMEOUT_SEC. Returns the same
+        # {status, stdout, stderr, artifacts} shape verbatim.
+        return run_baseline_driver(tool_input["kernel_stem"])
     raise ValueError(f"Unknown tool: {tool_name}")
 
 
@@ -555,8 +606,10 @@ def _format_baseline_block(kernel_path: str, kernel_name: str | None) -> str:
         "KERNEL STEM verbatim as kernel_stem. If (and only if) "
         "spawn_baseline_harness succeeds, follow it immediately with a "
         "single call to compile_baseline_driver using the same "
-        "KERNEL STEM. A non-zero compile result must NOT block the "
-        "rest of the pipeline."
+        "KERNEL STEM. If (and only if) compile_baseline_driver returns "
+        "status='ok', follow it immediately with a single call to "
+        "run_baseline_driver using the same KERNEL STEM. A non-zero "
+        "compile or run result must NOT block the rest of the pipeline."
     )
 
 

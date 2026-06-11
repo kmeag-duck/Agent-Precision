@@ -737,3 +737,93 @@ def test_execute_tool_compile_baseline_driver_error_passes_through(monkeypatch):
     assert result["status"] == "error"
     assert "AGENT_PRECISION_KOKKOS_ROOT" in result["stderr"]
     assert result["artifacts"] == []
+
+
+# ---------- run_baseline_driver: tool schema + prompt + dispatch ----------
+
+
+def test_orchestrator_tools_include_run_baseline_driver():
+    """ORCHESTRATOR_TOOLS exposes run_baseline_driver with kernel_stem as the only required string input."""
+    by_name = {t["name"]: t for t in ORCHESTRATOR_TOOLS}
+    assert "run_baseline_driver" in by_name
+    tool = by_name["run_baseline_driver"]
+    props = tool["input_schema"]["properties"]
+    assert "kernel_stem" in props
+    assert props["kernel_stem"]["type"] == "string"
+    assert set(tool["input_schema"]["required"]) == {"kernel_stem"}
+
+
+def test_orchestrator_prompt_mentions_run_baseline_driver_and_env_var():
+    """The orchestrator prompt names run_baseline_driver and AGENT_PRECISION_RUN_TIMEOUT_SEC, and states the run output is a side artifact (not a precondition for finish)."""
+    text = ORCHESTRATOR_SYSTEM_PROMPT
+    assert "run_baseline_driver" in text
+    assert "AGENT_PRECISION_RUN_TIMEOUT_SEC" in text
+    # Must be marked as a side artifact, same as the baseline + compile.
+    assert "side artifact" in text.lower() or "not a precondition for finish" in text.lower()
+
+
+def test_format_baseline_block_cpp_mentions_run_step():
+    """For a .cpp kernel, the BASELINE STEP block tells the orchestrator to follow a successful compile_baseline_driver with a single run_baseline_driver call using the same KERNEL STEM."""
+    block = _format_baseline_block(
+        "test-kernels/kokkos/mixed/nbody_force.cpp", None
+    )
+    assert "run_baseline_driver" in block
+    # Must be coupled to the compile call, not a standalone instruction.
+    assert "compile_baseline_driver" in block
+
+
+def test_format_baseline_block_cu_does_not_mention_run_step():
+    """For a CUDA .cu kernel, the (skipped) BASELINE STEP block must NOT mention run_baseline_driver — the run depends on a compile, which depends on the harness, which is forbidden for .cu inputs."""
+    block = _format_baseline_block(
+        "test-kernels/cuda/lowerable/vector_add.cu", None
+    )
+    assert "run_baseline_driver" not in block
+
+
+def test_execute_tool_dispatches_run_baseline_driver(monkeypatch):
+    """_execute_tool routes run_baseline_driver to workflow.tools.run_baseline_driver and returns its {status, stdout, stderr, artifacts} dict verbatim (no extra wrapping)."""
+    captured = {}
+
+    def stub_run(kernel_stem):
+        captured["kernel_stem"] = kernel_stem
+        return {
+            "status": "ok",
+            "stdout": "driver ran cleanly",
+            "stderr": "",
+            "artifacts": ["baselines/nbody_force/reference.json"],
+        }
+
+    monkeypatch.setattr(orchestrator, "run_baseline_driver", stub_run)
+
+    result = _execute_tool(
+        "run_baseline_driver", {"kernel_stem": "nbody_force"}
+    )
+
+    assert captured == {"kernel_stem": "nbody_force"}
+    # Verbatim pass-through — same shape future remote-batch tools share.
+    assert result == {
+        "status": "ok",
+        "stdout": "driver ran cleanly",
+        "stderr": "",
+        "artifacts": ["baselines/nbody_force/reference.json"],
+    }
+
+
+def test_execute_tool_run_baseline_driver_error_passes_through(monkeypatch):
+    """When the run helper returns status='error', _execute_tool passes that result through unchanged so the orchestrator sees the same error shape as a successful tool result."""
+    monkeypatch.setattr(
+        orchestrator,
+        "run_baseline_driver",
+        lambda stem: {
+            "status": "error",
+            "stdout": "",
+            "stderr": "Driver exited with code 7.",
+            "artifacts": [],
+        },
+    )
+    result = _execute_tool(
+        "run_baseline_driver", {"kernel_stem": "x"}
+    )
+    assert result["status"] == "error"
+    assert "code 7" in result["stderr"]
+    assert result["artifacts"] == []

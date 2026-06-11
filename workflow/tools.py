@@ -18,10 +18,17 @@ Currently exposes:
     agent into a native executable at baselines/<kernel_stem>/driver,
     linking against the Kokkos install named by the
     AGENT_PRECISION_KOKKOS_ROOT environment variable.
+
+  - run_baseline_driver(kernel_stem): execute the compiled driver at
+    baselines/<kernel_stem>/driver and verify that it produces a
+    parseable baselines/<kernel_stem>/reference.json. Subject to a
+    per-run wall-clock timeout configured via the
+    AGENT_PRECISION_RUN_TIMEOUT_SEC environment variable (default 60s).
 """
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -31,6 +38,14 @@ from pathlib import Path
 # it does not collide with Kokkos's own CMake convention (Kokkos_ROOT)
 # or with a system-wide install.
 KOKKOS_ROOT_ENV = "AGENT_PRECISION_KOKKOS_ROOT"
+
+# Environment variable that caps the wall-clock seconds run_baseline_driver
+# will wait for the compiled driver to finish. Namespaced for the same
+# reason as KOKKOS_ROOT_ENV; the explicit "_SEC" suffix avoids ms/s
+# ambiguity. Kernels in v0 are small enough that 60s is generous; raise
+# this as kernels grow (e.g. once deployment-scale inputs land).
+RUN_TIMEOUT_ENV = "AGENT_PRECISION_RUN_TIMEOUT_SEC"
+DEFAULT_RUN_TIMEOUT_SEC = 60
 
 # Compile flags. C++20 is required by the baseline driver template; the
 # OpenMP host backend is what the Kokkos install in this repo was built
@@ -134,4 +149,131 @@ def compile_baseline_driver(kernel_stem: str) -> dict:
         "stdout": proc.stdout,
         "stderr": proc.stderr,
         "artifacts": [str(driver_bin)],
+    }
+
+
+def _parse_timeout(raw: str) -> int | None:
+    """Parse RUN_TIMEOUT_ENV into a positive int; return None on bad input."""
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    if value <= 0:
+        return None
+    return value
+
+
+def run_baseline_driver(kernel_stem: str) -> dict:
+    """Execute baselines/<kernel_stem>/driver and validate reference.json.
+
+    The driver is invoked with cwd=baselines/<kernel_stem>/ so the
+    `./reference.json` path the baseline_harness prompt mandates lands
+    next to the driver source/binary. Returns a uniform
+    `{status, stdout, stderr, artifacts}` dict (the same shape as
+    compile_baseline_driver and the planned remote-batch verifier
+    tools), where `status` is 'ok' on a clean run + parseable JSON and
+    'error' otherwise. On success, `artifacts` is the single-element
+    list `["baselines/<kernel_stem>/reference.json"]`.
+
+    Any pre-existing reference.json at the target path is deleted
+    before the subprocess runs so that, on a failed run, the orchestrator
+    does not see a misleadingly-stale reference. Compile/run failures
+    are non-fatal to the surrounding pipeline; the orchestrator treats
+    this whole side artifact as optional.
+    """
+    raw_timeout = os.environ.get(RUN_TIMEOUT_ENV)
+    if raw_timeout is None:
+        timeout = DEFAULT_RUN_TIMEOUT_SEC
+    else:
+        parsed = _parse_timeout(raw_timeout)
+        if parsed is None:
+            return _error(
+                f"{RUN_TIMEOUT_ENV}={raw_timeout!r} is not a positive "
+                f"integer number of seconds."
+            )
+        timeout = parsed
+
+    driver_dir = Path("baselines") / kernel_stem
+    driver_bin = driver_dir / "driver"
+    reference_path = driver_dir / "reference.json"
+
+    if not driver_bin.is_file():
+        return _error(
+            f"Driver binary not found at {driver_bin}. Did "
+            f"compile_baseline_driver run and succeed for this "
+            f"kernel_stem?"
+        )
+    if not os.access(driver_bin, os.X_OK):
+        return _error(
+            f"Driver binary at {driver_bin} is not executable."
+        )
+
+    # Drop any stale reference.json from a prior run so a failed
+    # subprocess cannot leave the orchestrator with a misleading file.
+    try:
+        reference_path.unlink()
+    except FileNotFoundError:
+        pass
+
+    try:
+        proc = subprocess.run(
+            ["./driver"],
+            cwd=str(driver_dir),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return _error(
+            f"Driver at {driver_bin} exceeded timeout of {timeout}s "
+            f"(configure via {RUN_TIMEOUT_ENV}).\n"
+            f"Partial stdout: {exc.stdout or ''}\n"
+            f"Partial stderr: {exc.stderr or ''}"
+        )
+    except FileNotFoundError as exc:
+        return _error(f"Failed to invoke driver at {driver_bin}: {exc}")
+
+    if proc.returncode != 0:
+        return {
+            "status": "error",
+            "stdout": proc.stdout,
+            "stderr": (
+                f"Driver exited with code {proc.returncode}.\n\n"
+                f"{proc.stderr}"
+            ),
+            "artifacts": [],
+        }
+
+    if not reference_path.is_file():
+        return {
+            "status": "error",
+            "stdout": proc.stdout,
+            "stderr": (
+                f"Driver exited 0 but did not write {reference_path}. "
+                f"Check that the driver writes ./reference.json "
+                f"relative to its CWD.\n\n{proc.stderr}"
+            ),
+            "artifacts": [],
+        }
+
+    try:
+        with reference_path.open() as fh:
+            json.load(fh)
+    except (OSError, json.JSONDecodeError) as exc:
+        return {
+            "status": "error",
+            "stdout": proc.stdout,
+            "stderr": (
+                f"Driver wrote {reference_path} but it is not valid "
+                f"JSON: {exc}\n\n{proc.stderr}"
+            ),
+            "artifacts": [],
+        }
+
+    return {
+        "status": "ok",
+        "stdout": proc.stdout,
+        "stderr": proc.stderr,
+        "artifacts": [str(reference_path)],
     }
