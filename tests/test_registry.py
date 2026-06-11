@@ -280,3 +280,10 @@ def test_baseline_harness_prompt_mentions_high_precision_format():
     """The baseline_harness prompt requires %.17g formatting so the reference output preserves full double precision."""
     prompt = AGENTS["baseline_harness"]["system_prompt"]
     assert "%.17g" in prompt
+
+
+def test_baseline_harness_prompt_mandates_kernel_splice_sentinels():
+    """The baseline_harness prompt mandates the exact '// ---- KERNEL BEGIN ----' and '// ---- KERNEL END ----' sentinels around the inlined kernel so a later mechanical-verification step can splice a rewritten kernel into the same driver template."""
+    prompt = AGENTS["baseline_harness"]["system_prompt"]
+    assert "// ---- KERNEL BEGIN ----" in prompt
+    assert "// ---- KERNEL END ----" in prompt

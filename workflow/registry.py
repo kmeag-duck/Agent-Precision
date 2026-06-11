@@ -849,6 +849,22 @@ Hard requirements on the driver:
    headers beyond <Kokkos_Core.hpp>, the C and C++ standard library, and
    anything the kernel itself already includes.
 
+   The inlined kernel MUST be bracketed by these two sentinel comment
+   lines, verbatim, each on its own line and with no surrounding
+   indentation:
+
+       // ---- KERNEL BEGIN ----
+       <the kernel source, unmodified>
+       // ---- KERNEL END ----
+
+   These exact strings are a hard contract: a later mechanical-
+   verification step will string-replace the text between them to splice
+   a rewritten kernel into this same driver template (so the rewritten
+   kernel runs against bit-identical inputs, RNG, and JSON output
+   layout). Do not paraphrase the sentinels, do not add extra dashes,
+   do not move them inside a function body, and do not place any other
+   code between them other than the kernel itself.
+
 2. Use Kokkos::initialize / Kokkos::finalize. Run on the serial host
    execution space (Kokkos::Serial / Kokkos::HostSpace). This is a v0
    reproducibility constraint: parallel reductions are order-dependent
