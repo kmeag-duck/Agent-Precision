@@ -647,3 +647,93 @@ def test_run_orchestrator_cu_kernel_skips_baseline_in_first_user_message(
     assert "BASELINE STEP" in first_user
     assert "skipped" in first_user.lower()
     assert "Do NOT call spawn_baseline_harness" in first_user
+
+
+# ---------- compile_baseline_driver: tool schema + prompt + dispatch ----------
+
+
+def test_orchestrator_tools_include_compile_baseline_driver():
+    """ORCHESTRATOR_TOOLS exposes compile_baseline_driver with kernel_stem as the only required string input."""
+    by_name = {t["name"]: t for t in ORCHESTRATOR_TOOLS}
+    assert "compile_baseline_driver" in by_name
+    tool = by_name["compile_baseline_driver"]
+    props = tool["input_schema"]["properties"]
+    assert "kernel_stem" in props
+    assert props["kernel_stem"]["type"] == "string"
+    assert set(tool["input_schema"]["required"]) == {"kernel_stem"}
+
+
+def test_orchestrator_prompt_mentions_compile_baseline_driver_and_env_var():
+    """The orchestrator prompt names compile_baseline_driver and AGENT_PRECISION_KOKKOS_ROOT, and states the compile is a side artifact (not a precondition for finish)."""
+    text = ORCHESTRATOR_SYSTEM_PROMPT
+    assert "compile_baseline_driver" in text
+    assert "AGENT_PRECISION_KOKKOS_ROOT" in text
+    # Must be marked as a side artifact, same as the baseline itself.
+    assert "side artifact" in text.lower() or "not a precondition for finish" in text.lower()
+
+
+def test_format_baseline_block_cpp_mentions_compile_step():
+    """For a .cpp kernel, the BASELINE STEP block tells the orchestrator to follow a successful spawn_baseline_harness with a single compile_baseline_driver call using the same KERNEL STEM."""
+    block = _format_baseline_block(
+        "test-kernels/kokkos/mixed/nbody_force.cpp", None
+    )
+    assert "compile_baseline_driver" in block
+    # Must couple it to the harness call, not be a standalone instruction.
+    assert "spawn_baseline_harness" in block
+
+
+def test_format_baseline_block_cu_does_not_mention_compile_step():
+    """For a CUDA .cu kernel, the (skipped) BASELINE STEP block must NOT mention compile_baseline_driver — the compile depends on the harness, which is forbidden for .cu inputs."""
+    block = _format_baseline_block(
+        "test-kernels/cuda/lowerable/vector_add.cu", None
+    )
+    assert "compile_baseline_driver" not in block
+
+
+def test_execute_tool_dispatches_compile_baseline_driver(monkeypatch):
+    """_execute_tool routes compile_baseline_driver to workflow.tools.compile_baseline_driver and returns its {status, stdout, stderr, artifacts} dict verbatim (no extra wrapping)."""
+    captured = {}
+
+    def stub_compile(kernel_stem):
+        captured["kernel_stem"] = kernel_stem
+        return {
+            "status": "ok",
+            "stdout": "compiled fine",
+            "stderr": "",
+            "artifacts": ["baselines/nbody_force/driver"],
+        }
+
+    monkeypatch.setattr(orchestrator, "compile_baseline_driver", stub_compile)
+
+    result = _execute_tool(
+        "compile_baseline_driver", {"kernel_stem": "nbody_force"}
+    )
+
+    assert captured == {"kernel_stem": "nbody_force"}
+    # Verbatim pass-through — same shape future remote-batch tools share.
+    assert result == {
+        "status": "ok",
+        "stdout": "compiled fine",
+        "stderr": "",
+        "artifacts": ["baselines/nbody_force/driver"],
+    }
+
+
+def test_execute_tool_compile_baseline_driver_error_passes_through(monkeypatch):
+    """When the compile helper returns status='error', _execute_tool passes that result through unchanged so the orchestrator sees the same error shape as a successful tool result."""
+    monkeypatch.setattr(
+        orchestrator,
+        "compile_baseline_driver",
+        lambda stem: {
+            "status": "error",
+            "stdout": "",
+            "stderr": "AGENT_PRECISION_KOKKOS_ROOT is not set.",
+            "artifacts": [],
+        },
+    )
+    result = _execute_tool(
+        "compile_baseline_driver", {"kernel_stem": "x"}
+    )
+    assert result["status"] == "error"
+    assert "AGENT_PRECISION_KOKKOS_ROOT" in result["stderr"]
+    assert result["artifacts"] == []

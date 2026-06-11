@@ -18,11 +18,15 @@ flowchart TD
   D -- "spawn_analyst" --> A["Analyst agent"]
   D -- "spawn_rewriter" --> R["Rewriter agent"]
   D -- "spawn_verifier" --> V["Verifier agent"]
+  D -- "spawn_baseline_harness<br/>(Kokkos .cpp only; side artifact)" --> B["Baseline-harness agent"]
+  D -- "compile_baseline_driver<br/>(deterministic; after baseline_harness)" --> C["g++ subprocess<br/>(AGENT_PRECISION_KOKKOS_ROOT)"]
   D -- "finish" --> F(["print final kernel + notes"])
   P -- "{kind, value, rationale, confidence, alternative}" --> O
   A -- "{variables, rework, precision_budget, overall_notes}" --> O
   R -- "{rewritten_code, summary_of_changes}" --> O
   V -- "{verdict, per_variable, concerns}" --> O
+  B -- "{driver_source, ...} -> baselines/&lt;stem&gt;/driver.cpp" --> O
+  C -- "{status, stdout, stderr, artifacts}" --> O
 ```
 
 For the intended happy-path *sequence* through the conversation (who

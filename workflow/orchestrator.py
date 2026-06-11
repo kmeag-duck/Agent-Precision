@@ -20,6 +20,7 @@ from pathlib import Path
 import anthropic
 
 from .run_agent import run_agent
+from .tools import compile_baseline_driver
 
 ORCHESTRATOR_MODEL = "claude-opus-4-7"
 
@@ -123,6 +124,19 @@ You have access to five specialist agents:
     BASELINE STEP block invites you to (it only does so for Kokkos C++
     kernels). On approval, the orchestrator writes the driver to
     baselines/<kernel_stem>/driver.cpp; you do not need to manage that.
+
+You also have one deterministic (non-LLM) tool:
+  - compile_baseline_driver: takes a kernel_stem and compiles
+    baselines/<kernel_stem>/driver.cpp into baselines/<kernel_stem>/
+    driver using the local Kokkos install named by the
+    AGENT_PRECISION_KOKKOS_ROOT environment variable. Returns
+    {status, stdout, stderr, artifacts}. Call this exactly once,
+    immediately after a successful spawn_baseline_harness call, and
+    using the same kernel_stem. Do not call it if spawn_baseline_harness
+    was skipped or rejected. Like the baseline itself, the compiled
+    driver is a side artifact: it is not a precondition for finish, and
+    a compile error there must NOT block the analyst -> rewriter ->
+    verifier pipeline.
 
 You also have a finish tool to emit the final answer.
 
@@ -351,6 +365,35 @@ ORCHESTRATOR_TOOLS = [
         },
     },
     {
+        "name": "compile_baseline_driver",
+        "description": (
+            "Deterministic (non-LLM) tool. Compiles "
+            "baselines/<kernel_stem>/driver.cpp (produced by a prior "
+            "spawn_baseline_harness call) into baselines/<kernel_stem>/"
+            "driver, linking against the local Kokkos install named by "
+            "the AGENT_PRECISION_KOKKOS_ROOT environment variable. "
+            "Returns {status, stdout, stderr, artifacts}. Call exactly "
+            "once per run, immediately after a successful "
+            "spawn_baseline_harness, with the same kernel_stem. The "
+            "compiled driver is a side artifact and not a precondition "
+            "for finish."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "kernel_stem": {
+                    "type": "string",
+                    "description": (
+                        "Filesystem-safe short name for this kernel; "
+                        "MUST match the kernel_stem passed to the "
+                        "preceding spawn_baseline_harness call."
+                    ),
+                },
+            },
+            "required": ["kernel_stem"],
+        },
+    },
+    {
         "name": "finish",
         "description": "Terminate the workflow with the final rewritten kernel.",
         "input_schema": {
@@ -434,6 +477,13 @@ def _execute_tool(tool_name: str, tool_input: dict) -> dict:
             "result": result,
             "driver_path": str(driver_path),
         }
+    if tool_name == "compile_baseline_driver":
+        # Deterministic tool (no LLM call): shells out to g++ against
+        # the Kokkos install named by AGENT_PRECISION_KOKKOS_ROOT and
+        # returns a {status, stdout, stderr, artifacts} dict verbatim
+        # (no extra wrapping), so the orchestrator sees the same shape
+        # future remote-batch verifier tools will return.
+        return compile_baseline_driver(tool_input["kernel_stem"])
     raise ValueError(f"Unknown tool: {tool_name}")
 
 
@@ -502,7 +552,11 @@ def _format_baseline_block(kernel_path: str, kernel_name: str | None) -> str:
         "When you call spawn_baseline_harness, pass the original kernel "
         "source as kernel_source (no tolerance block; you MAY prepend a "
         "single TARGET KERNEL: line if one is given above) and the "
-        "KERNEL STEM verbatim as kernel_stem."
+        "KERNEL STEM verbatim as kernel_stem. If (and only if) "
+        "spawn_baseline_harness succeeds, follow it immediately with a "
+        "single call to compile_baseline_driver using the same "
+        "KERNEL STEM. A non-zero compile result must NOT block the "
+        "rest of the pipeline."
     )
 
 

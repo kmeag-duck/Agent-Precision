@@ -19,12 +19,19 @@
 #   ./scripts/run-argo.sh test-kernels/kokkos/mixed/nbody_force.cpp
 #
 # Environment overrides:
-#   ARGO_REMOTE_HOST     SSH host (default: homes.cels.anl.gov)
-#   ARGO_TUNNEL_PORT     Local SSH-tunnel port (default: 8082)
-#   ARGO_PROXY_PORT      Local shim port (default: 8083)
-#   ARGO_PROXY_SCRIPT    Path to claude-argo-proxy.py
-#                        (default: ${HOME}/argo-shim-lite/claude-argo-proxy.py)
-#   ARGO_USER            Username passed as ANTHROPIC_AUTH_TOKEN (default: $USER)
+#   ARGO_REMOTE_HOST              SSH host (default: homes.cels.anl.gov)
+#   ARGO_TUNNEL_PORT              Local SSH-tunnel port (default: 8082)
+#   ARGO_PROXY_PORT               Local shim port (default: 8083)
+#   ARGO_PROXY_SCRIPT             Path to claude-argo-proxy.py
+#                                 (default: ${HOME}/argo-shim-lite/claude-argo-proxy.py)
+#   ARGO_USER                     Username passed as ANTHROPIC_AUTH_TOKEN
+#                                 (default: $USER)
+#   AGENT_PRECISION_KOKKOS_ROOT   Kokkos install prefix used by the
+#                                 compile_baseline_driver orchestrator tool.
+#                                 Defaults to ${PWD}/kokkos (the bundled
+#                                 install) if unset and that directory exists;
+#                                 otherwise left unset and the compile tool
+#                                 returns a non-fatal error.
 
 set -euo pipefail
 
@@ -104,6 +111,15 @@ if [ $# -eq 0 ]; then
     echo -e "${YELLOW}Usage: $0 <kernel_file>${NC}"
     echo -e "${YELLOW}Example: $0 test-kernels/kokkos/mixed/nbody_force.cpp${NC}"
     exit 2
+fi
+
+# Default AGENT_PRECISION_KOKKOS_ROOT to the bundled install at ${PWD}/kokkos
+# if the caller did not set it and that directory looks like a Kokkos prefix.
+# This makes the compile_baseline_driver orchestrator tool actually work
+# out of the box from the repo root, without forcing every CWD to have one.
+if [ -z "${AGENT_PRECISION_KOKKOS_ROOT:-}" ] && [ -d "${PWD}/kokkos/include" ] && [ -d "${PWD}/kokkos/lib" ]; then
+    export AGENT_PRECISION_KOKKOS_ROOT="${PWD}/kokkos"
+    echo -e "${GREEN}AGENT_PRECISION_KOKKOS_ROOT defaulted to ${AGENT_PRECISION_KOKKOS_ROOT}${NC}"
 fi
 
 echo -e "${GREEN}Running workflow via Argo...${NC}"
