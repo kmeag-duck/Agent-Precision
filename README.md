@@ -42,7 +42,7 @@ vocabulary and plumbing".
 What works today:
 
 - Core pipeline `(precision_advisor →)? analyst → rewriter → verifier`; orchestrator forbids `finish` without `verdict='accept'`.
-- Side artifact: `baseline_harness` — a fifth agent that, for Kokkos `.cpp` kernels only, emits a self-contained C++ driver to `baselines/<kernel_stem>/driver.cpp` that (when later compiled and run) writes a deterministic reference output to `./reference.json`. Not consumed by any other agent in this run; reserved for a future mechanical comparator. Not a precondition for `finish`.
+- Side artifact: the **harness → compile → run** trio for Kokkos `.cpp` kernels only. `baseline_harness` is a fifth agent that emits a self-contained C++ driver to `baselines/<kernel_stem>/driver.cpp`; the deterministic (non-LLM) `compile_baseline_driver` tool then `g++`-compiles it into `baselines/<kernel_stem>/driver` against the local Kokkos install named by `AGENT_PRECISION_KOKKOS_ROOT`; the deterministic `run_baseline_driver` tool then executes it (with `cwd=baselines/<kernel_stem>/`, subject to `AGENT_PRECISION_RUN_TIMEOUT_SEC`, default 60 s) so it writes a parseable `baselines/<kernel_stem>/reference.json`. The reference output is reserved for a future mechanical comparator; none of the three steps is a precondition for `finish`, and any failure in the trio (missing env var, compile error, non-zero exit, timeout, missing/invalid `reference.json`) is non-fatal to the analyst → rewriter → verifier pipeline.
 - Tolerance from `--sig-figs` / `--decimal-digits`, else inferred by the advisor; advisor may return `kind='unknown'`, which triggers fallback `{sig_figs: 6, source: 'advisor_unknown_defaulted'}`.
 - Tolerance threaded verbatim to analyst, rewriter, and verifier; analyst returns a `precision_budget` block; verifier audits it.
 - Per-variable methods: `downcast` (narrower hardware type — the throughput win), `emulate` (software pair, currently inline float-float / Dekker — throughput-NEGATIVE; only when downcast violates tolerance), or `keep`. Analyst can additionally suggest a kernel-shape `rework` such as Kahan summation.
@@ -52,7 +52,7 @@ What works today:
 
 What is intentionally **not** here yet:
 
-- Verifier is a **static / textual** check (faithfulness of code to verdict); no mechanical verification, no compile, no run, no benchmark. The baseline_harness emits the driver source but does not compile or execute it; a downstream mechanical comparator is still to come.
+- Verifier is a **static / textual** check (faithfulness of code to verdict); no mechanical verification of the *rewritten* kernel yet, no benchmark. The baseline side artifact does now compile and execute (capturing a reference output), but the splice-rewritten-kernel-in / recompile / rerun / compare-within-tolerance steps are still to come.
 - No automated evaluation across the `test-kernels/` corpus.
 - No framework (LangGraph etc.). See "Design notes" and "Roadmap".
 
@@ -170,10 +170,16 @@ emulate), so the verifier's per-variable `ok` check has actual meaning.
 The `baseline_harness` is orthogonal to the analyst → rewriter → verifier
 pipeline: it is invited (by the initial user message's BASELINE STEP
 block) for Kokkos `.cpp` inputs only, called at most once per run, and
-its output is a driver source that the operator compiles and runs out of
-band. The driver pins `Kokkos::Serial` and a fixed RNG seed (42 by
-default) so the reference output is reproducible. See `AGENTS.md`
-("Baseline harness (side artifact)") for the full scope.
+its output is a driver source. The orchestrator then chains two
+deterministic (non-LLM) tools after it — `compile_baseline_driver` (once,
+same `kernel_stem`) and `run_baseline_driver` (once, same `kernel_stem`)
+— to produce `baselines/<kernel_stem>/{driver,reference.json}`. The
+driver pins `Kokkos::Serial` and a fixed RNG seed (42 by default) so the
+reference output is reproducible. The harness mandates splice sentinels
+(`// ---- KERNEL BEGIN ----` / `// ---- KERNEL END ----`) around the
+inlined kernel as a forward-looking contract for a future mechanical
+comparator that will swap in the rewritten kernel between them. See
+`AGENTS.md` ("Baseline harness (side artifact)") for the full scope.
 
 ## Orchestrator tools
 
@@ -184,17 +190,23 @@ default) so the reference output is reproducible. See `AGENTS.md`
 | `spawn_rewriter`           | dispatch to rewriter          | `task_prompt: string`                                                                                                          | rewriter's structured output, or `{"status":"rejected_by_user"}`         |
 | `spawn_verifier`           | dispatch to verifier          | `original_source: string`, `rewritten_source: string`, `analyst_verdict_json: string`, `tolerance_json: string`                | verifier's structured output, or `{"status":"rejected_by_user"}`         |
 | `spawn_baseline_harness`   | dispatch to baseline_harness  | `kernel_source: string`, `kernel_stem: string` (Kokkos `.cpp` only; at most once per run)                                      | harness output + `driver_path` (orchestrator writes `baselines/<kernel_stem>/driver.cpp`), or `{"status":"rejected_by_user"}` |
+| `compile_baseline_driver`  | `g++` the harness driver (deterministic, non-LLM) | `kernel_stem: string` (at most once per run; only after a successful `spawn_baseline_harness` with same stem; needs `AGENT_PRECISION_KOKKOS_ROOT`) | `{status, stdout, stderr, artifacts}` (artifacts = `[baselines/<stem>/driver]` on success, `[]` otherwise), or `{"status":"rejected_by_user"}` |
+| `run_baseline_driver`      | exec the compiled driver to capture reference output (deterministic, non-LLM) | `kernel_stem: string` (at most once per run; only after a successful `compile_baseline_driver` with same stem; bounded by `AGENT_PRECISION_RUN_TIMEOUT_SEC`, default 60 s) | `{status, stdout, stderr, artifacts}` (artifacts = `[baselines/<stem>/reference.json]` on success, `[]` otherwise), or `{"status":"rejected_by_user"}` |
 | `finish`                   | end the workflow              | `rewritten_code`, `notes`                                                                                                      | (terminates; nothing fed back)                                           |
 
 The orchestrator's system prompt enforces that `spawn_precision_advisor`
 is called at most once, only when the CLI passed no tolerance, and only
-before `spawn_analyst`; and that `spawn_baseline_harness` is called at
-most once and only for Kokkos `.cpp` inputs. The Python `_execute_tool`
-does not police any of this — it is trusted to the orchestrator LLM. The
-one exception is the filesystem write for `spawn_baseline_harness`: the
-driver path is computed from the orchestrator-supplied `kernel_stem`
-(not from the agent's output), so a misbehaving agent cannot redirect
-the write.
+before `spawn_analyst`; that `spawn_baseline_harness` is called at most
+once and only for Kokkos `.cpp` inputs; and that `compile_baseline_driver`
+and `run_baseline_driver` each fire at most once, only as the deterministic
+follow-ups to a successful preceding step, and only with the same
+`kernel_stem`. None of these rules are policed in Python — they are trusted
+to the orchestrator LLM. The exceptions are: the filesystem write for
+`spawn_baseline_harness` (driver path is computed from the orchestrator-
+supplied `kernel_stem`, not from the agent's output, so a misbehaving
+agent cannot redirect it), and `run_baseline_driver`'s pre-exec deletion
+of any stale `baselines/<stem>/reference.json` (so a failed run cannot
+leave a misleadingly-stale reference in place).
 
 ## Repo layout
 
@@ -216,8 +228,8 @@ the write.
   variable expected verdicts and test tolerances live in
   `test-kernels/SUMMARY.md` and are used for evaluating orchestrator
   output, not as input to it.
-- `baselines/` — generated per-kernel driver sources from
-  `baseline_harness` runs (`baselines/<kernel_stem>/driver.cpp`).
+- `baselines/` — generated per-kernel artifacts from the harness → compile
+  → run trio: `baselines/<kernel_stem>/{driver.cpp, driver, reference.json}`.
   Gitignored.
 - `scripts/` — Argo backend wrappers (`run-argoproxy.sh`, `run-argo.sh`).
 - `flowchart.md` — high-level orchestrator flowchart (HITL branches,
@@ -264,7 +276,7 @@ in "Roadmap" below; see `AGENTS.md` for the full rationale.
 Authoritative list lives in `AGENTS.md` under "Planned next steps"; this
 is a reader-facing summary.
 
-1. **Dynamic verification stack** — mechanical compile/run/compare as orchestrator tools, consuming the `baseline_harness` driver as the reference.
+1. **Dynamic verification stack** — baseline compile and reference-run already landed as orchestrator tools; what's still missing is splicing the rewritten kernel between the sentinels, recompiling, rerunning, and comparing outputs within tolerance.
 2. **Kernel-extractor agent** — slice a single target kernel out of a multi-kernel translation unit before analyst + baseline_harness run.
 3. **JLSE / async toolchain migration** — move compile/run to a remote scheduler.
 4. **Emulation library upgrade** — replace inline Dekker float-float with a vendored header.
