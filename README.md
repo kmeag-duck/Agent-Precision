@@ -41,8 +41,8 @@ vocabulary and plumbing".
 
 What works today:
 
-- Core pipeline `(precision_advisor →)? analyst → rewriter → verifier`; orchestrator forbids `finish` without `verdict='accept'`.
-- Side artifact: the **harness → compile → run** trio for Kokkos `.cpp` kernels only. `baseline_harness` is a fifth agent that emits a self-contained C++ driver to `baselines/<kernel_stem>/driver.cpp`; the deterministic (non-LLM) `compile_baseline_driver` tool then `g++`-compiles it into `baselines/<kernel_stem>/driver` against the local Kokkos install named by `AGENT_PRECISION_KOKKOS_ROOT`; the deterministic `run_baseline_driver` tool then executes it (with `cwd=baselines/<kernel_stem>/`, subject to `AGENT_PRECISION_RUN_TIMEOUT_SEC`, default 60 s) so it writes a parseable `baselines/<kernel_stem>/reference.json`. The reference output is reserved for a future mechanical comparator; none of the three steps is a precondition for `finish`, and any failure in the trio (missing env var, compile error, non-zero exit, timeout, missing/invalid `reference.json`) is non-fatal to the analyst → rewriter → verifier pipeline.
+- Core pipeline `(precision_advisor →)? analyst → rewriter → verifier`. `finish` is gated in **code** (not just in the system prompt) on the most recent `spawn_verifier` returning `verdict='accept'`; on a Kokkos `.cpp` input, `finish` additionally requires the most recent `compare_outputs` to have returned `status='ok'` for the current rewrite cycle. A premature `finish` is turned into a synthetic `{status:'error', is_error:true}` tool result naming what's missing, so the orchestrator can self-correct without exiting.
+- Dynamic verification chain for Kokkos `.cpp` kernels: **harness → compile → run → splice → compile_rewritten → run_rewritten → compare_outputs**, ending in a tolerance check that gates `finish`. The five LLM agents are reused as-is; the six deterministic (non-LLM) tools in `workflow/tools.py` (`compile_baseline_driver`, `run_baseline_driver`, `splice_rewritten_kernel`, `compile_rewritten_driver`, `run_rewritten_driver`, `compare_outputs`) all return the uniform `{status, stdout, stderr, artifacts}` shape. `baseline_harness` writes `baselines/<kernel_stem>/driver.cpp`; the baseline compile/run trio produces `baselines/<kernel_stem>/{driver, reference.json}`; the rewritten chain (splice → compile_rewritten → run_rewritten) produces `baselines/<kernel_stem>/rewritten/{driver.cpp, driver, reference.json}` from the rewriter's output without ever touching the baseline tree; `compare_outputs` diffs the two `reference.json` files under the same `tolerance_json` that was passed to `spawn_verifier` and writes `baselines/<kernel_stem>/rewritten/comparison.json` on both pass and fail paths. CUDA `.cu` inputs skip this entire chain in v0 and fall back to the verifier-only gate.
 - Tolerance from `--sig-figs` / `--decimal-digits`, else inferred by the advisor; advisor may return `kind='unknown'`, which triggers fallback `{sig_figs: 6, source: 'advisor_unknown_defaulted'}`.
 - Tolerance threaded verbatim to analyst, rewriter, and verifier; analyst returns a `precision_budget` block; verifier audits it.
 - Per-variable methods: `downcast` (narrower hardware type — the throughput win), `emulate` (software pair, currently inline float-float / Dekker — throughput-NEGATIVE; only when downcast violates tolerance), or `keep`. Analyst can additionally suggest a kernel-shape `rework` such as Kahan summation.
@@ -52,7 +52,8 @@ What works today:
 
 What is intentionally **not** here yet:
 
-- Verifier is a **static / textual** check (faithfulness of code to verdict); no mechanical verification of the *rewritten* kernel yet, no benchmark. The baseline side artifact does now compile and execute (capturing a reference output), but the splice-rewritten-kernel-in / recompile / rerun / compare-within-tolerance steps are still to come.
+- The `verifier` agent itself remains a **static / textual** check on faithfulness of code to verdict; mechanical verification of the rewritten kernel is now done by the `compare_outputs` tool downstream of it (not by the verifier agent). No micro-benchmark of the rewritten kernel — `compare_outputs` checks numerical agreement under tolerance, not throughput.
+- CUDA `.cu` inputs do not yet exercise the dynamic-verification chain; only the verifier-accept gate runs there.
 - No automated evaluation across the `test-kernels/` corpus.
 - No framework (LangGraph etc.). See "Design notes" and "Roadmap".
 
@@ -105,9 +106,13 @@ Argo paths exist).
 
 ## Workflow
 
-Intended happy path through the conversation when no tolerance flag is
-passed (so the advisor is called once up front). For the corresponding
-high-level flowchart (HITL branches, tool dispatch), see `flowchart.md`.
+Intended happy path through the conversation for a Kokkos `.cpp` input
+when no tolerance flag is passed (so the advisor is called once up
+front, and the full dynamic-verification chain runs). For a CUDA `.cu`
+input, every "baseline / rewritten chain" turn is skipped and the path
+goes verifier-accept → `finish` directly. For the corresponding
+high-level flowchart (HITL branches, tool dispatch, finish-gate), see
+`flowchart.md`.
 
 ```mermaid
 sequenceDiagram
@@ -117,12 +122,26 @@ sequenceDiagram
   participant An as Analyst
   participant Rw as Rewriter
   participant Vf as Verifier
+  participant Bh as BaselineHarness
+  participant Det as DeterministicTools
   User->>Orch: kernel source (no tolerance flag)
   Orch->>User: HITL: spawn_precision_advisor(kernel_source)?
   User->>Orch: y
   Orch->>Pa: kernel_source
   Pa-->>Orch: {kind, value, rationale, confidence}
   Note over Orch: agreed tolerance fixed (or default if kind='unknown')
+  Orch->>User: HITL: spawn_baseline_harness(kernel_source, kernel_stem)?
+  User->>Orch: y
+  Orch->>Bh: kernel_source
+  Bh-->>Orch: {driver_source, ...} → baselines/<stem>/driver.cpp
+  Orch->>User: HITL: compile_baseline_driver(kernel_stem)?
+  User->>Orch: y
+  Orch->>Det: g++ baselines/<stem>/driver.cpp
+  Det-->>Orch: {status:'ok', artifacts:[baselines/<stem>/driver]}
+  Orch->>User: HITL: run_baseline_driver(kernel_stem)?
+  User->>Orch: y
+  Orch->>Det: ./driver (cwd=baselines/<stem>)
+  Det-->>Orch: {status:'ok', artifacts:[baselines/<stem>/reference.json]}
   Orch->>User: HITL: spawn_analyst(kernel_source + tolerance)?
   User->>Orch: y
   Orch->>An: kernel_source + tolerance block
@@ -135,8 +154,25 @@ sequenceDiagram
   User->>Orch: y
   Orch->>Vf: original + rewritten + verdict_json + tolerance_json
   Vf-->>Orch: {verdict: accept, per_variable, concerns}
+  Orch->>User: HITL: splice_rewritten_kernel(kernel_stem, rewritten_code)?
+  User->>Orch: y
+  Orch->>Det: replace text between sentinels in baselines/<stem>/driver.cpp
+  Det-->>Orch: {status:'ok', artifacts:[baselines/<stem>/rewritten/driver.cpp]}
+  Orch->>User: HITL: compile_rewritten_driver(kernel_stem)?
+  User->>Orch: y
+  Orch->>Det: g++ baselines/<stem>/rewritten/driver.cpp
+  Det-->>Orch: {status:'ok', artifacts:[baselines/<stem>/rewritten/driver]}
+  Orch->>User: HITL: run_rewritten_driver(kernel_stem)?
+  User->>Orch: y
+  Orch->>Det: ./driver (cwd=baselines/<stem>/rewritten)
+  Det-->>Orch: {status:'ok', artifacts:[baselines/<stem>/rewritten/reference.json]}
+  Orch->>User: HITL: compare_outputs(kernel_stem, tolerance_json)?
+  User->>Orch: y
+  Orch->>Det: diff baseline vs rewritten reference.json under tolerance
+  Det-->>Orch: {status:'ok', artifacts:[baselines/<stem>/rewritten/comparison.json]}
   Orch->>User: HITL: finish(rewritten_code, notes)?
   User->>Orch: y
+  Note over Orch: finish-gate: verifier accept ∧ compare ok ✓
   Orch-->>User: final kernel
 ```
 
@@ -144,7 +180,11 @@ On `verdict='reject'`, the orchestrator either re-spawns the rewriter
 with a task prompt that incorporates the verifier's mismatches and
 concerns, or — if those concerns implicate the analyst's verdict itself
 — re-spawns the analyst. Either way, a fresh `spawn_verifier` must
-return `accept` before `finish` is allowed.
+return `accept` before `finish` is allowed. On a `compare_outputs`
+error, the orchestrator is steered (by both the system prompt and the
+synthetic gate-violation tool result) toward `spawn_analyst` rather
+than `spawn_rewriter`, because a numerical mismatch usually indicates
+the verifier's verdict was wrong rather than just the implementation.
 
 ## Agents
 
@@ -192,21 +232,36 @@ comparator that will swap in the rewritten kernel between them. See
 | `spawn_baseline_harness`   | dispatch to baseline_harness  | `kernel_source: string`, `kernel_stem: string` (Kokkos `.cpp` only; at most once per run)                                      | harness output + `driver_path` (orchestrator writes `baselines/<kernel_stem>/driver.cpp`), or `{"status":"rejected_by_user"}` |
 | `compile_baseline_driver`  | `g++` the harness driver (deterministic, non-LLM) | `kernel_stem: string` (at most once per run; only after a successful `spawn_baseline_harness` with same stem; needs `AGENT_PRECISION_KOKKOS_ROOT`) | `{status, stdout, stderr, artifacts}` (artifacts = `[baselines/<stem>/driver]` on success, `[]` otherwise), or `{"status":"rejected_by_user"}` |
 | `run_baseline_driver`      | exec the compiled driver to capture reference output (deterministic, non-LLM) | `kernel_stem: string` (at most once per run; only after a successful `compile_baseline_driver` with same stem; bounded by `AGENT_PRECISION_RUN_TIMEOUT_SEC`, default 60 s) | `{status, stdout, stderr, artifacts}` (artifacts = `[baselines/<stem>/reference.json]` on success, `[]` otherwise), or `{"status":"rejected_by_user"}` |
-| `finish`                   | end the workflow              | `rewritten_code`, `notes`                                                                                                      | (terminates; nothing fed back)                                           |
+| `splice_rewritten_kernel`  | replace text between `// ---- KERNEL BEGIN/END ----` sentinels in the baseline driver with the rewriter's output (deterministic, non-LLM; pure text I/O) | `kernel_stem: string`, `rewritten_kernel_source: string` (at most once per accepted verifier verdict; only after a successful `run_baseline_driver` + `spawn_verifier(accept)` with same stem) | `{status, stdout, stderr, artifacts}` (artifacts = `[baselines/<stem>/rewritten/driver.cpp]` on success, `[]` otherwise), or `{"status":"rejected_by_user"}` |
+| `compile_rewritten_driver` | `g++` the spliced rewritten driver (deterministic, non-LLM) | `kernel_stem: string` (at most once per accepted verifier verdict; only after a successful `splice_rewritten_kernel` with same stem; needs `AGENT_PRECISION_KOKKOS_ROOT`) | `{status, stdout, stderr, artifacts}` (artifacts = `[baselines/<stem>/rewritten/driver]` on success, `[]` otherwise), or `{"status":"rejected_by_user"}` |
+| `run_rewritten_driver`     | exec the rewritten driver to capture its reference output (deterministic, non-LLM; never touches the baseline tree) | `kernel_stem: string` (at most once per accepted verifier verdict; only after a successful `compile_rewritten_driver` with same stem; bounded by `AGENT_PRECISION_RUN_TIMEOUT_SEC`) | `{status, stdout, stderr, artifacts}` (artifacts = `[baselines/<stem>/rewritten/reference.json]` on success, `[]` otherwise), or `{"status":"rejected_by_user"}` |
+| `compare_outputs`          | numerically diff baseline vs rewritten `reference.json` under tolerance; gates `finish` on `.cpp` (deterministic, non-LLM; no subprocess) | `kernel_stem: string`, `tolerance_json: string` (same `{kind,value,source}` string passed to `spawn_verifier`; at most once per accepted verifier verdict; only after a successful `run_rewritten_driver`) | `{status, stdout, stderr, artifacts}` (artifacts = `[baselines/<stem>/rewritten/comparison.json]` on both pass and fail; `status='ok'` iff every value agrees and no shape mismatch), or `{"status":"rejected_by_user"}` |
+| `finish`                   | end the workflow              | `rewritten_code`, `notes`                                                                                                      | (terminates; nothing fed back) — but the orchestrator's `_FinishGateState` blocks the call (with a synthetic `is_error` tool result) until the gate is satisfied: verifier `verdict='accept'` for `.cu`, plus `compare_outputs status='ok'` for `.cpp` |
 
 The orchestrator's system prompt enforces that `spawn_precision_advisor`
 is called at most once, only when the CLI passed no tolerance, and only
 before `spawn_analyst`; that `spawn_baseline_harness` is called at most
-once and only for Kokkos `.cpp` inputs; and that `compile_baseline_driver`
-and `run_baseline_driver` each fire at most once, only as the deterministic
-follow-ups to a successful preceding step, and only with the same
-`kernel_stem`. None of these rules are policed in Python — they are trusted
-to the orchestrator LLM. The exceptions are: the filesystem write for
-`spawn_baseline_harness` (driver path is computed from the orchestrator-
-supplied `kernel_stem`, not from the agent's output, so a misbehaving
-agent cannot redirect it), and `run_baseline_driver`'s pre-exec deletion
-of any stale `baselines/<stem>/reference.json` (so a failed run cannot
-leave a misleadingly-stale reference in place).
+once and only for Kokkos `.cpp` inputs; and that the seven-step
+deterministic chain — `compile_baseline_driver` → `run_baseline_driver` →
+`splice_rewritten_kernel` → `compile_rewritten_driver` →
+`run_rewritten_driver` → `compare_outputs` — each fires at most once
+per accepted verifier verdict, only as the deterministic follow-up to a
+successful preceding step, and always with the same `kernel_stem`.
+Those rules are trusted to the orchestrator LLM. Three things are
+policed in Python instead: (1) the filesystem write for
+`spawn_baseline_harness` and the splice writes both compute their paths
+from the orchestrator-supplied `kernel_stem` (not from the agent's
+output) so a misbehaving agent cannot redirect them; (2) every "run"
+tool deletes any stale `reference.json` at its target path before
+invoking the subprocess, so a failed run cannot leave a misleadingly-
+stale reference in place; and (3) the **finish-gate** in
+`_FinishGateState` blocks `finish` until the most recent
+`spawn_verifier` returned `verdict='accept'` AND, on `.cpp` inputs, the
+most recent `compare_outputs` returned `status='ok'` for the current
+rewrite cycle. On a gate violation the loop synthesizes a `{status:
+'error', is_error: true}` tool result naming what's missing, so the
+orchestrator can self-correct on its next turn rather than silently
+exiting.
 
 ## Repo layout
 
@@ -228,8 +283,15 @@ leave a misleadingly-stale reference in place).
   variable expected verdicts and test tolerances live in
   `test-kernels/SUMMARY.md` and are used for evaluating orchestrator
   output, not as input to it.
-- `baselines/` — generated per-kernel artifacts from the harness → compile
-  → run trio: `baselines/<kernel_stem>/{driver.cpp, driver, reference.json}`.
+- `baselines/` — generated per-kernel artifacts from the dynamic-verification
+  chain. Baseline tree:
+  `baselines/<kernel_stem>/{driver.cpp, driver, reference.json}` (from
+  `spawn_baseline_harness` → `compile_baseline_driver` →
+  `run_baseline_driver`). Rewritten tree, written without ever touching
+  the baseline tree:
+  `baselines/<kernel_stem>/rewritten/{driver.cpp, driver, reference.json,
+  comparison.json}` (from `splice_rewritten_kernel` →
+  `compile_rewritten_driver` → `run_rewritten_driver` → `compare_outputs`).
   Gitignored.
 - `scripts/` — Argo backend wrappers (`run-argoproxy.sh`, `run-argo.sh`).
 - `flowchart.md` — high-level orchestrator flowchart (HITL branches,
@@ -276,8 +338,8 @@ in "Roadmap" below; see `AGENTS.md` for the full rationale.
 Authoritative list lives in `AGENTS.md` under "Planned next steps"; this
 is a reader-facing summary.
 
-1. **Dynamic verification stack** — baseline compile and reference-run already landed as orchestrator tools; what's still missing is splicing the rewritten kernel between the sentinels, recompiling, rerunning, and comparing outputs within tolerance.
-2. **Kernel-extractor agent** — slice a single target kernel out of a multi-kernel translation unit before analyst + baseline_harness run.
+1. **Kernel-extractor agent** — slice a single target kernel out of a multi-kernel translation unit before analyst + baseline_harness run.
+2. **CUDA dynamic-verification chain** — extend splice/compile_rewritten/run_rewritten/compare_outputs to `.cu` inputs so the finish-gate enforces baseline-equivalence there too (v0 falls back to verifier-only on `.cu`).
 3. **JLSE / async toolchain migration** — move compile/run to a remote scheduler.
 4. **Emulation library upgrade** — replace inline Dekker float-float with a vendored header.
 5. **Corpus evaluation** — run the workflow across all 17 `test-kernels/`, feeding each kernel's expected tolerance from `test-kernels/SUMMARY.md`, and compare verdicts against ground-truth labels.
