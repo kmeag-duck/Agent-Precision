@@ -497,6 +497,32 @@ You implement three per-variable methods:
    casts where the lowered variable meets values of other precisions so
    the compiler does not silently promote or demote.
 
+    Alias-driven downcast for kernel parameters. The kernel you are
+   given may already declare its parameter types through `using`
+   aliases (named `<ParamName>Type` — CamelCase of the parameter name
+   plus the literal suffix `Type`) defined immediately above the
+   function. When that pattern is present, downcast a kernel parameter
+   by changing the corresponding `using` alias only — leave the
+   function header and body untouched. For example, to downcast a
+   parameter named `a` from double to float:
+
+       // before
+       using aType = Kokkos::View<const double*>;
+       // after
+       using aType = Kokkos::View<const float*>;
+
+   This single edit propagates the precision change through the kernel
+   header and through any caller (such as the baseline-harness driver's
+   main()) that constructs `a`'s value through the same alias. Do not
+   bypass the alias by writing `Kokkos::View<const float*>` directly
+   in the function header — that breaks the contract the caller relies
+   on. For parameters the analyst did NOT name, leave the alias
+   unchanged.
+
+   If the kernel you are given does not use the alias pattern, fall
+   back to changing the parameter type directly in the function header
+   as before.
+
 2. emulate — replace the variable's declared type with a software-
    emulated pair type using the representation named in the instruction.
    For 'float-float', use the convention:
@@ -887,6 +913,71 @@ Hard requirements on the driver:
 6. Do not modify the kernel function. Do not change any variable's
    precision. Do not invent or rename kernel arguments. The whole point
    is to capture the *original* kernel's output as the reference.
+
+    EXCEPTION — precision-alias contract. Immediately inside the
+   '// ---- KERNEL BEGIN ----' sentinel and above the kernel function
+   definition, emit one `using` alias per kernel parameter whose type
+   involves a floating-point scalar or a Kokkos::View of a floating-
+   point scalar. Naming convention: `<ParamName>Type` (CamelCase of the
+   parameter name + 'Type' suffix). The kernel function's parameter
+   list MUST then refer to those aliases, not to the underlying types.
+   The kernel body is otherwise unchanged. For example, a kernel
+   originally declared as
+
+       void kernel(
+           Kokkos::View<double*> a,
+           Kokkos::View<const double*> b,
+           double alpha, double beta) { ... }
+
+   becomes, inside the sentinels:
+
+       using aType = Kokkos::View<double*>;
+       using bType = Kokkos::View<const double*>;
+       using alphaType = double;
+       using betaType = double;
+
+       void kernel(aType a, bType b, alphaType alpha, betaType beta) { ... }
+
+   Integer parameters (sizes, counts, indices) do NOT get aliases —
+   only floating-point scalars and floating-point Views. The kernel
+   body itself stays byte-for-byte identical to the original; only the
+   parameter type tokens in the function header are replaced with the
+   alias names.
+
+    `main()`, outside the sentinels, MUST use those aliases anywhere it
+   constructs values that flow into the kernel call. Use the matching
+   alias (e.g. `aType` for the `a` argument, `alphaType` for the
+   `alpha` argument) to declare the values that flow into the kernel
+   call. The aliases are the single point of truth for kernel I/O
+   precision: a later rewriter redefines the aliases inside the
+   sentinels to change kernel precision end-to-end, and `main()`
+   inherits the change for free.
+
+   Staging-view rule for `View<const T*>` kernel arguments. When a
+   kernel parameter's alias is a const View (e.g.
+   `using aType = Kokkos::View<const double*>;`), you cannot write into
+   a view of that type directly to populate it. Use a writable staging
+   view whose element type is DERIVED FROM THE ALIAS, then assign it
+   into the const-aliased view that you pass to the kernel:
+
+       // correct: staging view's element type tracks the alias
+       Kokkos::View<typename aType::non_const_value_type*> a_nc("a", N);
+       // ... fill a_nc through its host mirror ...
+       aType a = a_nc;  // const-binds; precision is whatever aType says
+       kernel(a, ...);
+
+   Do NOT hardcode the staging view's element type as `double`. A
+   hardcoded `Kokkos::View<double*> a_nc(...)` breaks the contract: when
+   the rewriter redefines `aType` to `Kokkos::View<const float*>`, the
+   `aType a = a_nc;` assignment no longer compiles because
+   `View<double*>` does not convert to `View<const float*>`. The
+   `typename <ParamName>Type::non_const_value_type` form is the only
+   one that survives a precision change to the alias.
+
+   For local host scratch (std::vector buffers, RNG distributions) that
+   do not directly become kernel arguments, plain `double` is fine —
+   only the values that cross the kernel boundary need to flow through
+   the aliases.
 
 7. Kokkos::deep_copy any device Views you read from back to host Views
    before iterating them for JSON emission.

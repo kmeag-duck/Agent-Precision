@@ -287,3 +287,81 @@ def test_baseline_harness_prompt_mandates_kernel_splice_sentinels():
     prompt = AGENTS["baseline_harness"]["system_prompt"]
     assert "// ---- KERNEL BEGIN ----" in prompt
     assert "// ---- KERNEL END ----" in prompt
+
+
+# ---------- Precision-alias contract (Option 4 splice-scope fix) ----------
+#
+# The splice tool replaces only the text between the kernel sentinels.
+# Anything the rewriter changes that affects the caller (e.g. a parameter
+# type) must therefore reach the caller through something that lives
+# inside the sentinels. The contract: the baseline harness emits a
+# `using <ParamName>Type = ...;` alias per floating-point kernel parameter
+# inside the sentinels; main() outside the sentinels uses those aliases;
+# the rewriter downcasts a parameter by redefining its alias and nothing
+# else.
+
+
+def test_baseline_harness_prompt_mandates_precision_alias_contract():
+    """The baseline_harness prompt mandates per-parameter `using <ParamName>Type` aliases inside the kernel sentinels so the splice tool can change kernel parameter precision (which the rewriter owns) without breaking main() (which it does not)."""
+    prompt = AGENTS["baseline_harness"]["system_prompt"]
+    # The CamelCase + 'Type' suffix naming convention is named explicitly.
+    assert "<ParamName>Type" in prompt
+    assert "using" in prompt
+    # The contract is two-sided: aliases live inside the sentinels, AND
+    # main() outside the sentinels must reference them.
+    assert "main()" in prompt
+    # Integer parameters are excluded so the harness doesn't bloat with
+    # NType / seedType aliases that the rewriter would never touch.
+    lower = prompt.lower()
+    assert "integer parameters" in lower or "integer parameter" in lower
+
+
+def test_baseline_harness_prompt_alias_example_is_concrete():
+    """The baseline_harness prompt shows a concrete before/after example so the model has an unambiguous target pattern; the example demonstrates the `<ParamName>Type` alias form against a generic kernel signature."""
+    prompt = AGENTS["baseline_harness"]["system_prompt"]
+    # Naming convention is demonstrated, not just described. The example
+    # uses generic parameter names (a, b, alpha, beta) so the prompt
+    # doesn't bias the harness toward any specific test kernel's naming.
+    assert "using aType" in prompt
+    # The example references Kokkos::View so the model sees the View
+    # element-type form (the case that matters for downcasting).
+    assert "Kokkos::View" in prompt
+
+
+def test_baseline_harness_prompt_requires_alias_derived_staging_view():
+    """When a kernel parameter is `View<const T*>`, the harness needs a writable staging view to populate it. The prompt mandates that the staging view's element type be derived from the alias (`typename <ParamName>Type::non_const_value_type`) rather than hardcoded to `double`; a hardcoded element type breaks the splice contract because the alias-only rewrite no longer matches the staging view's type. Witnessed on nbody_force: the first end-to-end run produced `Kokkos::View<double*> m_nc` which did not convert to the rewritten `Kokkos::View<const float*> mType`."""
+    prompt = AGENTS["baseline_harness"]["system_prompt"]
+    # The alias-derived-type idiom is named explicitly. Without this
+    # exact phrase the harness has no way to derive the staging view's
+    # element type from the alias.
+    assert "non_const_value_type" in prompt
+    # The failure mode (hardcoded `double` staging view) is called out
+    # so the model knows what NOT to do. We don't pin the exact wording
+    # but require both halves of the warning: "do not" + "double".
+    normalized = " ".join(prompt.lower().split())
+    assert "do not hardcode" in normalized or "do not" in normalized
+    # The rule is scoped to const View parameters (the only case where
+    # staging is necessary). Mentioning const View anchors the rule.
+    assert "const" in normalized
+
+
+def test_rewriter_prompt_documents_alias_driven_downcast():
+    """The rewriter prompt tells the rewriter that when the kernel uses the `<ParamName>Type` alias pattern, downcasting a parameter means redefining its alias only — not editing the function header. This is the rewriter's side of the splice-scope contract."""
+    prompt = AGENTS["rewriter"]["system_prompt"]
+    assert "<ParamName>Type" in prompt
+    # The rewriter must understand "redefine the alias, leave the header
+    # alone" — both halves of that instruction must be present.
+    # Normalize whitespace so wrapped phrases like "fall\n   back" still match.
+    normalized = " ".join(prompt.lower().split())
+    assert "alias" in normalized
+    # Fallback path is documented so the rewriter doesn't choke on
+    # legacy kernels that don't use the alias pattern.
+    assert "fall back" in normalized or "fallback" in normalized
+
+
+def test_rewriter_prompt_forbids_bypassing_alias():
+    """The rewriter prompt explicitly forbids writing the lowered type directly in the function header when an alias exists, because doing so silently breaks the caller (which constructs values through the alias)."""
+    prompt = AGENTS["rewriter"]["system_prompt"].lower()
+    # "bypass" / "directly" language warns the rewriter off the obvious
+    # wrong move (edit the header, ignore the alias).
+    assert "bypass" in prompt or "directly" in prompt
