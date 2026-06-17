@@ -593,26 +593,4 @@
       }
     }
   }
-}/*```
-
-##### Key Configuration Details:
-
-| Field                           | Value                       | Description                                                                                                |
-| ------------------------------- | --------------------------- | ---------------------------------------------------------------------------------------------------------- |
-| `provider.argo.npm`             | `@ai-sdk/openai-compatible` | The AI SDK provider package that enables OpenAI-compatible API communication.                              |
-| `provider.argo.options.baseURL` | `http://localhost:52675/v1` | Points to your local `argo-proxy` instance. Must match the port configured in Step 2.                      |
-| `provider.argo.options.apiKey`  | `<your-argonne-username>`   | Your Argonne username. This is passed to `argo-proxy` as the user identifier — not a secret API key.       |
-| `provider.argo.models`          | `argo:*`                    | Model identifiers using the `argo:` prefix. These must match the model aliases registered in the Argo API. |
-
-> ⚠️ **Important:** Replace `<your-argonne-username>` in the `apiKey` field with
-> your actual Argonne username. This value must match the `user` field in your
-> `argo-proxy` `config.yaml`.
-
-### 3. Launch OpenCode
-
-With `argo-proxy` running in a separate terminal, start OpenCode from your
-project directory:
-
-```bash
-opencode
-*/
+}
