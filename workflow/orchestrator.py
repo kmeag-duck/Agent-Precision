@@ -21,6 +21,7 @@ import anthropic
 
 from .run_agent import run_agent
 from .tools import (
+    compare_outputs,
     compile_baseline_driver,
     compile_rewritten_driver,
     run_baseline_driver,
@@ -199,10 +200,33 @@ You also have two deterministic (non-LLM) tools:
     accepted verifier verdict, immediately after a successful
     compile_rewritten_driver call, with the same kernel_stem. Do not
     call it if compile_rewritten_driver was skipped, rejected, or
-    returned an error. The rewritten reference output is a precursor
-    for a future mechanical comparator; like the rest of the
-    rewritten chain, a run error here must NOT block finish on its
-    own.
+    returned an error. The rewritten reference output is the input to
+    compare_outputs; a run error here means the comparator cannot
+    proceed and finish will be blocked for .cpp kernels until
+    compare_outputs has successfully run.
+
+  - compare_outputs: takes a kernel_stem and a tolerance_json (a JSON
+    string with the same {kind, value, source} shape that
+    spawn_verifier received) and numerically compares
+    baselines/<kernel_stem>/reference.json (baseline) against
+    baselines/<kernel_stem>/rewritten/reference.json (rewritten)
+    under the supplied tolerance. Writes a
+    baselines/<kernel_stem>/rewritten/comparison.json artifact on
+    both pass and fail paths. Returns
+    {status, stdout, stderr, artifacts}, with status='ok' iff every
+    compared value agrees under the tolerance and no shape mismatch
+    was detected. Call exactly once per accepted verifier verdict,
+    immediately after a successful run_rewritten_driver, with the
+    same kernel_stem and the same tolerance_json that was passed to
+    spawn_verifier. Unlike the other rewritten-chain tools, this IS a
+    precondition for finish on .cpp (Kokkos) kernels: the
+    orchestrator loop will refuse a finish call until compare_outputs
+    has returned status='ok' for the current rewrite cycle. If
+    compare_outputs returns an error, the numerical mismatch usually
+    indicates the verifier's verdict was wrong rather than just the
+    implementation; spawn_analyst (not spawn_rewriter) is typically
+    the right retry. .cu (CUDA) kernels skip this whole chain and
+    finish remains gated only on the verifier verdict.
 
 You also have a finish tool to emit the final answer.
 
@@ -252,7 +276,11 @@ Your job after the tolerance is fixed:
 
 Hard rules:
 - You may not call finish unless the most recent spawn_verifier call
-  returned verdict='accept'.
+  returned verdict='accept'. On .cpp (Kokkos) inputs, you must ALSO
+  have run compare_outputs after the most recent verifier-accept and
+  received status='ok' from it; the orchestrator loop enforces this
+  in code, not just in the prompt, and a premature finish call will
+  be turned into a synthetic tool error telling you what is missing.
 - You may not call spawn_precision_advisor if the user message
   provided a tolerance. You may not call spawn_precision_advisor more
   than once.
@@ -577,9 +605,10 @@ ORCHESTRATOR_TOOLS = [
             "Returns {status, stdout, stderr, artifacts}. Call exactly "
             "once per accepted verifier verdict, immediately after a "
             "successful compile_rewritten_driver, with the same "
-            "kernel_stem. The rewritten reference output is a precursor "
-            "for a future mechanical comparator and is not a "
-            "precondition for finish."
+            "kernel_stem. The rewritten reference output is the input "
+            "to compare_outputs; without it, compare_outputs cannot "
+            "run, so on .cpp inputs a run error here transitively "
+            "blocks finish until the chain is repaired."
         ),
         "input_schema": {
             "type": "object",
@@ -594,6 +623,57 @@ ORCHESTRATOR_TOOLS = [
                 },
             },
             "required": ["kernel_stem"],
+        },
+    },
+    {
+        "name": "compare_outputs",
+        "description": (
+            "Deterministic (non-LLM) tool. Numerically compares "
+            "baselines/<kernel_stem>/reference.json (baseline) against "
+            "baselines/<kernel_stem>/rewritten/reference.json "
+            "(rewritten) under the agreed output-precision tolerance. "
+            "Writes baselines/<kernel_stem>/rewritten/comparison.json "
+            "on BOTH pass and fail paths so the operator always has a "
+            "machine-readable record of the most recent decision. "
+            "Returns {status, stdout, stderr, artifacts}, with "
+            "status='ok' iff every compared value agrees under the "
+            "tolerance and no shape mismatch was detected. Call "
+            "exactly once per accepted verifier verdict, immediately "
+            "after a successful run_rewritten_driver, with the same "
+            "kernel_stem and the same tolerance_json that was passed "
+            "to spawn_verifier. This IS a precondition for finish on "
+            ".cpp (Kokkos) kernels: the orchestrator loop refuses a "
+            "finish call until compare_outputs has returned "
+            "status='ok' for the current rewrite cycle. On a "
+            "comparator error, spawn_analyst (not spawn_rewriter) is "
+            "typically the right retry, because a numerical mismatch "
+            "usually indicates the verifier's verdict was wrong "
+            "rather than just the implementation."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "kernel_stem": {
+                    "type": "string",
+                    "description": (
+                        "Filesystem-safe short name for this kernel; "
+                        "MUST match the kernel_stem passed to the "
+                        "preceding run_rewritten_driver call."
+                    ),
+                },
+                "tolerance_json": {
+                    "type": "string",
+                    "description": (
+                        "The same {kind, value, source} JSON string "
+                        "passed to spawn_verifier on this rewrite "
+                        "cycle. The comparator parses it and uses "
+                        "kind ('sig_figs' or 'decimal_digits') and "
+                        "value (positive integer) to decide the "
+                        "per-value pass/fail threshold."
+                    ),
+                },
+            },
+            "required": ["kernel_stem", "tolerance_json"],
         },
     },
     {
@@ -719,6 +799,19 @@ def _execute_tool(tool_name: str, tool_input: dict) -> dict:
         # Returns the same {status, stdout, stderr, artifacts} shape
         # verbatim.
         return run_rewritten_driver(tool_input["kernel_stem"])
+    if tool_name == "compare_outputs":
+        # Deterministic tool (no LLM call): pure file + arithmetic I/O,
+        # no subprocess. Reads the two reference.json files, walks
+        # outputs/ under the supplied tolerance, writes a
+        # comparison.json artifact, returns the same
+        # {status, stdout, stderr, artifacts} shape verbatim. The
+        # status of this call is what the finish-gate guard in
+        # run_orchestrator reads when deciding whether to honor a
+        # finish call on a .cpp kernel.
+        return compare_outputs(
+            tool_input["kernel_stem"],
+            tool_input["tolerance_json"],
+        )
     raise ValueError(f"Unknown tool: {tool_name}")
 
 
@@ -803,9 +896,124 @@ def _format_baseline_block(kernel_path: str, kernel_name: str | None) -> str:
         "compile_rewritten_driver using the same KERNEL STEM. If (and only "
         "if) compile_rewritten_driver returns status='ok', follow it "
         "immediately with a single call to run_rewritten_driver using the "
-        "same KERNEL STEM. A splice, rewritten-compile, or rewritten-run "
-        "error must NOT block finish."
+        "same KERNEL STEM. If (and only if) run_rewritten_driver returns "
+        "status='ok', follow it immediately with a single call to "
+        "compare_outputs using the same KERNEL STEM and the same "
+        "tolerance_json string you passed to spawn_verifier. "
+        "compare_outputs IS a precondition for finish on this .cpp "
+        "kernel: a finish call before compare_outputs has returned "
+        "status='ok' will be turned into a synthetic tool error. A "
+        "splice, rewritten-compile, or rewritten-run error means the "
+        "comparator cannot run, so the chain must be repaired before "
+        "finish. If compare_outputs returns an error, prefer spawn_analyst "
+        "(not spawn_rewriter) for the retry — a numerical mismatch "
+        "usually indicates the verifier's verdict was wrong rather "
+        "than just the implementation."
     )
+
+
+class _FinishGateState:
+    """Per-run state that decides whether a `finish` tool call is allowed.
+
+    The orchestrator's hard rule (prompt-visible AND enforced here in
+    code) is:
+
+      - For .cpp (Kokkos) inputs, `finish` requires the most recent
+        spawn_verifier call to have returned verdict='accept' AND the
+        most recent compare_outputs call to have returned status='ok'
+        for the CURRENT rewrite cycle.
+      - For .cu (CUDA) inputs the dynamic-verification chain is
+        skipped entirely; `finish` is gated only on the most recent
+        spawn_verifier verdict being 'accept' (the same rule the
+        system prompt has always carried, now backed by code).
+
+    "Current rewrite cycle" is the key constraint: any spawn_rewriter
+    call invalidates BOTH tracked statuses (a new rewrite obviously
+    invalidates the verifier verdict that approved the previous
+    rewrite, and equally obviously invalidates a comparator result
+    that was computed against the previous rewritten reference.json).
+    Any subsequent step in the dynamic-verification chain
+    (splice_rewritten_kernel, compile_rewritten_driver,
+    run_rewritten_driver) also invalidates the comparator status,
+    because each of those steps overwrites a file the comparator
+    later reads. Only compare_outputs writes last_compare_status, and
+    only spawn_verifier writes last_verifier_verdict.
+
+    On a gate violation the orchestrator loop turns the finish call
+    into a synthetic {status:'error', stderr:<missing_steps>}
+    tool_result that the orchestrator sees on its next turn and can
+    self-correct from, instead of silently letting finish through.
+    """
+
+    def __init__(self, kernel_path: str) -> None:
+        self.kernel_path = kernel_path
+        self.requires_comparator = kernel_path.endswith(".cpp")
+        self.last_verifier_verdict: str | None = None
+        self.last_compare_status: str | None = None
+
+    def observe(self, tool_name: str, exec_result: dict) -> None:
+        """Update tracked state given the tool that just ran."""
+        if tool_name == "spawn_rewriter":
+            # New rewrite cycle starts here. Any prior verifier accept
+            # was approving the PREVIOUS rewrite, not this one; any
+            # prior comparator result was reading the PREVIOUS
+            # rewritten reference.json.
+            self.last_verifier_verdict = None
+            self.last_compare_status = None
+            return
+        if tool_name in {
+            "splice_rewritten_kernel",
+            "compile_rewritten_driver",
+            "run_rewritten_driver",
+        }:
+            # Each of these overwrites or invalidates a file the
+            # comparator reads. The verifier verdict is unaffected
+            # (the verifier read source text, not the run artifact).
+            self.last_compare_status = None
+            return
+        if tool_name == "spawn_verifier":
+            if exec_result.get("status") == "ok":
+                verdict = exec_result.get("result", {}).get("verdict")
+                self.last_verifier_verdict = verdict
+            return
+        if tool_name == "compare_outputs":
+            self.last_compare_status = exec_result.get("status")
+            return
+        # Other tools (spawn_precision_advisor, spawn_analyst,
+        # spawn_baseline_harness, compile_baseline_driver,
+        # run_baseline_driver) do not affect the gate.
+        return
+
+    def check_finish(self) -> str | None:
+        """Return None if `finish` is allowed, else a missing-steps message."""
+        if self.last_verifier_verdict != "accept":
+            return (
+                "finish is not allowed: the most recent spawn_verifier "
+                "call did not return verdict='accept' (current state: "
+                f"verifier_verdict={self.last_verifier_verdict!r}). "
+                "Call spawn_verifier on the current rewritten kernel "
+                "(re-running spawn_rewriter and/or spawn_analyst first "
+                "if needed) before calling finish."
+            )
+        if self.requires_comparator and self.last_compare_status != "ok":
+            return (
+                "finish is not allowed: on a .cpp (Kokkos) input, "
+                "finish requires the dynamic-verification chain to "
+                "have ended with compare_outputs returning "
+                "status='ok' for the current rewrite cycle "
+                "(current state: compare_status="
+                f"{self.last_compare_status!r}). Run "
+                "splice_rewritten_kernel -> compile_rewritten_driver "
+                "-> run_rewritten_driver -> compare_outputs (with the "
+                "same kernel_stem and the same tolerance_json passed "
+                "to spawn_verifier) before calling finish. If "
+                "compare_outputs has already returned an error, the "
+                "numerical mismatch usually indicates the verifier's "
+                "verdict was wrong rather than just the "
+                "implementation, so spawn_analyst (not "
+                "spawn_rewriter) is typically the right retry."
+            )
+        return None
 
 
 def run_orchestrator(
@@ -847,6 +1055,7 @@ def run_orchestrator(
     messages: list[dict] = [{"role": "user", "content": user_message}]
 
     client = anthropic.Anthropic()
+    gate = _FinishGateState(kernel_path)
 
     turns = 0
     while True:
@@ -898,9 +1107,30 @@ def run_orchestrator(
                 continue
             # choice == "y"
             if tu.name == "finish":
-                finish_args = dict(tu.input)
-                break
+                gate_error = gate.check_finish()
+                if gate_error is None:
+                    finish_args = dict(tu.input)
+                    break
+                # Gate violation: synthesize a tool_result the
+                # orchestrator can self-correct from on its next turn,
+                # instead of returning the finish args. This is the
+                # source-of-truth enforcement for the rule the system
+                # prompt describes; if the two ever disagree, this
+                # code wins.
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": tu.id,
+                    "content": json.dumps({
+                        "status": "error",
+                        "stdout": "",
+                        "stderr": gate_error,
+                        "artifacts": [],
+                    }),
+                    "is_error": True,
+                })
+                continue
             exec_result = _execute_tool(tu.name, dict(tu.input))
+            gate.observe(tu.name, exec_result)
             tool_results.append({
                 "type": "tool_result",
                 "tool_use_id": tu.id,

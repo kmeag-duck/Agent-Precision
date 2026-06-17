@@ -107,8 +107,10 @@ def test_execute_tool_dispatches_spawn_rewriter(monkeypatch):
 
 
 def test_run_orchestrator_happy_path(monkeypatch, fake_anthropic):
-    """run_orchestrator drives analyst -> rewriter -> finish end-to-end with HITL approvals."""
-    # Three orchestrator turns: spawn_analyst, spawn_rewriter, finish.
+    """run_orchestrator drives analyst -> rewriter -> verifier(accept) -> finish end-to-end with HITL approvals."""
+    # Uses a .cu kernel so the finish-gate requires only verifier-accept
+    # (not the .cpp dynamic-verification chain). Four orchestrator turns:
+    # spawn_analyst, spawn_rewriter, spawn_verifier(accept), finish.
     fake = fake_anthropic([
         FakeResponse(
             content=[ToolUseBlock(
@@ -127,6 +129,21 @@ def test_run_orchestrator_happy_path(monkeypatch, fake_anthropic):
         FakeResponse(
             content=[ToolUseBlock(
                 id="tu_3",
+                name="spawn_verifier",
+                input={
+                    "original_source": "KSRC",
+                    "rewritten_source": "FINAL",
+                    "analyst_verdict_json": "{}",
+                    "tolerance_json": (
+                        '{"kind":"sig_figs","value":6,'
+                        '"source":"advisor_unknown_defaulted"}'
+                    ),
+                },
+            )],
+        ),
+        FakeResponse(
+            content=[ToolUseBlock(
+                id="tu_4",
                 name="finish",
                 input={"rewritten_code": "FINAL", "notes": "done"},
             )],
@@ -139,17 +156,19 @@ def test_run_orchestrator_happy_path(monkeypatch, fake_anthropic):
             return {"variables": [], "overall_notes": "ok"}
         if type_ == "rewriter":
             return {"rewritten_code": "FINAL", "summary_of_changes": "ok"}
+        if type_ == "verifier":
+            return {"verdict": "accept", "per_variable": [], "concerns": []}
         raise AssertionError(f"unexpected agent: {type_}")
 
     monkeypatch.setattr(orchestrator, "run_agent", stub_run_agent)
 
-    # Three HITL prompts, all approved.
-    _scripted_input(monkeypatch, ["y", "y", "y"])
+    # Four HITL prompts, all approved.
+    _scripted_input(monkeypatch, ["y", "y", "y", "y"])
 
-    result = run_orchestrator("path/to/kernel.cpp", "kernel source body")
+    result = run_orchestrator("path/to/kernel.cu", "kernel source body")
 
     assert result == {"rewritten_code": "FINAL", "notes": "done"}
-    assert len(fake.messages.calls) == 3
+    assert len(fake.messages.calls) == 4
 
     # First call: just the user message.
     first_messages = fake.messages.calls[0]["messages"]
@@ -177,6 +196,9 @@ def test_run_orchestrator_rejection_feeds_back_sentinel(
     monkeypatch, fake_anthropic
 ):
     """A HITL 'n' rejects the tool call without invoking run_agent and feeds {'status':'rejected_by_user'} back to the orchestrator."""
+    # Uses a .cu kernel so finish requires only verifier-accept (no
+    # comparator chain). Three turns: spawn_analyst (rejected),
+    # spawn_verifier(accept), finish.
     fake = fake_anthropic([
         # Turn 1: orchestrator proposes spawn_analyst — user rejects.
         FakeResponse(
@@ -186,26 +208,46 @@ def test_run_orchestrator_rejection_feeds_back_sentinel(
                 input={"kernel_source": "KSRC"},
             )],
         ),
-        # Turn 2: after seeing rejection, orchestrator just calls finish.
+        # Turn 2: after seeing rejection, orchestrator calls verifier to
+        # satisfy the finish-gate.
         FakeResponse(
             content=[ToolUseBlock(
                 id="tu_2",
+                name="spawn_verifier",
+                input={
+                    "original_source": "src",
+                    "rewritten_source": "src",
+                    "analyst_verdict_json": "{}",
+                    "tolerance_json": (
+                        '{"kind":"sig_figs","value":6,'
+                        '"source":"advisor_unknown_defaulted"}'
+                    ),
+                },
+            )],
+        ),
+        # Turn 3: finish.
+        FakeResponse(
+            content=[ToolUseBlock(
+                id="tu_3",
                 name="finish",
                 input={"rewritten_code": "X", "notes": "gave up"},
             )],
         ),
     ])
 
-    # If the analyst is actually invoked, this test should fail loudly.
-    def fail_run_agent(type_, task):
+    # Only the verifier should actually run via _execute_tool; the
+    # analyst call gets rejected and a finish call has no agent.
+    def stub_run_agent(type_, task):
+        if type_ == "verifier":
+            return {"verdict": "accept", "per_variable": [], "concerns": []}
         raise AssertionError(
-            f"run_agent should not be called after rejection; got {type_!r}"
+            f"run_agent should not be called for {type_!r} in this test"
         )
 
-    monkeypatch.setattr(orchestrator, "run_agent", fail_run_agent)
-    _scripted_input(monkeypatch, ["n", "y"])  # reject, then approve finish
+    monkeypatch.setattr(orchestrator, "run_agent", stub_run_agent)
+    _scripted_input(monkeypatch, ["n", "y", "y"])  # reject, approve, finish
 
-    result = run_orchestrator("k.cpp", "src")
+    result = run_orchestrator("k.cu", "src")
 
     assert result == {"rewritten_code": "X", "notes": "gave up"}
 
@@ -392,16 +434,15 @@ def test_run_orchestrator_user_cli_tolerance_appears_in_first_user_message(
     monkeypatch, fake_anthropic
 ):
     """When a user-supplied tolerance is passed, the first user message embeds it verbatim and the orchestrator is told NOT to call spawn_precision_advisor."""
+    # First-user-message-only test: short-circuit by returning text + end_turn
+    # on turn 1 so the loop exits with None before engaging the finish gate.
     fake = fake_anthropic([
         FakeResponse(
-            content=[ToolUseBlock(
-                id="tu_1",
-                name="finish",
-                input={"rewritten_code": "X", "notes": "Y"},
-            )],
+            content=[TextBlock(text="(test stop)")],
+            stop_reason="end_turn",
         ),
     ])
-    _scripted_input(monkeypatch, ["y"])  # approve finish
+    _scripted_input(monkeypatch, [])  # no tool_use, no HITL pause
 
     run_orchestrator(
         "k.cpp",
@@ -425,16 +466,15 @@ def test_run_orchestrator_no_tolerance_invites_advisor_in_first_user_message(
     monkeypatch, fake_anthropic
 ):
     """When tolerance=None, the first user message instructs the orchestrator to call spawn_precision_advisor first."""
+    # First-user-message-only test: short-circuit on turn 1 with a
+    # text+end_turn response so the loop exits before engaging the gate.
     fake = fake_anthropic([
         FakeResponse(
-            content=[ToolUseBlock(
-                id="tu_1",
-                name="finish",
-                input={"rewritten_code": "X", "notes": "Y"},
-            )],
+            content=[TextBlock(text="(test stop)")],
+            stop_reason="end_turn",
         ),
     ])
-    _scripted_input(monkeypatch, ["y"])
+    _scripted_input(monkeypatch, [])
 
     run_orchestrator("k.cpp", "src", tolerance=None)
 
@@ -583,16 +623,15 @@ def test_run_orchestrator_cpp_kernel_invites_baseline_in_first_user_message(
     monkeypatch, fake_anthropic
 ):
     """For a .cpp kernel, the first user message embeds the BASELINE STEP block with the file stem so the orchestrator can decide whether to call spawn_baseline_harness."""
+    # First-user-message-only test: short-circuit on turn 1 with a
+    # text+end_turn response so the loop exits before engaging the gate.
     fake = fake_anthropic([
         FakeResponse(
-            content=[ToolUseBlock(
-                id="tu_1",
-                name="finish",
-                input={"rewritten_code": "X", "notes": "Y"},
-            )],
+            content=[TextBlock(text="(test stop)")],
+            stop_reason="end_turn",
         ),
     ])
-    _scripted_input(monkeypatch, ["y"])
+    _scripted_input(monkeypatch, [])
 
     run_orchestrator("path/to/nbody_force.cpp", "src")
 
@@ -606,16 +645,15 @@ def test_run_orchestrator_cpp_with_kernel_name_includes_target_kernel_line(
     monkeypatch, fake_anthropic
 ):
     """When kernel_name is passed to run_orchestrator, the first user message adds a TARGET KERNEL: <name> line to the BASELINE STEP block."""
+    # First-user-message-only test: short-circuit on turn 1 with a
+    # text+end_turn response so the loop exits before engaging the gate.
     fake = fake_anthropic([
         FakeResponse(
-            content=[ToolUseBlock(
-                id="tu_1",
-                name="finish",
-                input={"rewritten_code": "X", "notes": "Y"},
-            )],
+            content=[TextBlock(text="(test stop)")],
+            stop_reason="end_turn",
         ),
     ])
-    _scripted_input(monkeypatch, ["y"])
+    _scripted_input(monkeypatch, [])
 
     run_orchestrator(
         "path/to/vector_add.cpp", "src", kernel_name="vector_add"
@@ -630,16 +668,15 @@ def test_run_orchestrator_cu_kernel_skips_baseline_in_first_user_message(
     monkeypatch, fake_anthropic
 ):
     """For a CUDA .cu kernel, the first user message's BASELINE STEP block tells the orchestrator not to call spawn_baseline_harness (v0 is Kokkos-only)."""
+    # First-user-message-only test: short-circuit on turn 1 with a
+    # text+end_turn response so the loop exits before engaging the gate.
     fake = fake_anthropic([
         FakeResponse(
-            content=[ToolUseBlock(
-                id="tu_1",
-                name="finish",
-                input={"rewritten_code": "X", "notes": "Y"},
-            )],
+            content=[TextBlock(text="(test stop)")],
+            stop_reason="end_turn",
         ),
     ])
-    _scripted_input(monkeypatch, ["y"])
+    _scripted_input(monkeypatch, [])
 
     run_orchestrator("path/to/vector_add.cu", "src")
 
@@ -1151,3 +1188,336 @@ def test_execute_tool_run_rewritten_driver_error_passes_through(monkeypatch):
     assert "rewritten/driver" in result["stderr"]
     assert "compile_rewritten_driver" in result["stderr"]
     assert result["artifacts"] == []
+
+
+# ---------- compare_outputs: tool schema + prompt + dispatch ----------
+
+
+def test_orchestrator_tools_include_compare_outputs():
+    """ORCHESTRATOR_TOOLS exposes compare_outputs with kernel_stem AND tolerance_json as the two required string inputs (unlike the run / compile tools, which take only kernel_stem)."""
+    by_name = {t["name"]: t for t in ORCHESTRATOR_TOOLS}
+    assert "compare_outputs" in by_name
+    tool = by_name["compare_outputs"]
+    props = tool["input_schema"]["properties"]
+    assert "kernel_stem" in props
+    assert "tolerance_json" in props
+    assert props["kernel_stem"]["type"] == "string"
+    assert props["tolerance_json"]["type"] == "string"
+    assert set(tool["input_schema"]["required"]) == {
+        "kernel_stem",
+        "tolerance_json",
+    }
+
+
+def test_orchestrator_prompt_mentions_compare_outputs_and_finish_gate():
+    """The orchestrator prompt names compare_outputs, ties it to a preceding successful run_rewritten_driver, and states it IS a precondition for finish on .cpp inputs (the source-of-truth gate is in code, but the prompt must tell the model)."""
+    text = ORCHESTRATOR_SYSTEM_PROMPT
+    assert "compare_outputs" in text
+    # Must be conditioned on the rewritten-run step succeeding, never
+    # standalone, and must reuse the tolerance_json the verifier got.
+    assert "run_rewritten_driver" in text
+    assert "tolerance_json" in text
+    # Must explicitly call out the finish-gate change for .cpp inputs.
+    assert "precondition for finish" in text.lower()
+    # Must mention the retry-bias suggestion (spawn_analyst, not
+    # spawn_rewriter, on comparator error) so the model has a clear
+    # next move when the gate blocks finish.
+    assert "spawn_analyst" in text
+
+
+def test_format_baseline_block_cpp_mentions_compare_outputs_step():
+    """For a .cpp kernel, the BASELINE STEP block tells the orchestrator to call compare_outputs immediately after a successful run_rewritten_driver, reusing the same tolerance_json passed to spawn_verifier, AND states the comparator IS a precondition for finish."""
+    block = _format_baseline_block(
+        "test-kernels/kokkos/mixed/nbody_force.cpp", None
+    )
+    assert "compare_outputs" in block
+    # Must be coupled to the upstream rewritten-run step.
+    assert "run_rewritten_driver" in block
+    # Must reuse the verifier's tolerance_json.
+    assert "tolerance_json" in block
+    # Must make the finish-gate visible at the block level (the
+    # orchestrator reads this block for its in-context guidance).
+    assert "finish" in block
+
+
+def test_format_baseline_block_cu_does_not_mention_compare_outputs():
+    """For a CUDA .cu kernel, the (skipped) BASELINE STEP block must NOT mention compare_outputs — the whole rewritten chain is skipped for .cu inputs in v0, and the finish-gate falls back to verifier-only."""
+    block = _format_baseline_block(
+        "test-kernels/cuda/lowerable/vector_add.cu", None
+    )
+    assert "compare_outputs" not in block
+
+
+def test_execute_tool_dispatches_compare_outputs(monkeypatch):
+    """_execute_tool routes compare_outputs to workflow.tools.compare_outputs, forwards BOTH kernel_stem and tolerance_json, and returns its {status, stdout, stderr, artifacts} dict verbatim (no extra wrapping)."""
+    captured = {}
+
+    def stub_compare(kernel_stem, tolerance_json):
+        captured["kernel_stem"] = kernel_stem
+        captured["tolerance_json"] = tolerance_json
+        return {
+            "status": "ok",
+            "stdout": "all 8 values agree",
+            "stderr": "",
+            "artifacts": [
+                "baselines/nbody_force/rewritten/comparison.json"
+            ],
+        }
+
+    monkeypatch.setattr(orchestrator, "compare_outputs", stub_compare)
+
+    tol = json.dumps(
+        {"kind": "sig_figs", "value": 3, "source": "user_cli"}
+    )
+    result = _execute_tool(
+        "compare_outputs",
+        {"kernel_stem": "nbody_force", "tolerance_json": tol},
+    )
+
+    assert captured == {"kernel_stem": "nbody_force", "tolerance_json": tol}
+    assert result == {
+        "status": "ok",
+        "stdout": "all 8 values agree",
+        "stderr": "",
+        "artifacts": [
+            "baselines/nbody_force/rewritten/comparison.json"
+        ],
+    }
+
+
+def test_execute_tool_compare_outputs_error_passes_through(monkeypatch):
+    """When the comparator returns status='error' (tolerance failure, shape mismatch, malformed tolerance_json, missing reference.json), _execute_tool passes that result through unchanged so the orchestrator sees the same error shape as a successful tool result — and the finish-gate downstream can read status to decide whether to block."""
+    monkeypatch.setattr(
+        orchestrator,
+        "compare_outputs",
+        lambda stem, tol: {
+            "status": "error",
+            "stdout": "",
+            "stderr": (
+                "Tolerance mismatch under sig_figs=3: 5/8 values "
+                "disagree."
+            ),
+            "artifacts": ["baselines/x/rewritten/comparison.json"],
+        },
+    )
+    tol = json.dumps(
+        {"kind": "sig_figs", "value": 3, "source": "user_cli"}
+    )
+    result = _execute_tool(
+        "compare_outputs", {"kernel_stem": "x", "tolerance_json": tol}
+    )
+    assert result["status"] == "error"
+    assert "Tolerance mismatch" in result["stderr"]
+    assert result["artifacts"] == [
+        "baselines/x/rewritten/comparison.json"
+    ]
+
+
+# ---------- finish-gate: code-side enforcement ----------
+
+
+def _verifier_accept_response(turn_id, original="src", rewritten="src"):
+    """Build the FakeResponse for one spawn_verifier(accept) turn.
+
+    Threads in plausible original/rewritten strings so the fake API
+    sees the same input shape it would in a real run. The verifier
+    stub elsewhere returns verdict='accept' regardless of inputs.
+    """
+    return FakeResponse(
+        content=[ToolUseBlock(
+            id=turn_id,
+            name="spawn_verifier",
+            input={
+                "original_source": original,
+                "rewritten_source": rewritten,
+                "analyst_verdict_json": "{}",
+                "tolerance_json": (
+                    '{"kind":"sig_figs","value":3,"source":"user_cli"}'
+                ),
+            },
+        )],
+    )
+
+
+def _compare_response(turn_id, kernel_stem):
+    return FakeResponse(
+        content=[ToolUseBlock(
+            id=turn_id,
+            name="compare_outputs",
+            input={
+                "kernel_stem": kernel_stem,
+                "tolerance_json": (
+                    '{"kind":"sig_figs","value":3,"source":"user_cli"}'
+                ),
+            },
+        )],
+    )
+
+
+def _finish_response(turn_id):
+    return FakeResponse(
+        content=[ToolUseBlock(
+            id=turn_id,
+            name="finish",
+            input={"rewritten_code": "FINAL", "notes": "done"},
+        )],
+    )
+
+
+def test_finish_gate_cpp_verifier_accept_and_compare_ok_allows_finish(
+    monkeypatch, fake_anthropic, tmp_path
+):
+    """For a .cpp kernel, finish is allowed when the most recent spawn_verifier returned verdict='accept' AND the most recent compare_outputs returned status='ok' for the current rewrite cycle."""
+    monkeypatch.chdir(tmp_path)
+    fake = fake_anthropic([
+        _verifier_accept_response("tu_v"),
+        _compare_response("tu_c", "kstem"),
+        _finish_response("tu_f"),
+    ])
+
+    monkeypatch.setattr(
+        orchestrator,
+        "run_agent",
+        lambda type_, task: {
+            "verdict": "accept",
+            "per_variable": [],
+            "concerns": [],
+        },
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "compare_outputs",
+        lambda stem, tol: {
+            "status": "ok",
+            "stdout": "match",
+            "stderr": "",
+            "artifacts": [],
+        },
+    )
+    _scripted_input(monkeypatch, ["y", "y", "y"])
+
+    result = run_orchestrator("path/to/kstem.cpp", "src")
+    assert result == {"rewritten_code": "FINAL", "notes": "done"}
+    assert len(fake.messages.calls) == 3
+
+
+def test_finish_gate_cpp_verifier_accept_but_compare_error_blocks_finish(
+    monkeypatch, fake_anthropic, tmp_path
+):
+    """For a .cpp kernel, even with a verifier-accept on file, a comparator status='error' blocks finish; the loop injects a synthetic tool_result naming what's missing instead of returning the finish args."""
+    monkeypatch.chdir(tmp_path)
+    fake = fake_anthropic([
+        _verifier_accept_response("tu_v"),
+        _compare_response("tu_c", "kstem"),
+        _finish_response("tu_f"),
+        # Turn 4: gate blocked finish, model gets a synthetic error and
+        # must do something next. Make it text-only so the loop exits
+        # cleanly with None and we can introspect the gate behavior.
+        FakeResponse(
+            content=[TextBlock(text="(test stop)")],
+            stop_reason="end_turn",
+        ),
+    ])
+    monkeypatch.setattr(
+        orchestrator,
+        "run_agent",
+        lambda type_, task: {
+            "verdict": "accept",
+            "per_variable": [],
+            "concerns": [],
+        },
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "compare_outputs",
+        lambda stem, tol: {
+            "status": "error",
+            "stdout": "",
+            "stderr": "Tolerance mismatch under sig_figs=3.",
+            "artifacts": [],
+        },
+    )
+    _scripted_input(monkeypatch, ["y", "y", "y"])  # all three approved
+
+    result = run_orchestrator("path/to/kstem.cpp", "src")
+    # Finish was blocked -> loop continued and then ran out at turn 4
+    # via the text+end_turn response, returning None.
+    assert result is None
+
+    # The tool_result fed back for the blocked finish call must carry
+    # an explicit gate-violation error and the is_error flag.
+    fourth_messages = fake.messages.calls[3]["messages"]
+    last = fourth_messages[-1]
+    assert last["role"] == "user"
+    blocks_by_id = {b["tool_use_id"]: b for b in last["content"]}
+    finish_block = blocks_by_id["tu_f"]
+    assert finish_block["is_error"] is True
+    payload = json.loads(finish_block["content"])
+    assert payload["status"] == "error"
+    assert "compare_outputs" in payload["stderr"]
+
+
+def test_finish_gate_cpp_compare_never_called_blocks_finish(
+    monkeypatch, fake_anthropic, tmp_path
+):
+    """For a .cpp kernel, a verifier-accept alone is not enough to allow finish; the comparator must have actually been called this rewrite cycle. Missing compare_outputs is treated as compare_status=None, which the gate blocks."""
+    monkeypatch.chdir(tmp_path)
+    fake = fake_anthropic([
+        _verifier_accept_response("tu_v"),
+        _finish_response("tu_f"),
+        FakeResponse(
+            content=[TextBlock(text="(test stop)")],
+            stop_reason="end_turn",
+        ),
+    ])
+    monkeypatch.setattr(
+        orchestrator,
+        "run_agent",
+        lambda type_, task: {
+            "verdict": "accept",
+            "per_variable": [],
+            "concerns": [],
+        },
+    )
+    _scripted_input(monkeypatch, ["y", "y"])
+
+    result = run_orchestrator("path/to/kstem.cpp", "src")
+    assert result is None
+
+    # The blocked-finish tool_result must mention that compare_outputs
+    # was missing for the current rewrite cycle.
+    third_messages = fake.messages.calls[2]["messages"]
+    last = third_messages[-1]
+    blocks_by_id = {b["tool_use_id"]: b for b in last["content"]}
+    finish_block = blocks_by_id["tu_f"]
+    assert finish_block["is_error"] is True
+    payload = json.loads(finish_block["content"])
+    assert "compare_outputs" in payload["stderr"]
+    # The gate names the variable it is missing so the model can self-
+    # correct without having to re-read the system prompt.
+    assert "compare_status" in payload["stderr"]
+
+
+def test_finish_gate_cu_verifier_accept_allows_finish_without_comparator(
+    monkeypatch, fake_anthropic, tmp_path
+):
+    """For a .cu kernel, the dynamic-verification chain is skipped entirely and the finish-gate falls back to verifier-only — finish succeeds on a verifier-accept with no compare_outputs call."""
+    monkeypatch.chdir(tmp_path)
+    fake = fake_anthropic([
+        _verifier_accept_response("tu_v"),
+        _finish_response("tu_f"),
+    ])
+    monkeypatch.setattr(
+        orchestrator,
+        "run_agent",
+        lambda type_, task: {
+            "verdict": "accept",
+            "per_variable": [],
+            "concerns": [],
+        },
+    )
+    _scripted_input(monkeypatch, ["y", "y"])
+
+    result = run_orchestrator("path/to/vector_add.cu", "src")
+    assert result == {"rewritten_code": "FINAL", "notes": "done"}
+    assert len(fake.messages.calls) == 2

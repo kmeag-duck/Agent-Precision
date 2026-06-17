@@ -10,12 +10,18 @@ outside the sentinels, and the same uniform result schema. Also
 covers compile_rewritten_driver — env-var contract shared with the
 baseline compile, rewritten-subdir source/output paths, missing-source
 hint blaming splice_rewritten_kernel, baseline-binary preservation,
-and compile-flag parity with compile_baseline_driver. Finally covers
+and compile-flag parity with compile_baseline_driver. Also covers
 run_rewritten_driver — env-var contract shared with the baseline run,
 rewritten-subdir cwd / artifact path, missing-binary hint blaming
-compile_rewritten_driver, and isolation from the baseline tree. All
-tests monkeypatch subprocess.run so no real compiler or driver
-invocation happens.
+compile_rewritten_driver, and isolation from the baseline tree.
+Finally covers compare_outputs — tolerance-kind dispatch (sig_figs and
+decimal_digits with the documented strict-< thresholds), NaN-always-
+mismatches asymmetry, ±inf rules, shape-error vs tolerance-failure
+distinction, mismatch list truncation with a "+ K more suppressed"
+footer, comparison.json artifact on both pass and fail paths, and
+the uniform result schema. All tests monkeypatch subprocess.run so no
+real compiler or driver invocation happens; comparator tests use pure
+file I/O against tmp_path.
 """
 
 import json
@@ -30,6 +36,7 @@ from workflow.tools import (
     KERNEL_END_SENTINEL,
     KOKKOS_ROOT_ENV,
     RUN_TIMEOUT_ENV,
+    compare_outputs,
     compile_baseline_driver,
     compile_rewritten_driver,
     run_baseline_driver,
@@ -1567,3 +1574,499 @@ def test_run_rewritten_driver_result_keys_are_stable(monkeypatch, tmp_path):
 
     monkeypatch.setattr(subprocess, "run", raise_timeout)
     assert set(run_rewritten_driver("x").keys()) == expected_keys
+
+
+# ---------- compare_outputs: shape + tolerance + special values + artifact ----------
+
+
+def _write_reference_pair(
+    tmp_path, stem, baseline_payload, rewritten_payload
+):
+    """Stage baseline + rewritten reference.json files for a kernel_stem.
+
+    Mirrors the layout the live run_baseline_driver / run_rewritten_driver
+    chain would have produced: baselines/<stem>/reference.json and
+    baselines/<stem>/rewritten/reference.json. Either payload may be a
+    Python value (will be json.dumps'd) or a raw string (written
+    verbatim, so tests can stage deliberately-invalid JSON).
+    """
+    baseline_dir = tmp_path / "baselines" / stem
+    rewritten_dir = baseline_dir / "rewritten"
+    rewritten_dir.mkdir(parents=True)
+
+    def write_one(target, payload):
+        if payload is None:
+            return
+        if isinstance(payload, str):
+            target.write_text(payload)
+        else:
+            target.write_text(json.dumps(payload))
+
+    write_one(baseline_dir / "reference.json", baseline_payload)
+    write_one(rewritten_dir / "reference.json", rewritten_payload)
+    return baseline_dir, rewritten_dir
+
+
+def _well_shaped(outputs):
+    """Build a minimally-valid reference.json shell around an outputs dict."""
+    return {
+        "kernel": "foo",
+        "seed": 1,
+        "inputs": {"N": 8},
+        "outputs": outputs,
+    }
+
+
+def _tolerance(kind, value):
+    return json.dumps({"kind": kind, "value": value, "source": "user_cli"})
+
+
+def test_compare_outputs_errors_when_both_references_missing(
+    monkeypatch, tmp_path
+):
+    """If neither baseline/<stem>/reference.json nor baselines/<stem>/rewritten/reference.json exists, compare_outputs returns status='error' (no comparison.json is written because there is no rewritten dir to put it in)."""
+    monkeypatch.chdir(tmp_path)
+
+    result = compare_outputs("nbody_force", _tolerance("sig_figs", 3))
+
+    assert result["status"] == "error"
+    assert "baseline" in result["stderr"].lower()
+    assert result["artifacts"] == []
+
+
+def test_compare_outputs_errors_when_baseline_missing(monkeypatch, tmp_path):
+    """If only the rewritten reference.json exists, compare_outputs blames the baseline side and names run_baseline_driver as the upstream that should have produced it."""
+    monkeypatch.chdir(tmp_path)
+    rewritten_dir = tmp_path / "baselines" / "x" / "rewritten"
+    rewritten_dir.mkdir(parents=True)
+    (rewritten_dir / "reference.json").write_text(
+        json.dumps(_well_shaped({"out": [1.0]}))
+    )
+
+    result = compare_outputs("x", _tolerance("sig_figs", 3))
+
+    assert result["status"] == "error"
+    assert "baseline" in result["stderr"].lower()
+    assert "run_baseline_driver" in result["stderr"]
+    assert result["artifacts"] == []
+
+
+def test_compare_outputs_errors_when_rewritten_missing(monkeypatch, tmp_path):
+    """If only the baseline reference.json exists, compare_outputs blames the rewritten side and names run_rewritten_driver as the upstream that should have produced it."""
+    monkeypatch.chdir(tmp_path)
+    baseline_dir = tmp_path / "baselines" / "x"
+    baseline_dir.mkdir(parents=True)
+    (baseline_dir / "reference.json").write_text(
+        json.dumps(_well_shaped({"out": [1.0]}))
+    )
+
+    result = compare_outputs("x", _tolerance("sig_figs", 3))
+
+    assert result["status"] == "error"
+    assert "rewritten" in result["stderr"].lower()
+    assert "run_rewritten_driver" in result["stderr"]
+    assert result["artifacts"] == []
+
+
+def test_compare_outputs_errors_on_invalid_json_either_side(
+    monkeypatch, tmp_path
+):
+    """A reference.json that exists but does not parse as JSON returns status='error' on whichever side is bad, citing the file path."""
+    monkeypatch.chdir(tmp_path)
+
+    # Bad baseline.
+    _write_reference_pair(
+        tmp_path,
+        "a",
+        baseline_payload="{not json",
+        rewritten_payload=_well_shaped({"out": [1.0]}),
+    )
+    r1 = compare_outputs("a", _tolerance("sig_figs", 3))
+    assert r1["status"] == "error"
+    assert "baseline" in r1["stderr"].lower()
+
+    # Bad rewritten.
+    _write_reference_pair(
+        tmp_path,
+        "b",
+        baseline_payload=_well_shaped({"out": [1.0]}),
+        rewritten_payload="{also not json",
+    )
+    r2 = compare_outputs("b", _tolerance("sig_figs", 3))
+    assert r2["status"] == "error"
+    assert "rewritten" in r2["stderr"].lower()
+
+
+def test_compare_outputs_errors_on_malformed_tolerance_json(
+    monkeypatch, tmp_path
+):
+    """An unparseable or wrong-kind tolerance_json returns status='error' WITHOUT touching the reference.json files (so a bad caller cannot wedge the comparator)."""
+    monkeypatch.chdir(tmp_path)
+    _write_reference_pair(
+        tmp_path,
+        "x",
+        baseline_payload=_well_shaped({"out": [1.0]}),
+        rewritten_payload=_well_shaped({"out": [1.0]}),
+    )
+
+    # Unparseable.
+    bad1 = compare_outputs("x", "{not json")
+    assert bad1["status"] == "error"
+    assert "tolerance_json" in bad1["stderr"]
+    assert bad1["artifacts"] == []
+
+    # Wrong kind.
+    bad2 = compare_outputs(
+        "x", json.dumps({"kind": "ulps", "value": 3, "source": "user_cli"})
+    )
+    assert bad2["status"] == "error"
+    assert "kind" in bad2["stderr"]
+
+    # Bad value (non-positive or non-int).
+    bad3 = compare_outputs(
+        "x",
+        json.dumps({"kind": "sig_figs", "value": 0, "source": "user_cli"}),
+    )
+    assert bad3["status"] == "error"
+    assert "value" in bad3["stderr"]
+
+    bad4 = compare_outputs(
+        "x",
+        json.dumps(
+            {"kind": "sig_figs", "value": "three", "source": "user_cli"}
+        ),
+    )
+    assert bad4["status"] == "error"
+
+
+def test_compare_outputs_shape_mismatch_writes_shape_error_artifact(
+    monkeypatch, tmp_path
+):
+    """Different top-level keys / output array names / array lengths each surface as status='error' with shape_error populated in the written comparison.json (so the operator can distinguish from a regular tolerance failure)."""
+    monkeypatch.chdir(tmp_path)
+
+    # Different top-level keys.
+    _write_reference_pair(
+        tmp_path,
+        "topk",
+        baseline_payload={
+            "kernel": "foo",
+            "seed": 1,
+            "inputs": {"N": 8},
+            "outputs": {"a": [1.0]},
+        },
+        rewritten_payload={
+            "kernel": "foo",
+            "seed": 1,
+            "outputs": {"a": [1.0]},
+        },
+    )
+    r_topk = compare_outputs("topk", _tolerance("sig_figs", 3))
+    assert r_topk["status"] == "error"
+    doc_topk = json.loads(
+        (
+            tmp_path
+            / "baselines"
+            / "topk"
+            / "rewritten"
+            / "comparison.json"
+        ).read_text()
+    )
+    assert "shape_error" in doc_topk
+    assert "top-level" in doc_topk["shape_error"].lower()
+
+    # Different output array names.
+    _write_reference_pair(
+        tmp_path,
+        "names",
+        baseline_payload=_well_shaped({"a": [1.0], "b": [2.0]}),
+        rewritten_payload=_well_shaped({"a": [1.0], "c": [2.0]}),
+    )
+    r_names = compare_outputs("names", _tolerance("sig_figs", 3))
+    assert r_names["status"] == "error"
+    doc_names = json.loads(
+        (
+            tmp_path
+            / "baselines"
+            / "names"
+            / "rewritten"
+            / "comparison.json"
+        ).read_text()
+    )
+    assert "shape_error" in doc_names
+    assert (
+        "output array" in doc_names["shape_error"].lower()
+        or "name mismatch" in doc_names["shape_error"].lower()
+    )
+
+    # Different array lengths.
+    _write_reference_pair(
+        tmp_path,
+        "lens",
+        baseline_payload=_well_shaped({"a": [1.0, 2.0, 3.0]}),
+        rewritten_payload=_well_shaped({"a": [1.0, 2.0]}),
+    )
+    r_lens = compare_outputs("lens", _tolerance("sig_figs", 3))
+    assert r_lens["status"] == "error"
+    doc_lens = json.loads(
+        (
+            tmp_path
+            / "baselines"
+            / "lens"
+            / "rewritten"
+            / "comparison.json"
+        ).read_text()
+    )
+    assert "shape_error" in doc_lens
+    assert "length" in doc_lens["shape_error"].lower()
+
+
+def test_compare_outputs_sig_figs_passes_inside_threshold(
+    monkeypatch, tmp_path
+):
+    """sig_figs=N passes when |a-b| < 10^-N * max(|a|,|b|) (strict <), and the both-zero special case passes."""
+    monkeypatch.chdir(tmp_path)
+    # 1.0 vs 1.0009 with sig_figs=3 -> threshold = 0.001 * 1.0009 ~= 0.001;
+    # |diff| = 0.0009 < threshold, so passes.
+    _write_reference_pair(
+        tmp_path,
+        "inside",
+        baseline_payload=_well_shaped({"a": [1.0, 0.0]}),
+        rewritten_payload=_well_shaped({"a": [1.0009, 0.0]}),
+    )
+    result = compare_outputs("inside", _tolerance("sig_figs", 3))
+    assert result["status"] == "ok"
+    assert result["artifacts"] == [
+        "baselines/inside/rewritten/comparison.json"
+    ]
+    doc = json.loads(
+        (
+            tmp_path
+            / "baselines"
+            / "inside"
+            / "rewritten"
+            / "comparison.json"
+        ).read_text()
+    )
+    assert doc["status"] == "ok"
+    assert doc["total_compared"] == 2
+    assert doc["mismatches"] == []
+
+
+def test_compare_outputs_sig_figs_fails_just_outside_threshold(
+    monkeypatch, tmp_path
+):
+    """sig_figs=N is strict-<, so a value at or just beyond 10^-N * max(|a|,|b|) fails and the failure is recorded with abs_err and threshold in comparison.json."""
+    monkeypatch.chdir(tmp_path)
+    # 1.0 vs 1.01 with sig_figs=3 -> threshold = 0.001 * 1.01 = 0.00101;
+    # |diff| = 0.01 > threshold, so fails.
+    _write_reference_pair(
+        tmp_path,
+        "outside",
+        baseline_payload=_well_shaped({"a": [1.0]}),
+        rewritten_payload=_well_shaped({"a": [1.01]}),
+    )
+    result = compare_outputs("outside", _tolerance("sig_figs", 3))
+    assert result["status"] == "error"
+    assert "1/1" in result["stderr"]
+    doc = json.loads(
+        (
+            tmp_path
+            / "baselines"
+            / "outside"
+            / "rewritten"
+            / "comparison.json"
+        ).read_text()
+    )
+    assert doc["status"] == "error"
+    assert len(doc["mismatches"]) == 1
+    m = doc["mismatches"][0]
+    assert m["name"] == "a" and m["index"] == 0
+    assert m["abs_err"] is not None
+    assert m["threshold"] is not None
+
+
+def test_compare_outputs_decimal_digits_pass_and_fail(
+    monkeypatch, tmp_path
+):
+    """decimal_digits=N passes when |a-b| < 10^-N and fails otherwise, independent of the magnitudes (unlike sig_figs)."""
+    monkeypatch.chdir(tmp_path)
+    # decimal_digits=4 -> threshold = 0.0001.
+    # Pair (1000.0, 1000.00005) passes; pair (1.0, 1.001) fails.
+    _write_reference_pair(
+        tmp_path,
+        "dd",
+        baseline_payload=_well_shaped({"a": [1000.0], "b": [1.0]}),
+        rewritten_payload=_well_shaped({"a": [1000.00005], "b": [1.001]}),
+    )
+    result = compare_outputs("dd", _tolerance("decimal_digits", 4))
+    assert result["status"] == "error"
+    doc = json.loads(
+        (
+            tmp_path
+            / "baselines"
+            / "dd"
+            / "rewritten"
+            / "comparison.json"
+        ).read_text()
+    )
+    failed_names = {m["name"] for m in doc["mismatches"]}
+    assert failed_names == {"b"}  # 'a' passed, 'b' failed
+    assert doc["total_compared"] == 2
+
+
+def test_compare_outputs_nan_always_mismatches(monkeypatch, tmp_path):
+    """NaN vs NaN, NaN vs finite, and finite vs NaN all mismatch — the comparator deliberately rejects the IEEE 754 NaN-equality asymmetry so any NaN in either output flags a regression."""
+    monkeypatch.chdir(tmp_path)
+    # Use Python's json non-strict parsing of NaN by writing the file raw.
+    raw_base = '{"kernel":"k","seed":1,"inputs":{},"outputs":{"a":[NaN,1.0,NaN]}}'
+    raw_rewr = '{"kernel":"k","seed":1,"inputs":{},"outputs":{"a":[NaN,NaN,2.0]}}'
+    baseline_dir = tmp_path / "baselines" / "nans"
+    (baseline_dir / "rewritten").mkdir(parents=True)
+    (baseline_dir / "reference.json").write_text(raw_base)
+    (baseline_dir / "rewritten" / "reference.json").write_text(raw_rewr)
+
+    result = compare_outputs("nans", _tolerance("sig_figs", 3))
+    assert result["status"] == "error"
+    doc = json.loads(
+        (baseline_dir / "rewritten" / "comparison.json").read_text()
+    )
+    # All three pairs are NaN-tainted: (NaN, NaN), (1.0, NaN), (NaN, 2.0).
+    assert doc["total_compared"] == 3
+    assert len(doc["mismatches"]) == 3
+
+
+def test_compare_outputs_inf_rules(monkeypatch, tmp_path):
+    """+inf vs +inf passes; -inf vs -inf passes; +inf vs -inf fails; inf vs finite fails."""
+    monkeypatch.chdir(tmp_path)
+    raw_base = (
+        '{"kernel":"k","seed":1,"inputs":{},'
+        '"outputs":{"a":[Infinity, -Infinity, Infinity, Infinity]}}'
+    )
+    raw_rewr = (
+        '{"kernel":"k","seed":1,"inputs":{},'
+        '"outputs":{"a":[Infinity, -Infinity, -Infinity, 1.0]}}'
+    )
+    baseline_dir = tmp_path / "baselines" / "infs"
+    (baseline_dir / "rewritten").mkdir(parents=True)
+    (baseline_dir / "reference.json").write_text(raw_base)
+    (baseline_dir / "rewritten" / "reference.json").write_text(raw_rewr)
+
+    result = compare_outputs("infs", _tolerance("sig_figs", 3))
+    assert result["status"] == "error"
+    doc = json.loads(
+        (baseline_dir / "rewritten" / "comparison.json").read_text()
+    )
+    # Pairs: (+inf,+inf) OK, (-inf,-inf) OK, (+inf,-inf) FAIL, (+inf,1.0) FAIL.
+    assert doc["total_compared"] == 4
+    failed_indices = sorted(m["index"] for m in doc["mismatches"])
+    assert failed_indices == [2, 3]
+
+
+def test_compare_outputs_truncates_mismatch_list_with_footer(
+    monkeypatch, tmp_path
+):
+    """When more than 10 leaves disagree, the stderr (and the written comparison.json) lists only the first 10 entries followed by a "+ K more mismatches suppressed" footer."""
+    monkeypatch.chdir(tmp_path)
+    n = 25
+    _write_reference_pair(
+        tmp_path,
+        "many",
+        baseline_payload=_well_shaped({"a": [0.0] * n}),
+        rewritten_payload=_well_shaped({"a": [1.0] * n}),
+    )
+    result = compare_outputs("many", _tolerance("decimal_digits", 6))
+    assert result["status"] == "error"
+    # Stderr footer mentions the suppressed count.
+    assert f"{n - 10} more mismatches suppressed" in result["stderr"]
+    # The written comparison.json is also capped at 10 entries.
+    doc = json.loads(
+        (
+            tmp_path
+            / "baselines"
+            / "many"
+            / "rewritten"
+            / "comparison.json"
+        ).read_text()
+    )
+    assert len(doc["mismatches"]) == 10
+    assert doc["total_compared"] == n
+
+
+def test_compare_outputs_writes_comparison_json_on_both_paths(
+    monkeypatch, tmp_path
+):
+    """comparison.json is written on the success path AND the tolerance-failure path, always under the rewritten subtree, always listed as the artifact."""
+    monkeypatch.chdir(tmp_path)
+
+    # Success path.
+    _write_reference_pair(
+        tmp_path,
+        "okpath",
+        baseline_payload=_well_shaped({"a": [1.0]}),
+        rewritten_payload=_well_shaped({"a": [1.0]}),
+    )
+    ok = compare_outputs("okpath", _tolerance("sig_figs", 3))
+    assert ok["status"] == "ok"
+    ok_path = tmp_path / "baselines" / "okpath" / "rewritten" / "comparison.json"
+    assert ok_path.is_file()
+    assert ok["artifacts"] == [str(ok_path.relative_to(tmp_path))]
+
+    # Failure path.
+    _write_reference_pair(
+        tmp_path,
+        "failpath",
+        baseline_payload=_well_shaped({"a": [1.0]}),
+        rewritten_payload=_well_shaped({"a": [10.0]}),
+    )
+    bad = compare_outputs("failpath", _tolerance("sig_figs", 3))
+    assert bad["status"] == "error"
+    bad_path = (
+        tmp_path / "baselines" / "failpath" / "rewritten" / "comparison.json"
+    )
+    assert bad_path.is_file()
+    assert bad["artifacts"] == [str(bad_path.relative_to(tmp_path))]
+
+
+def test_compare_outputs_result_keys_are_stable(monkeypatch, tmp_path):
+    """Every code path returns a dict with exactly the keys {status, stdout, stderr, artifacts} — same shape as the other deterministic tools so the orchestrator's tool-result handling is uniform."""
+    expected_keys = {"status", "stdout", "stderr", "artifacts"}
+    monkeypatch.chdir(tmp_path)
+
+    # 1) malformed tolerance
+    r1 = compare_outputs("nope", "not json")
+    assert set(r1.keys()) == expected_keys
+
+    # 2) both files missing
+    r2 = compare_outputs("nope", _tolerance("sig_figs", 3))
+    assert set(r2.keys()) == expected_keys
+
+    # 3) shape mismatch
+    _write_reference_pair(
+        tmp_path,
+        "shp",
+        baseline_payload=_well_shaped({"a": [1.0]}),
+        rewritten_payload=_well_shaped({"b": [1.0]}),
+    )
+    r3 = compare_outputs("shp", _tolerance("sig_figs", 3))
+    assert set(r3.keys()) == expected_keys
+
+    # 4) ok
+    _write_reference_pair(
+        tmp_path,
+        "go",
+        baseline_payload=_well_shaped({"a": [1.0]}),
+        rewritten_payload=_well_shaped({"a": [1.0]}),
+    )
+    r4 = compare_outputs("go", _tolerance("sig_figs", 3))
+    assert set(r4.keys()) == expected_keys
+
+    # 5) tolerance fail
+    _write_reference_pair(
+        tmp_path,
+        "no",
+        baseline_payload=_well_shaped({"a": [1.0]}),
+        rewritten_payload=_well_shaped({"a": [10.0]}),
+    )
+    r5 = compare_outputs("no", _tolerance("sig_figs", 3))
+    assert set(r5.keys()) == expected_keys
