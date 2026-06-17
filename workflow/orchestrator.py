@@ -24,6 +24,7 @@ from .tools import (
     compile_baseline_driver,
     compile_rewritten_driver,
     run_baseline_driver,
+    run_rewritten_driver,
     splice_rewritten_kernel,
 )
 
@@ -186,6 +187,22 @@ You also have two deterministic (non-LLM) tools:
     returned an error. The compiled rewritten driver is a precursor
     for a future mechanical comparator; like the splice step, a
     compile error here must NOT block finish on its own.
+
+  - run_rewritten_driver: takes a kernel_stem and executes
+    baselines/<kernel_stem>/rewritten/driver (produced by a prior
+    compile_rewritten_driver call) with cwd set to
+    baselines/<kernel_stem>/rewritten/, then verifies that it
+    produced a parseable baselines/<kernel_stem>/rewritten/reference.json.
+    Subject to the same AGENT_PRECISION_RUN_TIMEOUT_SEC wall-clock
+    timeout as run_baseline_driver. Returns
+    {status, stdout, stderr, artifacts}. Call this exactly once per
+    accepted verifier verdict, immediately after a successful
+    compile_rewritten_driver call, with the same kernel_stem. Do not
+    call it if compile_rewritten_driver was skipped, rejected, or
+    returned an error. The rewritten reference output is a precursor
+    for a future mechanical comparator; like the rest of the
+    rewritten chain, a run error here must NOT block finish on its
+    own.
 
 You also have a finish tool to emit the final answer.
 
@@ -547,6 +564,39 @@ ORCHESTRATOR_TOOLS = [
         },
     },
     {
+        "name": "run_rewritten_driver",
+        "description": (
+            "Deterministic (non-LLM) tool. Executes "
+            "baselines/<kernel_stem>/rewritten/driver (produced by a "
+            "prior compile_rewritten_driver call) with cwd set to "
+            "baselines/<kernel_stem>/rewritten/, so the driver writes "
+            "./reference.json next to itself. Validates that the "
+            "resulting reference.json is parseable JSON. Subject to a "
+            "wall-clock timeout from AGENT_PRECISION_RUN_TIMEOUT_SEC "
+            "(default 60s) — same env contract as run_baseline_driver. "
+            "Returns {status, stdout, stderr, artifacts}. Call exactly "
+            "once per accepted verifier verdict, immediately after a "
+            "successful compile_rewritten_driver, with the same "
+            "kernel_stem. The rewritten reference output is a precursor "
+            "for a future mechanical comparator and is not a "
+            "precondition for finish."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "kernel_stem": {
+                    "type": "string",
+                    "description": (
+                        "Filesystem-safe short name for this kernel; "
+                        "MUST match the kernel_stem passed to the "
+                        "preceding compile_rewritten_driver call."
+                    ),
+                },
+            },
+            "required": ["kernel_stem"],
+        },
+    },
+    {
         "name": "finish",
         "description": "Terminate the workflow with the final rewritten kernel.",
         "input_schema": {
@@ -661,6 +711,14 @@ def _execute_tool(tool_name: str, tool_input: dict) -> dict:
         # Returns the same {status, stdout, stderr, artifacts} shape
         # verbatim.
         return compile_rewritten_driver(tool_input["kernel_stem"])
+    if tool_name == "run_rewritten_driver":
+        # Deterministic tool (no LLM call): same subprocess shape as
+        # run_baseline_driver but cwd=baselines/<stem>/rewritten/, so
+        # the rewritten driver's ./reference.json lands inside the
+        # rewritten subtree and the baseline tree is never touched.
+        # Returns the same {status, stdout, stderr, artifacts} shape
+        # verbatim.
+        return run_rewritten_driver(tool_input["kernel_stem"])
     raise ValueError(f"Unknown tool: {tool_name}")
 
 
@@ -742,8 +800,11 @@ def _format_baseline_block(kernel_path: str, kernel_name: str | None) -> str:
         "and the rewriter's accepted rewritten kernel source as "
         "rewritten_kernel_source. If (and only if) splice_rewritten_kernel "
         "returns status='ok', follow it immediately with a single call to "
-        "compile_rewritten_driver using the same KERNEL STEM. A splice or "
-        "rewritten-compile error must NOT block finish."
+        "compile_rewritten_driver using the same KERNEL STEM. If (and only "
+        "if) compile_rewritten_driver returns status='ok', follow it "
+        "immediately with a single call to run_rewritten_driver using the "
+        "same KERNEL STEM. A splice, rewritten-compile, or rewritten-run "
+        "error must NOT block finish."
     )
 
 

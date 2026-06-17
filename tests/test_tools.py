@@ -6,13 +6,16 @@ run_baseline_driver — env-var parsing, missing/non-executable binary,
 clean run + reference.json validation, non-zero exit, timeout, and
 the same uniform result schema. Also covers splice_rewritten_kernel —
 sentinel discovery, error cases, round-trip identity, byte-preservation
-outside the sentinels, and the same uniform result schema. Finally
+outside the sentinels, and the same uniform result schema. Also
 covers compile_rewritten_driver — env-var contract shared with the
 baseline compile, rewritten-subdir source/output paths, missing-source
 hint blaming splice_rewritten_kernel, baseline-binary preservation,
-and compile-flag parity with compile_baseline_driver. All tests
-monkeypatch subprocess.run so no real compiler or driver invocation
-happens.
+and compile-flag parity with compile_baseline_driver. Finally covers
+run_rewritten_driver — env-var contract shared with the baseline run,
+rewritten-subdir cwd / artifact path, missing-binary hint blaming
+compile_rewritten_driver, and isolation from the baseline tree. All
+tests monkeypatch subprocess.run so no real compiler or driver
+invocation happens.
 """
 
 import json
@@ -30,6 +33,7 @@ from workflow.tools import (
     compile_baseline_driver,
     compile_rewritten_driver,
     run_baseline_driver,
+    run_rewritten_driver,
     splice_rewritten_kernel,
 )
 
@@ -1280,3 +1284,286 @@ def test_compile_rewritten_driver_result_keys_are_stable(
 
     monkeypatch.setattr(subprocess, "run", lambda *a, **kw: FailProc())
     assert set(compile_rewritten_driver("x").keys()) == expected_keys
+
+
+# ---------- run_rewritten_driver: env-var + preflight + cwd + success ----------
+
+
+def _stage_rewritten_driver_binary(tmp_path, stem, reference_payload=None):
+    """Create a fake executable at baselines/<stem>/rewritten/driver under tmp_path.
+
+    Mirrors _stage_driver_binary but targets the rewritten subdirectory
+    that compile_rewritten_driver populates. The file does NOT need to
+    actually do anything; tests monkeypatch subprocess.run. It just
+    needs to exist and be executable so run_rewritten_driver's
+    preflight checks pass. If reference_payload is provided, it is
+    written as ./reference.json next to the driver (matching what a
+    real driver would do on success).
+    """
+    rewritten_dir = tmp_path / "baselines" / stem / "rewritten"
+    rewritten_dir.mkdir(parents=True)
+    binary = rewritten_dir / "driver"
+    binary.write_text("#!/bin/sh\nexit 0\n")
+    binary.chmod(binary.stat().st_mode | stat.S_IXUSR)
+    if reference_payload is not None:
+        (rewritten_dir / "reference.json").write_text(
+            json.dumps(reference_payload)
+        )
+    return rewritten_dir
+
+
+def test_run_rewritten_driver_rejects_invalid_env_timeout(monkeypatch, tmp_path):
+    """A non-integer or non-positive AGENT_PRECISION_RUN_TIMEOUT_SEC makes run_rewritten_driver return status='error' WITHOUT invoking subprocess.run (same env contract as run_baseline_driver)."""
+    monkeypatch.chdir(tmp_path)
+    _stage_rewritten_driver_binary(tmp_path, "nbody_force")
+
+    def fail_run(*a, **kw):
+        raise AssertionError(
+            "subprocess.run must not be called for invalid timeout"
+        )
+
+    monkeypatch.setattr(subprocess, "run", fail_run)
+
+    for bad in ["not_an_int", "0", "-5", "3.14"]:
+        monkeypatch.setenv(RUN_TIMEOUT_ENV, bad)
+        result = run_rewritten_driver("nbody_force")
+        assert result["status"] == "error"
+        assert RUN_TIMEOUT_ENV in result["stderr"]
+        assert result["artifacts"] == []
+
+
+def test_run_rewritten_driver_errors_when_driver_binary_missing(
+    monkeypatch, tmp_path
+):
+    """If baselines/<stem>/rewritten/driver does not exist, run_rewritten_driver returns status='error' (no subprocess call) and the error names compile_rewritten_driver as the upstream tool that was supposed to have produced it (NOT compile_baseline_driver)."""
+    monkeypatch.chdir(tmp_path)
+
+    def fail_run(*a, **kw):
+        raise AssertionError(
+            "subprocess.run must not be called when driver binary is missing"
+        )
+
+    monkeypatch.setattr(subprocess, "run", fail_run)
+
+    result = run_rewritten_driver("nbody_force")
+
+    assert result["status"] == "error"
+    # Path must point at the rewritten subdirectory, not the baseline.
+    assert "rewritten/driver" in result["stderr"]
+    # Hint must blame the rewritten-compile step, not the baseline compile.
+    assert "compile_rewritten_driver" in result["stderr"]
+    assert "compile_baseline_driver" not in result["stderr"]
+    assert result["artifacts"] == []
+
+
+def test_run_rewritten_driver_errors_when_driver_binary_not_executable(
+    monkeypatch, tmp_path
+):
+    """If baselines/<stem>/rewritten/driver exists but lacks the exec bit, run_rewritten_driver returns status='error' without invoking subprocess.run."""
+    monkeypatch.chdir(tmp_path)
+    rewritten_dir = tmp_path / "baselines" / "nbody_force" / "rewritten"
+    rewritten_dir.mkdir(parents=True)
+    binary = rewritten_dir / "driver"
+    binary.write_text("noop")
+    binary.chmod(binary.stat().st_mode & ~stat.S_IXUSR & ~stat.S_IXGRP & ~stat.S_IXOTH)
+
+    def fail_run(*a, **kw):
+        raise AssertionError(
+            "subprocess.run must not be called when driver binary is non-executable"
+        )
+
+    monkeypatch.setattr(subprocess, "run", fail_run)
+
+    result = run_rewritten_driver("nbody_force")
+
+    assert result["status"] == "error"
+    assert "executable" in result["stderr"].lower()
+    assert result["artifacts"] == []
+
+
+def test_run_rewritten_driver_invokes_driver_with_rewritten_subdir_cwd(
+    monkeypatch, tmp_path
+):
+    """run_rewritten_driver shells out to ./driver with cwd=baselines/<stem>/rewritten/ — so the driver writes reference.json inside the rewritten subtree, not next to the baseline."""
+    monkeypatch.chdir(tmp_path)
+    _stage_rewritten_driver_binary(
+        tmp_path, "nbody_force", reference_payload={"x": 1}
+    )
+
+    captured = {}
+
+    class OkProc:
+        returncode = 0
+        stdout = "stdout-here"
+        stderr = "stderr-here"
+
+    def fake_run(cmd, **kw):
+        captured["cmd"] = cmd
+        captured["cwd"] = kw["cwd"]
+        captured["capture_output"] = kw["capture_output"]
+        captured["text"] = kw["text"]
+        captured["check"] = kw["check"]
+        return OkProc()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    run_rewritten_driver("nbody_force")
+
+    assert captured["cmd"] == ["./driver"]
+    # cwd is the per-stem rewritten dir.
+    assert os.path.basename(captured["cwd"]) == "rewritten"
+    assert os.path.basename(os.path.dirname(captured["cwd"])) == "nbody_force"
+    assert (
+        os.path.basename(os.path.dirname(os.path.dirname(captured["cwd"])))
+        == "baselines"
+    )
+    assert captured["capture_output"] is True
+    assert captured["text"] is True
+    assert captured["check"] is False
+
+
+def test_run_rewritten_driver_success_returns_rewritten_reference_artifact(
+    monkeypatch, tmp_path
+):
+    """On exit 0 with a parseable reference.json, run_rewritten_driver returns status='ok' with the single-element artifacts list ['baselines/<stem>/rewritten/reference.json']."""
+    monkeypatch.chdir(tmp_path)
+    rewritten_dir = _stage_rewritten_driver_binary(tmp_path, "nbody_force")
+
+    class OkProc:
+        returncode = 0
+        stdout = "all good"
+        stderr = ""
+
+    def fake_run(cmd, **kw):
+        (rewritten_dir / "reference.json").write_text(
+            json.dumps({"outputs": [1.0, 2.0]})
+        )
+        return OkProc()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = run_rewritten_driver("nbody_force")
+
+    assert result["status"] == "ok"
+    assert result["stdout"] == "all good"
+    assert result["artifacts"] == [
+        "baselines/nbody_force/rewritten/reference.json"
+    ]
+
+
+def test_run_rewritten_driver_does_not_touch_baseline_reference(
+    monkeypatch, tmp_path
+):
+    """run_rewritten_driver must not overwrite, delete, or even observe a pre-existing baselines/<stem>/reference.json from the baseline run. The two trees are independent artifacts the future comparator needs both of."""
+    monkeypatch.chdir(tmp_path)
+    rewritten_dir = _stage_rewritten_driver_binary(tmp_path, "nbody_force")
+
+    # Pre-existing baseline reference that must survive byte-identically.
+    baseline_dir = tmp_path / "baselines" / "nbody_force"
+    sentinel_bytes = b'{"baseline_sentinel": "do not touch"}'
+    (baseline_dir / "reference.json").write_bytes(sentinel_bytes)
+
+    class OkProc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(cmd, **kw):
+        (rewritten_dir / "reference.json").write_text(json.dumps({"ok": 1}))
+        return OkProc()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    run_rewritten_driver("nbody_force")
+
+    # Baseline file must be byte-identical to what we wrote.
+    assert (baseline_dir / "reference.json").read_bytes() == sentinel_bytes
+
+
+def test_run_rewritten_driver_deletes_stale_rewritten_reference_before_run(
+    monkeypatch, tmp_path
+):
+    """Any pre-existing baselines/<stem>/rewritten/reference.json is deleted before the subprocess runs, so a failed rewritten driver cannot leave the orchestrator with a misleadingly-stale file (same guarantee run_baseline_driver makes, scoped to the rewritten subtree)."""
+    monkeypatch.chdir(tmp_path)
+    rewritten_dir = _stage_rewritten_driver_binary(tmp_path, "nbody_force")
+    stale = rewritten_dir / "reference.json"
+    stale.write_text(json.dumps({"stale": True}))
+
+    observed_at_run = {}
+
+    class FailProc:
+        returncode = 1
+        stdout = ""
+        stderr = "boom"
+
+    def fake_run(cmd, **kw):
+        observed_at_run["stale_exists"] = stale.exists()
+        return FailProc()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = run_rewritten_driver("nbody_force")
+
+    assert observed_at_run["stale_exists"] is False
+    assert result["status"] == "error"
+
+
+def test_run_rewritten_driver_errors_on_timeout(monkeypatch, tmp_path):
+    """If the rewritten driver exceeds the configured timeout, run_rewritten_driver catches TimeoutExpired and returns status='error' naming the timeout and the env var (same shape as run_baseline_driver)."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv(RUN_TIMEOUT_ENV, "5")
+    _stage_rewritten_driver_binary(tmp_path, "nbody_force")
+
+    def raise_timeout(*a, **kw):
+        raise subprocess.TimeoutExpired(cmd=["./driver"], timeout=5)
+
+    monkeypatch.setattr(subprocess, "run", raise_timeout)
+
+    result = run_rewritten_driver("nbody_force")
+
+    assert result["status"] == "error"
+    assert "timeout" in result["stderr"].lower()
+    assert "5" in result["stderr"]
+    assert RUN_TIMEOUT_ENV in result["stderr"]
+    assert result["artifacts"] == []
+
+
+def test_run_rewritten_driver_result_keys_are_stable(monkeypatch, tmp_path):
+    """Every code path returns a dict with exactly the keys {status, stdout, stderr, artifacts} — same shape as run_baseline_driver and the other deterministic tools."""
+    expected_keys = {"status", "stdout", "stderr", "artifacts"}
+    monkeypatch.chdir(tmp_path)
+
+    # 1) bad env timeout
+    monkeypatch.setenv(RUN_TIMEOUT_ENV, "not_an_int")
+    assert set(run_rewritten_driver("x").keys()) == expected_keys
+    monkeypatch.delenv(RUN_TIMEOUT_ENV, raising=False)
+
+    # 2) missing binary
+    assert set(run_rewritten_driver("x").keys()) == expected_keys
+
+    # 3) success
+    _stage_rewritten_driver_binary(tmp_path, "x", reference_payload={"ok": 1})
+
+    class OkProc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: OkProc())
+    assert set(run_rewritten_driver("x").keys()) == expected_keys
+
+    # 4) non-zero exit
+    class FailProc:
+        returncode = 9
+        stdout = ""
+        stderr = "boom"
+
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: FailProc())
+    assert set(run_rewritten_driver("x").keys()) == expected_keys
+
+    # 5) timeout
+    def raise_timeout(*a, **kw):
+        raise subprocess.TimeoutExpired(cmd=["./driver"], timeout=1)
+
+    monkeypatch.setattr(subprocess, "run", raise_timeout)
+    assert set(run_rewritten_driver("x").keys()) == expected_keys

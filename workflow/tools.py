@@ -37,6 +37,13 @@ Currently exposes:
     splice_rewritten_kernel) into baselines/<kernel_stem>/rewritten/
     driver. Shares the env-var contract, compile flags, and result
     schema of compile_baseline_driver; only the directory differs.
+
+  - run_rewritten_driver(kernel_stem): execute the compiled rewritten
+    driver at baselines/<kernel_stem>/rewritten/driver and verify it
+    produces a parseable baselines/<kernel_stem>/rewritten/reference.json.
+    Shares the env-var contract (AGENT_PRECISION_RUN_TIMEOUT_SEC),
+    subprocess shape, and result schema of run_baseline_driver; only
+    the directory differs. The baseline tree is never touched.
 """
 
 from __future__ import annotations
@@ -235,23 +242,30 @@ def _parse_timeout(raw: str) -> int | None:
     return value
 
 
-def run_baseline_driver(kernel_stem: str) -> dict:
-    """Execute baselines/<kernel_stem>/driver and validate reference.json.
+def _run_driver(driver_dir: Path, missing_binary_hint: str) -> dict:
+    """Execute <driver_dir>/driver and validate <driver_dir>/reference.json.
 
-    The driver is invoked with cwd=baselines/<kernel_stem>/ so the
-    `./reference.json` path the baseline_harness prompt mandates lands
-    next to the driver source/binary. Returns a uniform
-    `{status, stdout, stderr, artifacts}` dict (the same shape as
-    compile_baseline_driver and the planned remote-batch verifier
-    tools), where `status` is 'ok' on a clean run + parseable JSON and
-    'error' otherwise. On success, `artifacts` is the single-element
-    list `["baselines/<kernel_stem>/reference.json"]`.
+    Shared implementation behind run_baseline_driver and
+    run_rewritten_driver. The two public wrappers differ only in
+    which directory they target — the env-var parsing, preflight
+    checks, stale-reference deletion, subprocess invocation, timeout
+    handling, JSON validation, and result schema are identical.
+    Pulling the body here keeps the dynamic-verification chain
+    (splice -> compile_rewritten -> run_rewritten -> compare) from
+    drifting from the baseline chain it parallels.
+
+    `missing_binary_hint` is the human-readable hint appended to the
+    "driver binary not found" error so the operator knows which
+    upstream tool was supposed to have produced that file (e.g.
+    compile_baseline_driver for the baseline, compile_rewritten_driver
+    for the rewritten variant). Everything else about the error
+    results is identical across the two wrappers.
 
     Any pre-existing reference.json at the target path is deleted
     before the subprocess runs so that, on a failed run, the orchestrator
-    does not see a misleadingly-stale reference. Compile/run failures
-    are non-fatal to the surrounding pipeline; the orchestrator treats
-    this whole side artifact as optional.
+    does not see a misleadingly-stale reference. Run failures are
+    non-fatal to the surrounding pipeline; the orchestrator treats this
+    whole side artifact as optional.
     """
     raw_timeout = os.environ.get(RUN_TIMEOUT_ENV)
     if raw_timeout is None:
@@ -265,15 +279,12 @@ def run_baseline_driver(kernel_stem: str) -> dict:
             )
         timeout = parsed
 
-    driver_dir = Path("baselines") / kernel_stem
     driver_bin = driver_dir / "driver"
     reference_path = driver_dir / "reference.json"
 
     if not driver_bin.is_file():
         return _error(
-            f"Driver binary not found at {driver_bin}. Did "
-            f"compile_baseline_driver run and succeed for this "
-            f"kernel_stem?"
+            f"Driver binary not found at {driver_bin}. {missing_binary_hint}"
         )
     if not os.access(driver_bin, os.X_OK):
         return _error(
@@ -349,6 +360,60 @@ def run_baseline_driver(kernel_stem: str) -> dict:
         "stderr": proc.stderr,
         "artifacts": [str(reference_path)],
     }
+
+
+def run_baseline_driver(kernel_stem: str) -> dict:
+    """Execute baselines/<kernel_stem>/driver and validate reference.json.
+
+    The driver is invoked with cwd=baselines/<kernel_stem>/ so the
+    `./reference.json` path the baseline_harness prompt mandates lands
+    next to the driver source/binary. Returns a uniform
+    `{status, stdout, stderr, artifacts}` dict (the same shape as
+    compile_baseline_driver and the planned remote-batch verifier
+    tools), where `status` is 'ok' on a clean run + parseable JSON and
+    'error' otherwise. On success, `artifacts` is the single-element
+    list `["baselines/<kernel_stem>/reference.json"]`.
+
+    Any pre-existing reference.json at the target path is deleted
+    before the subprocess runs so that, on a failed run, the orchestrator
+    does not see a misleadingly-stale reference. Compile/run failures
+    are non-fatal to the surrounding pipeline; the orchestrator treats
+    this whole side artifact as optional.
+    """
+    return _run_driver(
+        Path("baselines") / kernel_stem,
+        missing_binary_hint=(
+            "Did compile_baseline_driver run and succeed for this "
+            "kernel_stem?"
+        ),
+    )
+
+
+def run_rewritten_driver(kernel_stem: str) -> dict:
+    """Execute baselines/<kernel_stem>/rewritten/driver and validate JSON.
+
+    Companion to run_baseline_driver, targeting the rewritten driver
+    produced by compile_rewritten_driver. Same env-var contract
+    (AGENT_PRECISION_RUN_TIMEOUT_SEC), same subprocess shape, same
+    result schema. The rewritten driver runs with cwd set to
+    baselines/<kernel_stem>/rewritten/, so its `./reference.json`
+    lands inside the rewritten subtree and the baseline tree
+    (baselines/<kernel_stem>/{driver.cpp, driver, reference.json}) is
+    never touched by this call.
+
+    Like the baseline run, this is a side artifact: a non-zero run
+    result is non-fatal to the surrounding pipeline (the analyst ->
+    rewriter -> verifier loop still runs, and finish remains reachable
+    on verifier accept). On success, `artifacts` is the single-element
+    list `["baselines/<kernel_stem>/rewritten/reference.json"]`.
+    """
+    return _run_driver(
+        Path("baselines") / kernel_stem / "rewritten",
+        missing_binary_hint=(
+            "Did compile_rewritten_driver run and succeed for this "
+            "kernel_stem?"
+        ),
+    )
 
 
 def _find_unique_sentinel_line(lines: list[str], sentinel: str) -> int | None:

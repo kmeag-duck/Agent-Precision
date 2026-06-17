@@ -1041,3 +1041,113 @@ def test_execute_tool_compile_rewritten_driver_error_passes_through(monkeypatch)
     assert "rewritten/driver.cpp" in result["stderr"]
     assert "splice_rewritten_kernel" in result["stderr"]
     assert result["artifacts"] == []
+
+
+# ---------- run_rewritten_driver: tool schema + prompt + dispatch ----------
+
+
+def test_orchestrator_tools_include_run_rewritten_driver():
+    """ORCHESTRATOR_TOOLS exposes run_rewritten_driver with kernel_stem as its only required string input — same shape as run_baseline_driver."""
+    by_name = {t["name"]: t for t in ORCHESTRATOR_TOOLS}
+    assert "run_rewritten_driver" in by_name
+    tool = by_name["run_rewritten_driver"]
+    props = tool["input_schema"]["properties"]
+    assert "kernel_stem" in props
+    assert props["kernel_stem"]["type"] == "string"
+    assert tool["input_schema"]["required"] == ["kernel_stem"]
+
+
+def test_orchestrator_prompt_mentions_run_rewritten_driver():
+    """The orchestrator prompt names run_rewritten_driver, ties it to a preceding successful compile_rewritten_driver, and states a rewritten-run error must not block finish."""
+    text = ORCHESTRATOR_SYSTEM_PROMPT
+    assert "run_rewritten_driver" in text
+    # Must be conditioned on the rewritten-compile step succeeding,
+    # never a standalone instruction.
+    assert "compile_rewritten_driver" in text
+    # Must be flagged as non-blocking for finish, mirroring the rest of
+    # the baseline + dynamic-verification chain. The wording matches
+    # either of the two phrasings used elsewhere in the prompt.
+    assert (
+        "must NOT block finish" in text
+        or "not a precondition for finish" in text.lower()
+    )
+
+
+def test_format_baseline_block_cpp_mentions_run_rewritten_step():
+    """For a .cpp kernel, the BASELINE STEP block tells the orchestrator to call run_rewritten_driver immediately after a successful compile_rewritten_driver — and still mentions the upstream splice/compile_rewritten steps."""
+    block = _format_baseline_block(
+        "test-kernels/kokkos/mixed/nbody_force.cpp", None
+    )
+    assert "run_rewritten_driver" in block
+    # Must be coupled to compile_rewritten success — never standalone.
+    assert "compile_rewritten_driver" in block
+    # The whole rewritten chain must still be visible in the block so
+    # the orchestrator does not lose context of how it got here.
+    assert "splice_rewritten_kernel" in block
+
+
+def test_format_baseline_block_cu_does_not_mention_run_rewritten_step():
+    """For a CUDA .cu kernel, the (skipped) BASELINE STEP block must NOT mention run_rewritten_driver — it depends on compile_rewritten, which depends on splice, which depends on the baseline chain, which is forbidden for .cu inputs."""
+    block = _format_baseline_block(
+        "test-kernels/cuda/lowerable/vector_add.cu", None
+    )
+    assert "run_rewritten_driver" not in block
+
+
+def test_execute_tool_dispatches_run_rewritten_driver(monkeypatch):
+    """_execute_tool routes run_rewritten_driver to workflow.tools.run_rewritten_driver, forwards the kernel_stem argument, and returns its {status, stdout, stderr, artifacts} dict verbatim (no extra wrapping)."""
+    captured = {}
+
+    def stub_run(kernel_stem):
+        captured["kernel_stem"] = kernel_stem
+        return {
+            "status": "ok",
+            "stdout": "rewritten driver ran",
+            "stderr": "",
+            "artifacts": [
+                "baselines/nbody_force/rewritten/reference.json"
+            ],
+        }
+
+    monkeypatch.setattr(orchestrator, "run_rewritten_driver", stub_run)
+
+    result = _execute_tool(
+        "run_rewritten_driver", {"kernel_stem": "nbody_force"}
+    )
+
+    assert captured == {"kernel_stem": "nbody_force"}
+    # Verbatim pass-through — same shape future remote-batch tools share.
+    assert result == {
+        "status": "ok",
+        "stdout": "rewritten driver ran",
+        "stderr": "",
+        "artifacts": [
+            "baselines/nbody_force/rewritten/reference.json"
+        ],
+    }
+
+
+def test_execute_tool_run_rewritten_driver_error_passes_through(monkeypatch):
+    """When the rewritten-run helper returns status='error' (e.g. missing binary, non-zero exit, timeout, invalid JSON), _execute_tool passes that result through unchanged so the orchestrator sees the same error shape as a successful tool result."""
+    monkeypatch.setattr(
+        orchestrator,
+        "run_rewritten_driver",
+        lambda stem: {
+            "status": "error",
+            "stdout": "",
+            "stderr": (
+                "Driver binary not found at "
+                "baselines/x/rewritten/driver. Did "
+                "compile_rewritten_driver run and succeed for this "
+                "kernel_stem?"
+            ),
+            "artifacts": [],
+        },
+    )
+    result = _execute_tool(
+        "run_rewritten_driver", {"kernel_stem": "x"}
+    )
+    assert result["status"] == "error"
+    assert "rewritten/driver" in result["stderr"]
+    assert "compile_rewritten_driver" in result["stderr"]
+    assert result["artifacts"] == []
