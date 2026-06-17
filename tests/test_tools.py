@@ -6,7 +6,11 @@ run_baseline_driver — env-var parsing, missing/non-executable binary,
 clean run + reference.json validation, non-zero exit, timeout, and
 the same uniform result schema. Also covers splice_rewritten_kernel —
 sentinel discovery, error cases, round-trip identity, byte-preservation
-outside the sentinels, and the same uniform result schema. All tests
+outside the sentinels, and the same uniform result schema. Finally
+covers compile_rewritten_driver — env-var contract shared with the
+baseline compile, rewritten-subdir source/output paths, missing-source
+hint blaming splice_rewritten_kernel, baseline-binary preservation,
+and compile-flag parity with compile_baseline_driver. All tests
 monkeypatch subprocess.run so no real compiler or driver invocation
 happens.
 """
@@ -24,6 +28,7 @@ from workflow.tools import (
     KOKKOS_ROOT_ENV,
     RUN_TIMEOUT_ENV,
     compile_baseline_driver,
+    compile_rewritten_driver,
     run_baseline_driver,
     splice_rewritten_kernel,
 )
@@ -1003,3 +1008,275 @@ def test_splice_rewritten_kernel_result_keys_are_stable(monkeypatch, tmp_path):
         set(splice_rewritten_kernel(bad_stem, "void kernel() {}\n").keys())
         == expected_keys
     )
+
+
+# ---------- compile_rewritten_driver: env-var + missing source + success ----------
+
+
+def _stage_rewritten_driver(tmp_path, stem, body="int main(){return 0;}\n"):
+    """Write a placeholder baselines/<stem>/rewritten/driver.cpp under tmp_path.
+
+    Mirrors _stage_driver but targets the rewritten subdirectory that
+    splice_rewritten_kernel populates.
+    """
+    rewritten_dir = tmp_path / "baselines" / stem / "rewritten"
+    rewritten_dir.mkdir(parents=True)
+    (rewritten_dir / "driver.cpp").write_text(body)
+    return rewritten_dir
+
+
+def test_compile_rewritten_driver_errors_when_env_unset(monkeypatch, tmp_path):
+    """compile_rewritten_driver returns status='error' with no subprocess call when AGENT_PRECISION_KOKKOS_ROOT is unset (same env contract as compile_baseline_driver)."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv(KOKKOS_ROOT_ENV, raising=False)
+
+    def fail_run(*a, **kw):
+        raise AssertionError(
+            "subprocess.run must not be called when env unset"
+        )
+
+    monkeypatch.setattr(subprocess, "run", fail_run)
+
+    result = compile_rewritten_driver("nbody_force")
+
+    assert result["status"] == "error"
+    assert KOKKOS_ROOT_ENV in result["stderr"]
+    assert result["artifacts"] == []
+
+
+def test_compile_rewritten_driver_errors_when_env_points_at_non_kokkos(
+    monkeypatch, tmp_path
+):
+    """compile_rewritten_driver returns status='error' when AGENT_PRECISION_KOKKOS_ROOT points at a directory missing include/ or lib/ (same env contract as compile_baseline_driver)."""
+    monkeypatch.chdir(tmp_path)
+    bogus = tmp_path / "bogus_root"
+    bogus.mkdir()
+    monkeypatch.setenv(KOKKOS_ROOT_ENV, str(bogus))
+
+    def fail_run(*a, **kw):
+        raise AssertionError(
+            "subprocess.run must not be called for an invalid Kokkos root"
+        )
+
+    monkeypatch.setattr(subprocess, "run", fail_run)
+
+    result = compile_rewritten_driver("nbody_force")
+
+    assert result["status"] == "error"
+    assert "include/" in result["stderr"] or "lib/" in result["stderr"]
+    assert result["artifacts"] == []
+
+
+def test_compile_rewritten_driver_errors_when_driver_source_missing(
+    monkeypatch, tmp_path
+):
+    """compile_rewritten_driver returns status='error' (no subprocess call) when baselines/<stem>/rewritten/driver.cpp does not exist, and the error names splice_rewritten_kernel as the upstream tool that was supposed to have written it (NOT spawn_baseline_harness)."""
+    monkeypatch.chdir(tmp_path)
+    root = _make_fake_kokkos_root(tmp_path)
+    monkeypatch.setenv(KOKKOS_ROOT_ENV, str(root))
+
+    def fail_run(*a, **kw):
+        raise AssertionError(
+            "subprocess.run must not be called when driver source is missing"
+        )
+
+    monkeypatch.setattr(subprocess, "run", fail_run)
+
+    result = compile_rewritten_driver("nbody_force")
+
+    assert result["status"] == "error"
+    # Path must point at the rewritten subdirectory, not the baseline.
+    assert "rewritten/driver.cpp" in result["stderr"]
+    # Hint must blame splice, not the baseline harness.
+    assert "splice_rewritten_kernel" in result["stderr"]
+    assert "spawn_baseline_harness" not in result["stderr"]
+    assert result["artifacts"] == []
+
+
+def test_compile_rewritten_driver_success_targets_rewritten_subdir(
+    monkeypatch, tmp_path
+):
+    """On a successful compile, compile_rewritten_driver shells out to g++ with the rewritten driver source as input and writes the binary to baselines/<stem>/rewritten/driver — NOT the baseline path."""
+    monkeypatch.chdir(tmp_path)
+    root = _make_fake_kokkos_root(tmp_path)
+    monkeypatch.setenv(KOKKOS_ROOT_ENV, str(root))
+    _stage_rewritten_driver(tmp_path, "nbody_force")
+
+    captured = {}
+
+    class FakeProc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(cmd, capture_output, text, check):
+        captured["cmd"] = cmd
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = compile_rewritten_driver("nbody_force")
+
+    assert result["status"] == "ok"
+    assert result["artifacts"] == [
+        "baselines/nbody_force/rewritten/driver"
+    ]
+    cmd = captured["cmd"]
+    # Input source path is the rewritten one, NOT the baseline.
+    assert "baselines/nbody_force/rewritten/driver.cpp" in cmd
+    assert "baselines/nbody_force/driver.cpp" not in cmd
+    # Output binary lives in the rewritten subdir.
+    assert "-o" in cmd
+    assert cmd[cmd.index("-o") + 1] == "baselines/nbody_force/rewritten/driver"
+
+
+def test_compile_rewritten_driver_shares_compile_flags_with_baseline(
+    monkeypatch, tmp_path
+):
+    """compile_rewritten_driver uses the same compiler, C++ standard, Kokkos include/lib flags, and link libraries as compile_baseline_driver — only the source/output directory differs. Protects against accidental drift between the parallel chains."""
+    monkeypatch.chdir(tmp_path)
+    root = _make_fake_kokkos_root(tmp_path)
+    monkeypatch.setenv(KOKKOS_ROOT_ENV, str(root))
+    _stage_driver(tmp_path, "k")
+    _stage_rewritten_driver(tmp_path, "k")
+
+    cmds = []
+
+    class FakeProc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda cmd, **kw: (cmds.append(cmd), FakeProc())[1],
+    )
+
+    compile_baseline_driver("k")
+    compile_rewritten_driver("k")
+
+    base_cmd, rewritten_cmd = cmds
+    # Strip the source path and the -o target path; the rest of the
+    # command must match byte-for-byte.
+    def _normalize(c):
+        return [
+            x for x in c
+            if x != "baselines/k/driver.cpp"
+            and x != "baselines/k/driver"
+            and x != "baselines/k/rewritten/driver.cpp"
+            and x != "baselines/k/rewritten/driver"
+        ]
+
+    assert _normalize(base_cmd) == _normalize(rewritten_cmd)
+
+
+def test_compile_rewritten_driver_compile_failure_propagates_stderr(
+    monkeypatch, tmp_path
+):
+    """A non-zero g++ exit produces status='error' with the captured stderr, no artifacts, and an exit-code line — same error shape as compile_baseline_driver."""
+    monkeypatch.chdir(tmp_path)
+    root = _make_fake_kokkos_root(tmp_path)
+    monkeypatch.setenv(KOKKOS_ROOT_ENV, str(root))
+    _stage_rewritten_driver(tmp_path, "nbody_force")
+
+    class FakeProc:
+        returncode = 1
+        stdout = ""
+        stderr = "rewritten/driver.cpp:9: error: invalid conversion\n"
+
+    monkeypatch.setattr(
+        subprocess, "run", lambda *a, **kw: FakeProc()
+    )
+
+    result = compile_rewritten_driver("nbody_force")
+
+    assert result["status"] == "error"
+    assert "exited with code 1" in result["stderr"]
+    assert "invalid conversion" in result["stderr"]
+    assert result["artifacts"] == []
+
+
+def test_compile_rewritten_driver_handles_missing_gxx(monkeypatch, tmp_path):
+    """If g++ is not on PATH, compile_rewritten_driver returns status='error' (it does not crash the orchestrator) — same as compile_baseline_driver."""
+    monkeypatch.chdir(tmp_path)
+    root = _make_fake_kokkos_root(tmp_path)
+    monkeypatch.setenv(KOKKOS_ROOT_ENV, str(root))
+    _stage_rewritten_driver(tmp_path, "nbody_force")
+
+    def raise_fnf(*a, **kw):
+        raise FileNotFoundError("g++")
+
+    monkeypatch.setattr(subprocess, "run", raise_fnf)
+
+    result = compile_rewritten_driver("nbody_force")
+
+    assert result["status"] == "error"
+    assert "g++" in result["stderr"]
+    assert result["artifacts"] == []
+
+
+def test_compile_rewritten_driver_does_not_touch_baseline_binary(
+    monkeypatch, tmp_path
+):
+    """compile_rewritten_driver must not overwrite a pre-existing baselines/<stem>/driver binary — the rewritten and baseline binaries are separate artifacts and the comparator needs both intact."""
+    monkeypatch.chdir(tmp_path)
+    root = _make_fake_kokkos_root(tmp_path)
+    monkeypatch.setenv(KOKKOS_ROOT_ENV, str(root))
+    _stage_rewritten_driver(tmp_path, "k")
+
+    # Pre-existing baseline binary that must survive untouched.
+    baseline_dir = tmp_path / "baselines" / "k"
+    baseline_dir.mkdir(parents=True, exist_ok=True)
+    baseline_bin = baseline_dir / "driver"
+    baseline_bin.write_bytes(b"ORIGINAL BASELINE BINARY")
+
+    class FakeProc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    monkeypatch.setattr(
+        subprocess, "run", lambda *a, **kw: FakeProc()
+    )
+
+    compile_rewritten_driver("k")
+
+    assert baseline_bin.read_bytes() == b"ORIGINAL BASELINE BINARY"
+
+
+def test_compile_rewritten_driver_result_keys_are_stable(
+    monkeypatch, tmp_path
+):
+    """Every code path returns a dict with exactly the keys {status, stdout, stderr, artifacts} — same shape as compile_baseline_driver / run_baseline_driver / splice_rewritten_kernel / planned remote-batch verifier tools."""
+    expected_keys = {"status", "stdout", "stderr", "artifacts"}
+
+    # 1) env unset
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv(KOKKOS_ROOT_ENV, raising=False)
+    assert set(compile_rewritten_driver("x").keys()) == expected_keys
+
+    # 2) env set but no rewritten source
+    root = _make_fake_kokkos_root(tmp_path)
+    monkeypatch.setenv(KOKKOS_ROOT_ENV, str(root))
+    assert set(compile_rewritten_driver("x").keys()) == expected_keys
+
+    # 3) success
+    _stage_rewritten_driver(tmp_path, "x")
+
+    class OkProc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: OkProc())
+    assert set(compile_rewritten_driver("x").keys()) == expected_keys
+
+    # 4) failure
+    class FailProc:
+        returncode = 2
+        stdout = ""
+        stderr = "boom"
+
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: FailProc())
+    assert set(compile_rewritten_driver("x").keys()) == expected_keys

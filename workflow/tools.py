@@ -31,6 +31,12 @@ Currently exposes:
     with the supplied rewritten kernel source, and write the result to
     baselines/<kernel_stem>/rewritten/driver.cpp. Pure text I/O; never
     invokes a subprocess and never modifies the baseline file in place.
+
+  - compile_rewritten_driver(kernel_stem): compile
+    baselines/<kernel_stem>/rewritten/driver.cpp (produced by
+    splice_rewritten_kernel) into baselines/<kernel_stem>/rewritten/
+    driver. Shares the env-var contract, compile flags, and result
+    schema of compile_baseline_driver; only the directory differs.
 """
 
 from __future__ import annotations
@@ -89,19 +95,23 @@ def _error(stderr: str) -> dict:
     }
 
 
-def compile_baseline_driver(kernel_stem: str) -> dict:
-    """Compile baselines/<kernel_stem>/driver.cpp against the local Kokkos.
+def _compile_driver(driver_dir: Path, missing_source_hint: str) -> dict:
+    """Compile <driver_dir>/driver.cpp into <driver_dir>/driver.
 
-    Reads the Kokkos install prefix from the AGENT_PRECISION_KOKKOS_ROOT
-    environment variable. Returns a `{status, stdout, stderr, artifacts}`
-    dict, where `status` is 'ok' on a successful compile and 'error'
-    otherwise. `artifacts` is a list of created/expected output paths
-    (the driver binary) — empty on error.
+    Shared implementation behind compile_baseline_driver and
+    compile_rewritten_driver. The two public wrappers differ only in
+    which directory they target — the env-var checks, command shape,
+    subprocess invocation, error wrapping, and result schema are
+    identical. Pulling the body here keeps the dynamic-verification
+    chain (splice -> compile_rewritten -> run_rewritten -> compare)
+    from drifting from the baseline chain it parallels.
 
-    The driver source is expected to already exist at
-    baselines/<kernel_stem>/driver.cpp (written by the baseline_harness
-    agent on HITL approval). This helper does not run the compiled
-    binary; that is a separate step.
+    `missing_source_hint` is the human-readable hint appended to the
+    "driver source not found" error so the operator knows which
+    upstream tool was supposed to have written that file (e.g.
+    spawn_baseline_harness for the baseline, splice_rewritten_kernel
+    for the rewritten variant). Everything else about the error result
+    is identical across the two wrappers.
     """
     kokkos_root = os.environ.get(KOKKOS_ROOT_ENV)
     if not kokkos_root:
@@ -118,14 +128,11 @@ def compile_baseline_driver(kernel_stem: str) -> dict:
             f"Kokkos install prefix (missing include/ or lib/)."
         )
 
-    driver_dir = Path("baselines") / kernel_stem
     driver_src = driver_dir / "driver.cpp"
     driver_bin = driver_dir / "driver"
     if not driver_src.is_file():
         return _error(
-            f"Driver source not found at {driver_src}. Did "
-            f"spawn_baseline_harness run and get approved for this "
-            f"kernel_stem?"
+            f"Driver source not found at {driver_src}. {missing_source_hint}"
         )
 
     cmd = [
@@ -169,6 +176,52 @@ def compile_baseline_driver(kernel_stem: str) -> dict:
         "stderr": proc.stderr,
         "artifacts": [str(driver_bin)],
     }
+
+
+def compile_baseline_driver(kernel_stem: str) -> dict:
+    """Compile baselines/<kernel_stem>/driver.cpp against the local Kokkos.
+
+    Reads the Kokkos install prefix from the AGENT_PRECISION_KOKKOS_ROOT
+    environment variable. Returns a `{status, stdout, stderr, artifacts}`
+    dict, where `status` is 'ok' on a successful compile and 'error'
+    otherwise. `artifacts` is a list of created/expected output paths
+    (the driver binary) — empty on error.
+
+    The driver source is expected to already exist at
+    baselines/<kernel_stem>/driver.cpp (written by the baseline_harness
+    agent on HITL approval). This helper does not run the compiled
+    binary; that is a separate step.
+    """
+    return _compile_driver(
+        Path("baselines") / kernel_stem,
+        missing_source_hint=(
+            "Did spawn_baseline_harness run and get approved for this "
+            "kernel_stem?"
+        ),
+    )
+
+
+def compile_rewritten_driver(kernel_stem: str) -> dict:
+    """Compile baselines/<kernel_stem>/rewritten/driver.cpp.
+
+    Companion to compile_baseline_driver, targeting the rewritten
+    driver produced by splice_rewritten_kernel. Same env-var contract
+    (AGENT_PRECISION_KOKKOS_ROOT), same compile flags, same result
+    schema. The compiled binary lands at
+    baselines/<kernel_stem>/rewritten/driver, alongside the source.
+
+    Like the baseline compile, this is a side artifact: a non-zero
+    compile result is non-fatal to the surrounding pipeline (the
+    analyst -> rewriter -> verifier loop still runs, and finish remains
+    reachable on verifier accept).
+    """
+    return _compile_driver(
+        Path("baselines") / kernel_stem / "rewritten",
+        missing_source_hint=(
+            "Did splice_rewritten_kernel run and get approved for this "
+            "kernel_stem?"
+        ),
+    )
 
 
 def _parse_timeout(raw: str) -> int | None:
