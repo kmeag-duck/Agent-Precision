@@ -22,6 +22,7 @@ import anthropic
 from .run_agent import run_agent
 from .tools import (
     compile_baseline_driver,
+    compile_rewritten_driver,
     run_baseline_driver,
     splice_rewritten_kernel,
 )
@@ -172,6 +173,19 @@ You also have two deterministic (non-LLM) tools:
     or returned an error. The spliced driver is a precursor for a
     future mechanical comparator; like the baseline chain, a splice
     error must NOT block finish on its own.
+
+  - compile_rewritten_driver: takes a kernel_stem and compiles
+    baselines/<kernel_stem>/rewritten/driver.cpp (produced by a prior
+    splice_rewritten_kernel call) into baselines/<kernel_stem>/
+    rewritten/driver, using the same AGENT_PRECISION_KOKKOS_ROOT
+    install and the same flags as compile_baseline_driver. Returns
+    {status, stdout, stderr, artifacts}. Call this exactly once per
+    accepted verifier verdict, immediately after a successful
+    splice_rewritten_kernel call, with the same kernel_stem. Do not
+    call it if splice_rewritten_kernel was skipped, rejected, or
+    returned an error. The compiled rewritten driver is a precursor
+    for a future mechanical comparator; like the splice step, a
+    compile error here must NOT block finish on its own.
 
 You also have a finish tool to emit the final answer.
 
@@ -388,11 +402,11 @@ ORCHESTRATOR_TOOLS = [
                     "type": "string",
                     "description": (
                         "Filesystem-safe short name for this kernel "
-                        "(typically the input file stem, e.g. "
-                        "'nbody_force'). The orchestrator writes the "
-                        "approved driver to baselines/<kernel_stem>/"
-                        "driver.cpp. Use exactly the KERNEL STEM value "
-                        "given in the user message."
+                        "(typically the input file stem). The "
+                        "orchestrator writes the approved driver to "
+                        "baselines/<kernel_stem>/driver.cpp. Use "
+                        "exactly the KERNEL STEM value given in the "
+                        "user message."
                     ),
                 },
             },
@@ -503,6 +517,36 @@ ORCHESTRATOR_TOOLS = [
         },
     },
     {
+        "name": "compile_rewritten_driver",
+        "description": (
+            "Deterministic (non-LLM) tool. Compiles "
+            "baselines/<kernel_stem>/rewritten/driver.cpp (produced by a "
+            "prior splice_rewritten_kernel call) into "
+            "baselines/<kernel_stem>/rewritten/driver, using the same "
+            "AGENT_PRECISION_KOKKOS_ROOT install and the same compile "
+            "flags as compile_baseline_driver. Returns "
+            "{status, stdout, stderr, artifacts}. Call exactly once per "
+            "accepted verifier verdict, immediately after a successful "
+            "splice_rewritten_kernel, with the same kernel_stem. The "
+            "compiled rewritten driver is a precursor for a future "
+            "mechanical comparator and is not a precondition for finish."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "kernel_stem": {
+                    "type": "string",
+                    "description": (
+                        "Filesystem-safe short name for this kernel; "
+                        "MUST match the kernel_stem passed to the "
+                        "preceding splice_rewritten_kernel call."
+                    ),
+                },
+            },
+            "required": ["kernel_stem"],
+        },
+    },
+    {
         "name": "finish",
         "description": "Terminate the workflow with the final rewritten kernel.",
         "input_schema": {
@@ -610,6 +654,13 @@ def _execute_tool(tool_name: str, tool_input: dict) -> dict:
             tool_input["kernel_stem"],
             tool_input["rewritten_kernel_source"],
         )
+    if tool_name == "compile_rewritten_driver":
+        # Deterministic tool (no LLM call): same g++ invocation as
+        # compile_baseline_driver but targeting the spliced source at
+        # baselines/<stem>/rewritten/driver.cpp -> .../rewritten/driver.
+        # Returns the same {status, stdout, stderr, artifacts} shape
+        # verbatim.
+        return compile_rewritten_driver(tool_input["kernel_stem"])
     raise ValueError(f"Unknown tool: {tool_name}")
 
 
@@ -689,7 +740,10 @@ def _format_baseline_block(kernel_path: str, kernel_name: str | None) -> str:
         "preceding run_baseline_driver returned status='ok', call "
         "splice_rewritten_kernel exactly once with the same KERNEL STEM "
         "and the rewriter's accepted rewritten kernel source as "
-        "rewritten_kernel_source. A splice error must NOT block finish."
+        "rewritten_kernel_source. If (and only if) splice_rewritten_kernel "
+        "returns status='ok', follow it immediately with a single call to "
+        "compile_rewritten_driver using the same KERNEL STEM. A splice or "
+        "rewritten-compile error must NOT block finish."
     )
 
 

@@ -938,3 +938,106 @@ def test_execute_tool_splice_rewritten_kernel_error_passes_through(monkeypatch):
     assert result["status"] == "error"
     assert "Baseline driver source not found" in result["stderr"]
     assert result["artifacts"] == []
+
+
+# ---------- compile_rewritten_driver: tool schema + prompt + dispatch ----------
+
+
+def test_orchestrator_tools_include_compile_rewritten_driver():
+    """ORCHESTRATOR_TOOLS exposes compile_rewritten_driver with kernel_stem as its only required string input — same shape as compile_baseline_driver."""
+    by_name = {t["name"]: t for t in ORCHESTRATOR_TOOLS}
+    assert "compile_rewritten_driver" in by_name
+    tool = by_name["compile_rewritten_driver"]
+    props = tool["input_schema"]["properties"]
+    assert "kernel_stem" in props
+    assert props["kernel_stem"]["type"] == "string"
+    assert tool["input_schema"]["required"] == ["kernel_stem"]
+
+
+def test_orchestrator_prompt_mentions_compile_rewritten_driver():
+    """The orchestrator prompt names compile_rewritten_driver, ties it to a preceding successful splice_rewritten_kernel, and states a rewritten-compile error must not block finish."""
+    text = ORCHESTRATOR_SYSTEM_PROMPT
+    assert "compile_rewritten_driver" in text
+    # Must be conditioned on splice success, not standalone.
+    assert "splice_rewritten_kernel" in text
+    # Must be flagged as non-blocking for finish, mirroring the rest of
+    # the baseline + dynamic-verification chain.
+    assert (
+        "must NOT block finish" in text
+        or "not a precondition for finish" in text.lower()
+    )
+
+
+def test_format_baseline_block_cpp_mentions_compile_rewritten_step():
+    """For a .cpp kernel, the BASELINE STEP block tells the orchestrator to call compile_rewritten_driver immediately after a successful splice_rewritten_kernel."""
+    block = _format_baseline_block(
+        "test-kernels/kokkos/mixed/nbody_force.cpp", None
+    )
+    assert "compile_rewritten_driver" in block
+    # Must be coupled to splice success — never a standalone instruction.
+    assert "splice_rewritten_kernel" in block
+
+
+def test_format_baseline_block_cu_does_not_mention_compile_rewritten_step():
+    """For a CUDA .cu kernel, the (skipped) BASELINE STEP block must NOT mention compile_rewritten_driver — it depends on splice, which depends on the baseline chain, which is forbidden for .cu inputs."""
+    block = _format_baseline_block(
+        "test-kernels/cuda/lowerable/vector_add.cu", None
+    )
+    assert "compile_rewritten_driver" not in block
+
+
+def test_execute_tool_dispatches_compile_rewritten_driver(monkeypatch):
+    """_execute_tool routes compile_rewritten_driver to workflow.tools.compile_rewritten_driver, forwards the kernel_stem argument, and returns its {status, stdout, stderr, artifacts} dict verbatim (no extra wrapping)."""
+    captured = {}
+
+    def stub_compile(kernel_stem):
+        captured["kernel_stem"] = kernel_stem
+        return {
+            "status": "ok",
+            "stdout": "",
+            "stderr": "",
+            "artifacts": ["baselines/nbody_force/rewritten/driver"],
+        }
+
+    monkeypatch.setattr(
+        orchestrator, "compile_rewritten_driver", stub_compile
+    )
+
+    result = _execute_tool(
+        "compile_rewritten_driver", {"kernel_stem": "nbody_force"}
+    )
+
+    assert captured == {"kernel_stem": "nbody_force"}
+    # Verbatim pass-through — same shape future remote-batch tools share.
+    assert result == {
+        "status": "ok",
+        "stdout": "",
+        "stderr": "",
+        "artifacts": ["baselines/nbody_force/rewritten/driver"],
+    }
+
+
+def test_execute_tool_compile_rewritten_driver_error_passes_through(monkeypatch):
+    """When the rewritten-compile helper returns status='error' (e.g. missing source, compile failure), _execute_tool passes that result through unchanged so the orchestrator sees the same error shape as a successful tool result."""
+    monkeypatch.setattr(
+        orchestrator,
+        "compile_rewritten_driver",
+        lambda stem: {
+            "status": "error",
+            "stdout": "",
+            "stderr": (
+                "Driver source not found at "
+                "baselines/x/rewritten/driver.cpp. Did "
+                "splice_rewritten_kernel run and get approved for this "
+                "kernel_stem?"
+            ),
+            "artifacts": [],
+        },
+    )
+    result = _execute_tool(
+        "compile_rewritten_driver", {"kernel_stem": "x"}
+    )
+    assert result["status"] == "error"
+    assert "rewritten/driver.cpp" in result["stderr"]
+    assert "splice_rewritten_kernel" in result["stderr"]
+    assert result["artifacts"] == []
