@@ -21,14 +21,19 @@ from __future__ import annotations
 from pathlib import Path
 
 from .base import LanguageProfile
+from .cuda import CUDA_PROFILE
 from .kokkos import KOKKOS_PROFILE
 
 # Ordered registry. Insertion order is the tie-break order in
 # detect_language()'s content-probe pass for ambiguous .cpp inputs:
 # Kokkos first preserves the historical default behavior, then SYCL /
-# HIP-cpp / OpenMP-offload as those profiles land.
+# HIP-cpp / OpenMP-offload as those profiles land. CUDA owns `.cu`
+# exclusively and so never participates in the content-probe pass —
+# its position in the registry is irrelevant to detection but kept
+# next to Kokkos for readability.
 PROFILES: dict[str, LanguageProfile] = {
     KOKKOS_PROFILE.id: KOKKOS_PROFILE,
+    CUDA_PROFILE.id: CUDA_PROFILE,
 }
 
 
@@ -87,6 +92,7 @@ __all__ = [
     "LanguageProfile",
     "PROFILES",
     "KOKKOS_PROFILE",
+    "CUDA_PROFILE",
     "get_profile_by_id",
     "detect_language",
 ]

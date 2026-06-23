@@ -130,30 +130,34 @@ You have access to five specialist agents:
     budget looks tight against the tolerance. It does not re-judge
     whether the verdict was numerically correct.
 
-  - baseline_harness: takes the original Kokkos C++ kernel source and a
-    short kernel_stem string, and returns a self-contained C++ driver
-    program that, when later compiled and run by the operator, exercises
-    the kernel on fixed inputs and writes a reproducible reference
-    output to ./reference.json. This is a SIDE ARTIFACT for a future
-    mechanical comparator — it is not consumed by the analyst, rewriter,
-    or verifier in this run, and it is not a precondition for finish.
-    Call it at most once per run, and only when the user message's
-    BASELINE STEP block invites you to (it only does so for Kokkos C++
-    kernels). On approval, the orchestrator writes the driver to
-    baselines/<kernel_stem>/driver.cpp; you do not need to manage that.
+  - baseline_harness: takes the original kernel source and a short
+    kernel_stem string, and returns a self-contained driver program
+    that, when later compiled and run by the operator, exercises the
+    kernel on fixed inputs and writes a reproducible reference output
+    to ./reference.json. The driver's language matches the kernel's
+    language profile (Kokkos C++ -> driver.cpp built with g++; CUDA
+    C++ -> driver.cu built with nvcc). This is the first link in the
+    dynamic-verification chain that ends in compare_outputs and the
+    code-side finish-gate. Call it at most once per run, and only when
+    the user message's BASELINE STEP block invites you to (it does so
+    for any kernel whose resolved language profile supports dynamic
+    verification). On approval, the orchestrator writes the driver to
+    baselines/<kernel_stem>/<profile driver filename>; you do not need
+    to manage that.
 
 You also have two deterministic (non-LLM) tools:
-  - compile_baseline_driver: takes a kernel_stem and compiles
-    baselines/<kernel_stem>/driver.cpp into baselines/<kernel_stem>/
-    driver using the local Kokkos install named by the
-    AGENT_PRECISION_KOKKOS_ROOT environment variable. Returns
+  - compile_baseline_driver: takes a kernel_stem and compiles the
+    baseline driver source under baselines/<kernel_stem>/ into a
+    baselines/<kernel_stem>/driver binary, using the toolchain dictated
+    by the resolved language profile (g++ + AGENT_PRECISION_KOKKOS_ROOT
+    for Kokkos; nvcc + AGENT_PRECISION_CUDA_ARCH for CUDA). Returns
     {status, stdout, stderr, artifacts}. Call this exactly once,
     immediately after a successful spawn_baseline_harness call, and
     using the same kernel_stem. Do not call it if spawn_baseline_harness
-    was skipped or rejected. Like the baseline itself, the compiled
-    driver is a side artifact: it is not a precondition for finish, and
-    a compile error there must NOT block the analyst -> rewriter ->
-    verifier pipeline.
+    was skipped or rejected. A compile error here transitively blocks
+    the rest of the dynamic-verification chain (and therefore finish on
+    profiles where the chain is required) but does NOT block the
+    analyst -> rewriter -> verifier pipeline itself.
 
   - run_baseline_driver: takes a kernel_stem and executes
     baselines/<kernel_stem>/driver, then verifies that it produced a
@@ -164,38 +168,42 @@ You also have two deterministic (non-LLM) tools:
     once, immediately after a successful compile_baseline_driver call,
     and using the same kernel_stem. Do not call it if
     compile_baseline_driver was skipped, rejected, or returned an error.
-    The reference output is another side artifact: it is not a
-    precondition for finish, and a run error there must NOT block the
-    analyst -> rewriter -> verifier pipeline.
+    Like the compile step, a run error here transitively blocks the
+    rest of the dynamic-verification chain (and therefore finish on
+    profiles where the chain is required) but does NOT block the
+    analyst -> rewriter -> verifier pipeline itself.
 
   - splice_rewritten_kernel: takes a kernel_stem and the rewriter's
-    rewritten kernel source. Reads baselines/<kernel_stem>/driver.cpp
-    (the baseline driver written by spawn_baseline_harness), replaces
-    the text strictly between the '// ---- KERNEL BEGIN ----' and
-    '// ---- KERNEL END ----' sentinel lines with the rewritten source,
-    and writes the result to baselines/<kernel_stem>/rewritten/
-    driver.cpp. Returns {status, stdout, stderr, artifacts}. Call this
-    at most once per accepted verifier verdict, immediately after a
-    successful run_baseline_driver call AND a successful spawn_verifier
-    call with verdict='accept', using the same kernel_stem. Do not call
-    it if any prior step in the baseline chain (spawn_baseline_harness,
-    compile_baseline_driver, run_baseline_driver) was skipped, rejected,
-    or returned an error. The spliced driver is a precursor for a
-    future mechanical comparator; like the baseline chain, a splice
-    error must NOT block finish on its own.
+    rewritten kernel source. Reads the baseline driver source under
+    baselines/<kernel_stem>/ (written by spawn_baseline_harness),
+    replaces the text strictly between the '// ---- KERNEL BEGIN ----'
+    and '// ---- KERNEL END ----' sentinel lines with the rewritten
+    source, and writes the result under baselines/<kernel_stem>/
+    rewritten/ with the same driver filename. Returns
+    {status, stdout, stderr, artifacts}. Call this at most once per
+    accepted verifier verdict, immediately after a successful
+    run_baseline_driver call AND a successful spawn_verifier call with
+    verdict='accept', using the same kernel_stem. Do not call it if
+    any prior step in the baseline chain (spawn_baseline_harness,
+    compile_baseline_driver, run_baseline_driver) was skipped,
+    rejected, or returned an error. The spliced driver feeds the
+    rewritten compile/run/compare chain that the code-side finish-gate
+    enforces on profiles with dynamic_verification=True.
 
-  - compile_rewritten_driver: takes a kernel_stem and compiles
-    baselines/<kernel_stem>/rewritten/driver.cpp (produced by a prior
-    splice_rewritten_kernel call) into baselines/<kernel_stem>/
-    rewritten/driver, using the same AGENT_PRECISION_KOKKOS_ROOT
-    install and the same flags as compile_baseline_driver. Returns
+  - compile_rewritten_driver: takes a kernel_stem and compiles the
+    spliced driver source under baselines/<kernel_stem>/rewritten/
+    (produced by a prior splice_rewritten_kernel call) into
+    baselines/<kernel_stem>/rewritten/driver, using the same toolchain
+    and flags as compile_baseline_driver (so the only intentional
+    difference between the baseline and rewritten binaries is the
+    kernel source between the sentinels). Returns
     {status, stdout, stderr, artifacts}. Call this exactly once per
     accepted verifier verdict, immediately after a successful
     splice_rewritten_kernel call, with the same kernel_stem. Do not
     call it if splice_rewritten_kernel was skipped, rejected, or
-    returned an error. The compiled rewritten driver is a precursor
-    for a future mechanical comparator; like the splice step, a
-    compile error here must NOT block finish on its own.
+    returned an error. A compile error here transitively blocks the
+    rest of the dynamic-verification chain and therefore finish on
+    profiles where the chain is required.
 
   - run_rewritten_driver: takes a kernel_stem and executes
     baselines/<kernel_stem>/rewritten/driver (produced by a prior
@@ -210,8 +218,9 @@ You also have two deterministic (non-LLM) tools:
     call it if compile_rewritten_driver was skipped, rejected, or
     returned an error. The rewritten reference output is the input to
     compare_outputs; a run error here means the comparator cannot
-    proceed and finish will be blocked for .cpp kernels until
-    compare_outputs has successfully run.
+    proceed and finish will be blocked on profiles with
+    dynamic_verification=True until compare_outputs has successfully
+    run.
 
   - compare_outputs: takes a kernel_stem and a tolerance_json (a JSON
     string with the same {kind, value, source} shape that
@@ -227,14 +236,16 @@ You also have two deterministic (non-LLM) tools:
     immediately after a successful run_rewritten_driver, with the
     same kernel_stem and the same tolerance_json that was passed to
     spawn_verifier. Unlike the other rewritten-chain tools, this IS a
-    precondition for finish on .cpp (Kokkos) kernels: the
-    orchestrator loop will refuse a finish call until compare_outputs
-    has returned status='ok' for the current rewrite cycle. If
-    compare_outputs returns an error, the numerical mismatch usually
-    indicates the verifier's verdict was wrong rather than just the
-    implementation; spawn_analyst (not spawn_rewriter) is typically
-    the right retry. .cu (CUDA) kernels skip this whole chain and
-    finish remains gated only on the verifier verdict.
+    precondition for finish on profiles with dynamic_verification=True
+    (currently Kokkos C++ and CUDA C++): the orchestrator loop will
+    refuse a finish call until compare_outputs has returned
+    status='ok' for the current rewrite cycle. If compare_outputs
+    returns an error, the numerical mismatch usually indicates the
+    verifier's verdict was wrong rather than just the implementation;
+    spawn_analyst (not spawn_rewriter) is typically the right retry.
+    Profiles with dynamic_verification=False (none today; reserved for
+    languages registered before a baseline harness exists) skip this
+    whole chain and finish remains gated only on the verifier verdict.
 
 You also have a finish tool to emit the final answer.
 
@@ -284,11 +295,13 @@ Your job after the tolerance is fixed:
 
 Hard rules:
 - You may not call finish unless the most recent spawn_verifier call
-  returned verdict='accept'. On .cpp (Kokkos) inputs, you must ALSO
-  have run compare_outputs after the most recent verifier-accept and
-  received status='ok' from it; the orchestrator loop enforces this
-  in code, not just in the prompt, and a premature finish call will
-  be turned into a synthetic tool error telling you what is missing.
+  returned verdict='accept'. On inputs whose language profile carries
+  dynamic_verification=True (currently any Kokkos C++ or CUDA C++
+  kernel), you must ALSO have run compare_outputs after the most
+  recent verifier-accept and received status='ok' from it; the
+  orchestrator loop enforces this in code, not just in the prompt,
+  and a premature finish call will be turned into a synthetic tool
+  error telling you what is missing.
 - You may not call spawn_precision_advisor if the user message
   provided a tolerance. You may not call spawn_precision_advisor more
   than once.
@@ -851,7 +864,20 @@ def _execute_tool(
         result = run_agent("verifier", task)
         return {"status": "ok", "result": result}
     if tool_name == "spawn_baseline_harness":
-        result = run_agent("baseline_harness", tool_input["kernel_source"])
+        # Dispatch to the per-language baseline harness agent. The
+        # registry auto-builds one AGENTS entry per registered
+        # LanguageProfile under the key `baseline_harness_<id>`, so
+        # adding a new language only means registering a profile;
+        # nothing in this dispatch site changes. The legacy
+        # `baseline_harness` alias still resolves to Kokkos for
+        # back-compat with any caller that hits run_agent directly,
+        # but the orchestrator itself always goes through the
+        # per-language key so the prompt actually matches the
+        # language.
+        result = run_agent(
+            f"baseline_harness_{profile.id}",
+            tool_input["kernel_source"],
+        )
         # Side artifact: persist the driver next to its kernel stem so the
         # operator can `cd baselines/<stem>/` and compile it. This is the
         # first _execute_tool branch that touches the filesystem; the path
@@ -862,8 +888,8 @@ def _execute_tool(
         driver_dir = Path("baselines") / kernel_stem
         driver_dir.mkdir(parents=True, exist_ok=True)
         # Per-language driver filename (driver.cpp for Kokkos,
-        # driver.cu once a CUDA profile lands). Owned by the
-        # LanguageProfile so the orchestrator stays language-agnostic.
+        # driver.cu for CUDA). Owned by the LanguageProfile so the
+        # orchestrator stays language-agnostic.
         driver_path = driver_dir / profile.driver_filename
         driver_path.write_text(result["driver_source"])
         return {
@@ -930,7 +956,8 @@ def _execute_tool(
         # {status, stdout, stderr, artifacts} shape verbatim. The
         # status of this call is what the finish-gate guard in
         # run_orchestrator reads when deciding whether to honor a
-        # finish call on a .cpp kernel.
+        # finish call on a kernel whose language profile carries
+        # dynamic_verification=True.
         return compare_outputs(
             tool_input["kernel_stem"],
             tool_input["tolerance_json"],
@@ -977,39 +1004,42 @@ def _format_baseline_block(
     """Render the BASELINE STEP block embedded in the initial user message.
 
     The baseline_harness agent v0 is Kokkos-only: the orchestrator is
-    invited to call spawn_baseline_harness only when the kernel file is
-    a .cpp. For .cu (CUDA) inputs, the block tells the orchestrator
-    explicitly not to call it. (This extension check is intentionally
-    NOT delegated to the profile in v0 — detect_language currently
-    returns the Kokkos profile for both .cpp and .cu, and the baseline
-    harness agent itself is Kokkos-only. Phase B replaces this with a
-    profile capability flag once a CUDA harness lands.) The block also
-    surfaces the kernel_stem the orchestrator must pass to the tool (so
-    the driver lands at baselines/<stem>/<profile.driver_filename>),
-    and, if the caller provided one, the target kernel function name.
+    invited to call spawn_baseline_harness only when the resolved
+    language profile carries `dynamic_verification=True`. Profiles that
+    set that flag to False (none today; reserved for languages we add
+    before a baseline harness exists for them) get a "skip baseline"
+    block instead. Earlier revisions hard-coded this check to
+    `suffix == ".cpp"` because the Kokkos harness was the only one
+    written; with the CUDA profile (Phase B) the gate now follows the
+    profile flag, so `.cu` inputs invite the full chain too. The block
+    also surfaces the kernel_stem the orchestrator must pass to the
+    tool (so the driver lands at
+    baselines/<stem>/<profile.driver_filename>), and, if the caller
+    provided one, the target kernel function name.
 
     `profile.display_name` and `profile.driver_filename` populate the
     prose so the block stays in sync with the resolved language profile
-    when new languages land (eg. "CUDA" / "driver.cu" instead of
+    when new languages land (eg. "CUDA C++" / "driver.cu" instead of
     "Kokkos C++" / "driver.cpp").
     """
     stem = Path(kernel_path).stem
-    suffix = Path(kernel_path).suffix.lower()
-    if suffix != ".cpp":
+    if not profile.dynamic_verification:
         return (
-            "BASELINE STEP: skipped for this kernel (not a Kokkos .cpp "
-            "file). Do NOT call spawn_baseline_harness."
+            f"BASELINE STEP: skipped for this kernel (the {profile.display_name} "
+            "profile does not yet support dynamic verification). Do NOT "
+            "call spawn_baseline_harness."
         )
     target_line = (
         f"TARGET KERNEL: {kernel_name}\n" if kernel_name else ""
     )
     return (
         f"BASELINE STEP: this is a {profile.display_name} kernel, so "
-        "you MAY call spawn_baseline_harness exactly once to generate "
-        "a reference driver. This is a side artifact for a future "
-        "mechanical comparator; it is NOT consumed by the analyst, "
-        "rewriter, or verifier in this run, and it is NOT a "
-        "precondition for finish. Skip it if it seems unhelpful.\n"
+        "you SHOULD call spawn_baseline_harness exactly once to generate "
+        f"a reference driver (baselines/{stem}/{profile.driver_filename}). "
+        "This driver is the first link in the dynamic-verification chain "
+        "that ends in compare_outputs and the code-side finish-gate: it "
+        "is not consumed by the analyst, rewriter, or verifier, but it "
+        "IS a precondition for finish on this kernel's language profile.\n"
         f"KERNEL STEM: {stem}\n"
         f"{target_line}"
         "When you call spawn_baseline_harness, pass the original kernel "
@@ -1035,9 +1065,10 @@ def _format_baseline_block(
         "status='ok', follow it immediately with a single call to "
         "compare_outputs using the same KERNEL STEM and the same "
         "tolerance_json string you passed to spawn_verifier. "
-        "compare_outputs IS a precondition for finish on this .cpp "
-        "kernel: a finish call before compare_outputs has returned "
-        "status='ok' will be turned into a synthetic tool error. A "
+        f"compare_outputs IS a precondition for finish on this "
+        f"{profile.display_name} kernel: a finish call before "
+        "compare_outputs has returned status='ok' will be turned into "
+        "a synthetic tool error. A "
         "splice, rewritten-compile, or rewritten-run error means the "
         "comparator cannot run, so the chain must be repaired before "
         "finish. If compare_outputs returns an error, prefer spawn_analyst "
@@ -1053,14 +1084,17 @@ class _FinishGateState:
     The orchestrator's hard rule (prompt-visible AND enforced here in
     code) is:
 
-      - For .cpp (Kokkos) inputs, `finish` requires the most recent
-        spawn_verifier call to have returned verdict='accept' AND the
-        most recent compare_outputs call to have returned status='ok'
-        for the CURRENT rewrite cycle.
-      - For .cu (CUDA) inputs the dynamic-verification chain is
-        skipped entirely; `finish` is gated only on the most recent
-        spawn_verifier verdict being 'accept' (the same rule the
-        system prompt has always carried, now backed by code).
+      - For inputs whose language profile carries
+        dynamic_verification=True (currently Kokkos C++ and CUDA C++),
+        `finish` requires the most recent spawn_verifier call to have
+        returned verdict='accept' AND the most recent compare_outputs
+        call to have returned status='ok' for the CURRENT rewrite
+        cycle.
+      - For profiles with dynamic_verification=False (none today;
+        reserved for languages we register before a baseline harness
+        exists for them), the dynamic-verification chain is skipped
+        entirely; `finish` is gated only on the most recent
+        spawn_verifier verdict being 'accept'.
 
     "Current rewrite cycle" is the key constraint: any spawn_rewriter
     call invalidates BOTH tracked statuses (a new rewrite obviously
@@ -1083,14 +1117,15 @@ class _FinishGateState:
     def __init__(self, kernel_path: str, profile: LanguageProfile) -> None:
         self.kernel_path = kernel_path
         self.profile = profile
-        # v0 limitation: the dynamic-verification chain runs only for
-        # .cpp inputs (the baseline harness agent is Kokkos-only). The
-        # extension check stays here in code rather than on the
-        # profile, because detect_language currently returns the
-        # Kokkos profile for both .cpp and .cu and the harness itself
-        # is what's language-restricted, not the profile. Phase B
-        # replaces this with a profile capability flag.
-        self.requires_comparator = kernel_path.endswith(".cpp")
+        # Whether the dynamic-verification chain (and therefore the
+        # comparator) is required before finish is gated by the
+        # resolved language profile, not the file extension. Phase A
+        # threaded the profile through the orchestrator for exactly
+        # this purpose; Phase B added the second profile (CUDA) and
+        # flipped this from a `.cpp` literal check to the flag below.
+        # Future profiles register with dynamic_verification=False
+        # when no baseline harness exists for them yet.
+        self.requires_comparator = profile.dynamic_verification
         self.last_verifier_verdict: str | None = None
         self.last_compare_status: str | None = None
 

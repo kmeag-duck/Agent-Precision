@@ -385,3 +385,134 @@ def test_rewriter_prompt_forbids_bypassing_alias():
     # "bypass" / "directly" language warns the rewriter off the obvious
     # wrong move (edit the header, ignore the alias).
     assert "bypass" in prompt or "directly" in prompt
+
+
+# ---------- Baseline harness: CUDA profile ----------
+#
+# Phase B added CUDA as the second language profile. Its baseline_harness
+# entry is registered under AGENTS["baseline_harness_cuda"] by the
+# PROFILES loop in registry.py. These tests mirror the Kokkos baseline
+# harness tests above but assert CUDA-specific tokens (nvcc, cudaMalloc,
+# cudaMemcpy, __global__, <cuda_runtime.h>) and the CUDA-specific
+# staging-buffer rule (`std::remove_const_t<std::remove_pointer_t<...>>`,
+# which replaces Kokkos's `typename ...::non_const_value_type`). The
+# precision-alias contract and the splice sentinels are language-
+# independent invariants, so both prompts must honor them.
+
+
+def test_baseline_harness_cuda_entry_exists():
+    """AGENTS["baseline_harness_cuda"] is registered with the same required keys as every other agent entry; the PROFILES loop in registry.py populates it from CUDA_PROFILE."""
+    spec = AGENTS["baseline_harness_cuda"]
+    assert isinstance(spec["system_prompt"], str)
+    assert spec["system_prompt"].strip()
+    assert spec["output_schema"]["type"] == "object"
+    assert spec["model"]
+    assert spec["supports_temperature"] is False
+
+
+def test_baseline_harness_cuda_schema_required_fields():
+    """The CUDA baseline_harness schema has the same required fields as the Kokkos one — the downstream comparator and splice tools are language-agnostic, so the submit_result payload shape is shared."""
+    schema = AGENTS["baseline_harness_cuda"]["output_schema"]
+    assert set(schema["required"]) == {
+        "driver_source",
+        "kernel_function_name",
+        "inputs_summary",
+        "output_arrays",
+    }
+    assert schema["properties"]["output_arrays"]["type"] == "array"
+    assert schema["properties"]["output_arrays"]["items"]["type"] == "string"
+
+
+def test_baseline_harness_cuda_prompt_mentions_cuda_runtime_and_global():
+    """The CUDA baseline_harness prompt names <cuda_runtime.h> (the canonical include) and __global__ (the kernel-qualifier the driver launches) so the model is anchored on the right toolchain."""
+    prompt = AGENTS["baseline_harness_cuda"]["system_prompt"]
+    assert "<cuda_runtime.h>" in prompt
+    assert "__global__" in prompt
+
+
+def test_baseline_harness_cuda_prompt_mentions_cuda_memory_api():
+    """The CUDA baseline_harness prompt names cudaMalloc and cudaMemcpy so the model knows the device-allocation and host<->device transfer API it must use."""
+    prompt = AGENTS["baseline_harness_cuda"]["system_prompt"]
+    assert "cudaMalloc" in prompt
+    assert "cudaMemcpy" in prompt
+
+
+def test_baseline_harness_cuda_prompt_mandates_determinism():
+    """The CUDA baseline_harness prompt forbids host-side atomic floating-point ops (non-deterministic), mandates a fixed grid/block launch shape, and requires a fixed RNG seed — the three things needed for the reference to be bit-identical across runs."""
+    prompt = AGENTS["baseline_harness_cuda"]["system_prompt"]
+    # Atomics ban — atomicAdd is the canonical offender on GPU.
+    assert "atomicAdd" in prompt
+    # Fixed launch shape — the prompt's example uses `threads = 256`.
+    lower = prompt.lower()
+    assert "fixed" in lower
+    # Seed instruction (same phrasing test as Kokkos: "seed" + "fixed"
+    # or "reproducible" elsewhere in the prompt).
+    assert "seed" in lower
+    assert "fixed" in lower or "reproducible" in lower
+
+
+def test_baseline_harness_cuda_prompt_mentions_reference_json_and_format():
+    """The CUDA baseline_harness prompt names reference.json (the output file) and requires %.17g formatting so the reference preserves full double precision — same contract as the Kokkos prompt."""
+    prompt = AGENTS["baseline_harness_cuda"]["system_prompt"]
+    assert "reference.json" in prompt
+    assert "%.17g" in prompt
+
+
+def test_baseline_harness_cuda_prompt_mentions_target_kernel_and_no_invented_values():
+    """The CUDA baseline_harness prompt names TARGET KERNEL (the disambiguator the orchestrator may prepend) and forbids inventing numerical output values — same contract as the Kokkos prompt."""
+    prompt = AGENTS["baseline_harness_cuda"]["system_prompt"]
+    assert "TARGET KERNEL" in prompt
+    lower = prompt.lower()
+    assert "do not invent" in lower or "not invent" in lower or "never invent" in lower
+
+
+def test_baseline_harness_cuda_prompt_mandates_kernel_splice_sentinels():
+    """The CUDA baseline_harness prompt mandates the exact splice sentinels (language-independent contract — splice_rewritten_kernel is shared across profiles)."""
+    prompt = AGENTS["baseline_harness_cuda"]["system_prompt"]
+    assert "// ---- KERNEL BEGIN ----" in prompt
+    assert "// ---- KERNEL END ----" in prompt
+
+
+def test_baseline_harness_cuda_prompt_mandates_precision_alias_contract():
+    """The CUDA baseline_harness prompt mandates the same per-parameter `using <ParamName>Type` alias contract as the Kokkos prompt — splice scope is language-independent, so the alias contract is too. Integer parameters are excluded for the same reason."""
+    prompt = AGENTS["baseline_harness_cuda"]["system_prompt"]
+    assert "<ParamName>Type" in prompt
+    assert "using" in prompt
+    assert "main()" in prompt
+    lower = prompt.lower()
+    assert "integer parameters" in lower or "integer parameter" in lower
+
+
+def test_baseline_harness_cuda_prompt_requires_alias_derived_staging_buffer():
+    """The CUDA staging-buffer rule differs from Kokkos: instead of `typename ...::non_const_value_type` (a Kokkos View member), CUDA uses `std::remove_const_t<std::remove_pointer_t<aType>>` to derive the writable pointee type from a `const T*` alias. The prompt must teach this exact idiom; a hardcoded `double* a_nc; cudaMalloc(&a_nc, N*sizeof(double))` would break when the rewriter changes the alias to `const float*`."""
+    prompt = AGENTS["baseline_harness_cuda"]["system_prompt"]
+    # The CUDA-specific derivation idiom. Both halves matter — the
+    # remove_const_t strips the const, the remove_pointer_t strips the
+    # pointer, and the order is fixed (pointer first, then const) by C++.
+    assert "remove_const_t" in prompt
+    assert "remove_pointer_t" in prompt
+    # The failure mode (hardcoded `double`) is called out explicitly.
+    normalized = " ".join(prompt.lower().split())
+    assert "do not hardcode" in normalized or "do not" in normalized
+    # Rule is scoped to const pointer kernel arguments.
+    assert "const" in normalized
+
+
+def test_baseline_harness_cuda_prompt_does_not_mention_kokkos():
+    """The CUDA baseline_harness prompt must not mention Kokkos-specific tokens — those would mislead the model into emitting a hybrid driver. Cross-prompt isolation is the whole point of having one profile per language."""
+    prompt = AGENTS["baseline_harness_cuda"]["system_prompt"]
+    # Token-level isolation. These tokens uniquely identify the Kokkos
+    # prompt and have no business in a CUDA driver.
+    assert "Kokkos::initialize" not in prompt
+    assert "Kokkos::Serial" not in prompt
+    assert "Kokkos::View" not in prompt
+    assert "non_const_value_type" not in prompt
+
+
+def test_baseline_harness_kokkos_prompt_does_not_mention_cuda():
+    """Mirror of the CUDA isolation test: the Kokkos baseline_harness prompt must not mention CUDA-specific tokens. Together these two tests defend against accidental cross-contamination of the per-language prompts."""
+    prompt = AGENTS["baseline_harness_kokkos"]["system_prompt"]
+    assert "cudaMalloc" not in prompt
+    assert "cudaMemcpy" not in prompt
+    assert "__global__" not in prompt
+    assert "<cuda_runtime.h>" not in prompt

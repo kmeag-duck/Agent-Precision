@@ -30,6 +30,12 @@ import stat
 import subprocess
 
 from workflow import tools
+from workflow.languages import cuda as cuda_profile
+from workflow.languages.cuda import (
+    ARCH_ENV as CUDA_ARCH_ENV,
+    DEFAULT_ARCH as CUDA_DEFAULT_ARCH,
+    NVCC,
+)
 from workflow.tools import (
     DEFAULT_RUN_TIMEOUT_SEC,
     KERNEL_BEGIN_SENTINEL,
@@ -2070,3 +2076,223 @@ def test_compare_outputs_result_keys_are_stable(monkeypatch, tmp_path):
     )
     r5 = compare_outputs("no", _tolerance("sig_figs", 3), "kokkos")
     assert set(r5.keys()) == expected_keys
+
+
+# ---------- CUDA profile: compile + splice ----------
+#
+# These tests exercise the CUDA language profile (workflow.languages.cuda)
+# through the same six public tool wrappers as the Kokkos tests above.
+# Phase B added CUDA as the second profile, so the wrappers must dispatch
+# on `language_id="cuda"` to the nvcc command shape, the nvcc-on-PATH
+# preflight, and the `driver.cu` filename. The Kokkos tests above
+# remain the back-compat coverage for the g++ + Kokkos path; these
+# tests guarantee the new branch.
+
+
+def _stage_cuda_driver(tmp_path, stem, body="int main(){return 0;}\n"):
+    """Write a placeholder baselines/<stem>/driver.cu under tmp_path."""
+    driver_dir = tmp_path / "baselines" / stem
+    driver_dir.mkdir(parents=True)
+    (driver_dir / "driver.cu").write_text(body)
+    return driver_dir
+
+
+def _stage_cuda_baseline_driver(tmp_path, stem, body=_BASELINE_DRIVER_TEMPLATE):
+    """Write a baseline driver.cu at baselines/<stem>/ under tmp_path.
+
+    The body content is the same Kokkos-flavored template the splice
+    tests use; splice_rewritten_kernel only cares about the sentinel
+    lines, not the surrounding C++. What matters here is that the file
+    lives at driver.cu (not driver.cpp), so the CUDA profile finds it.
+    """
+    d = tmp_path / "baselines" / stem
+    d.mkdir(parents=True)
+    (d / "driver.cu").write_text(body)
+    return d
+
+
+def test_compile_baseline_driver_cuda_invokes_nvcc_with_default_arch(
+    monkeypatch, tmp_path
+):
+    """For language_id='cuda', compile_baseline_driver shells out to nvcc with -std=c++17, -O2, -arch=sm_89 by default, and the driver.cu source path."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv(CUDA_ARCH_ENV, raising=False)
+    _stage_cuda_driver(tmp_path, "vector_add")
+    monkeypatch.setattr(cuda_profile.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    captured = {}
+
+    class FakeProc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(cmd, capture_output, text, check):
+        captured["cmd"] = cmd
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = compile_baseline_driver("vector_add", "cuda")
+
+    assert result["status"] == "ok"
+    assert result["artifacts"] == ["baselines/vector_add/driver"]
+    cmd = captured["cmd"]
+    assert cmd[0] == NVCC
+    assert "-std=c++17" in cmd
+    assert "-O2" in cmd
+    assert f"-arch={CUDA_DEFAULT_ARCH}" in cmd
+    assert CUDA_DEFAULT_ARCH == "sm_89"  # invariant the docs promise
+    # Driver source is the .cu input, output is baselines/<stem>/driver.
+    assert "baselines/vector_add/driver.cu" in cmd
+    assert "-o" in cmd
+    assert cmd[cmd.index("-o") + 1] == "baselines/vector_add/driver"
+    # The CUDA profile must NOT inherit any Kokkos-specific flags.
+    assert "-fopenmp" not in cmd
+    assert "-lkokkoscore" not in cmd
+    assert "-lkokkoscontainers" not in cmd
+
+
+def test_compile_baseline_driver_cuda_honors_arch_env_override(
+    monkeypatch, tmp_path
+):
+    """AGENT_PRECISION_CUDA_ARCH=sm_70 replaces the default in the nvcc -arch= flag."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv(CUDA_ARCH_ENV, "sm_70")
+    _stage_cuda_driver(tmp_path, "vector_add")
+    monkeypatch.setattr(cuda_profile.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    captured = {}
+
+    class FakeProc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(cmd, capture_output, text, check):
+        captured["cmd"] = cmd
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = compile_baseline_driver("vector_add", "cuda")
+
+    assert result["status"] == "ok"
+    cmd = captured["cmd"]
+    assert "-arch=sm_70" in cmd
+    assert f"-arch={CUDA_DEFAULT_ARCH}" not in cmd
+
+
+def test_compile_baseline_driver_cuda_errors_when_nvcc_missing(
+    monkeypatch, tmp_path
+):
+    """When shutil.which('nvcc') returns None, compile_baseline_driver returns status='error' WITHOUT invoking subprocess.run and the stderr names nvcc."""
+    monkeypatch.chdir(tmp_path)
+    # No need to stage a source file — preflight runs before the
+    # source-exists check, so the error must surface from the missing
+    # toolchain alone.
+    monkeypatch.setattr(cuda_profile.shutil, "which", lambda name: None)
+
+    def fail_run(*a, **kw):
+        raise AssertionError(
+            "subprocess.run must not be called when nvcc is missing"
+        )
+
+    monkeypatch.setattr(subprocess, "run", fail_run)
+
+    result = compile_baseline_driver("vector_add", "cuda")
+
+    assert result["status"] == "error"
+    assert NVCC in result["stderr"]
+    assert result["artifacts"] == []
+
+
+def test_compile_baseline_driver_cuda_errors_when_driver_source_missing(
+    monkeypatch, tmp_path
+):
+    """When the CUDA driver source is absent, compile_baseline_driver returns status='error' (no subprocess) and the error names driver.cu (not driver.cpp)."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cuda_profile.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    def fail_run(*a, **kw):
+        raise AssertionError(
+            "subprocess.run must not be called when driver source missing"
+        )
+
+    monkeypatch.setattr(subprocess, "run", fail_run)
+
+    result = compile_baseline_driver("vector_add", "cuda")
+
+    assert result["status"] == "error"
+    assert "driver.cu" in result["stderr"]
+    assert "driver.cpp" not in result["stderr"]
+    assert result["artifacts"] == []
+
+
+def test_compile_baseline_driver_cuda_result_keys_are_stable(
+    monkeypatch, tmp_path
+):
+    """Every CUDA code path returns a dict with exactly {status, stdout, stderr, artifacts} — the uniform schema shared with the Kokkos path."""
+    expected_keys = {"status", "stdout", "stderr", "artifacts"}
+    monkeypatch.chdir(tmp_path)
+
+    # 1) nvcc missing
+    monkeypatch.setattr(cuda_profile.shutil, "which", lambda name: None)
+    assert set(compile_baseline_driver("x", "cuda").keys()) == expected_keys
+
+    # 2) success
+    monkeypatch.setattr(cuda_profile.shutil, "which", lambda name: f"/usr/bin/{name}")
+    _stage_cuda_driver(tmp_path, "x")
+
+    class OkProc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: OkProc())
+    assert set(compile_baseline_driver("x", "cuda").keys()) == expected_keys
+
+    # 3) compile failure
+    class FailProc:
+        returncode = 2
+        stdout = ""
+        stderr = "boom"
+
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: FailProc())
+    assert set(compile_baseline_driver("x", "cuda").keys()) == expected_keys
+
+
+def test_splice_rewritten_kernel_cuda_reads_and_writes_dot_cu(
+    monkeypatch, tmp_path
+):
+    """For language_id='cuda', splice_rewritten_kernel reads baselines/<stem>/driver.cu and writes baselines/<stem>/rewritten/driver.cu — NOT driver.cpp at either path."""
+    monkeypatch.chdir(tmp_path)
+    _stage_cuda_baseline_driver(tmp_path, "k")
+    _ban_subprocess(monkeypatch)
+
+    new_kernel = (
+        "__global__ void kernel(float* x, int n) {\n"
+        "  int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+        "  if (i < n) x[i] = x[i] * 2.0f;\n"
+        "}\n"
+    )
+
+    result = splice_rewritten_kernel("k", new_kernel, "cuda")
+
+    assert result["status"] == "ok"
+    assert result["artifacts"] == ["baselines/k/rewritten/driver.cu"]
+
+    out_path = tmp_path / "baselines" / "k" / "rewritten" / "driver.cu"
+    assert out_path.is_file()
+    # The .cpp filename must not appear in either tree.
+    assert not (tmp_path / "baselines" / "k" / "rewritten" / "driver.cpp").exists()
+    assert not (tmp_path / "baselines" / "k" / "driver.cpp").exists()
+
+    text = out_path.read_text()
+    out_lines = text.split("\n")
+    assert out_lines.count(KERNEL_BEGIN_SENTINEL) == 1
+    assert out_lines.count(KERNEL_END_SENTINEL) == 1
+    begin = out_lines.index(KERNEL_BEGIN_SENTINEL)
+    end = out_lines.index(KERNEL_END_SENTINEL)
+    spliced = "\n".join(out_lines[begin + 1 : end])
+    assert spliced == new_kernel.rstrip("\n")

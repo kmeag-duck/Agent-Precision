@@ -9,7 +9,7 @@ import json
 import pytest
 
 from workflow import orchestrator
-from workflow.languages import KOKKOS_PROFILE
+from workflow.languages import CUDA_PROFILE, KOKKOS_PROFILE
 from workflow.orchestrator import (
     DEFAULT_TOLERANCE_ON_ADVISOR_UNKNOWN,
     ORCHESTRATOR_SYSTEM_PROMPT,
@@ -242,11 +242,28 @@ def test_execute_tool_dispatches_spawn_rewriter(monkeypatch):
 # ---------- run_orchestrator: happy path ----------
 
 
-def test_run_orchestrator_happy_path(monkeypatch, fake_anthropic):
-    """run_orchestrator drives analyst -> rewriter -> verifier(accept) -> finish end-to-end with HITL approvals."""
-    # Uses a .cu kernel so the finish-gate requires only verifier-accept
-    # (not the .cpp dynamic-verification chain). Four orchestrator turns:
-    # spawn_analyst, spawn_rewriter, spawn_verifier(accept), finish.
+def test_run_orchestrator_happy_path(monkeypatch, fake_anthropic, tmp_path):
+    """run_orchestrator drives analyst -> rewriter -> verifier(accept) -> baseline harness chain -> compare_outputs -> finish end-to-end with HITL approvals."""
+    # Uses a .cpp kernel which under KOKKOS_PROFILE (dynamic_verification=True)
+    # requires the full dynamic-verification chain before finish. Phase B
+    # unified .cu and .cpp gating, so there is no shorter happy path
+    # available. Eleven orchestrator turns:
+    #   1. spawn_analyst
+    #   2. spawn_rewriter
+    #   3. spawn_verifier(accept)
+    #   4. spawn_baseline_harness   (writes driver under tmp_path)
+    #   5. compile_baseline_driver  (stubbed ok)
+    #   6. run_baseline_driver      (stubbed ok)
+    #   7. splice_rewritten_kernel  (stubbed ok)
+    #   8. compile_rewritten_driver (stubbed ok)
+    #   9. run_rewritten_driver     (stubbed ok)
+    #  10. compare_outputs          (stubbed ok -> sets compare_status)
+    #  11. finish
+    monkeypatch.chdir(tmp_path)
+    tol_json = (
+        '{"kind":"sig_figs","value":6,'
+        '"source":"advisor_unknown_defaulted"}'
+    )
     fake = fake_anthropic([
         FakeResponse(
             content=[ToolUseBlock(
@@ -270,16 +287,68 @@ def test_run_orchestrator_happy_path(monkeypatch, fake_anthropic):
                     "original_source": "KSRC",
                     "rewritten_source": "FINAL",
                     "analyst_verdict_json": "{}",
-                    "tolerance_json": (
-                        '{"kind":"sig_figs","value":6,'
-                        '"source":"advisor_unknown_defaulted"}'
-                    ),
+                    "tolerance_json": tol_json,
                 },
             )],
         ),
         FakeResponse(
             content=[ToolUseBlock(
                 id="tu_4",
+                name="spawn_baseline_harness",
+                input={"kernel_source": "KSRC", "kernel_stem": "kernel"},
+            )],
+        ),
+        FakeResponse(
+            content=[ToolUseBlock(
+                id="tu_5",
+                name="compile_baseline_driver",
+                input={"kernel_stem": "kernel"},
+            )],
+        ),
+        FakeResponse(
+            content=[ToolUseBlock(
+                id="tu_6",
+                name="run_baseline_driver",
+                input={"kernel_stem": "kernel"},
+            )],
+        ),
+        FakeResponse(
+            content=[ToolUseBlock(
+                id="tu_7",
+                name="splice_rewritten_kernel",
+                input={
+                    "kernel_stem": "kernel",
+                    "rewritten_kernel_source": "FINAL",
+                },
+            )],
+        ),
+        FakeResponse(
+            content=[ToolUseBlock(
+                id="tu_8",
+                name="compile_rewritten_driver",
+                input={"kernel_stem": "kernel"},
+            )],
+        ),
+        FakeResponse(
+            content=[ToolUseBlock(
+                id="tu_9",
+                name="run_rewritten_driver",
+                input={"kernel_stem": "kernel"},
+            )],
+        ),
+        FakeResponse(
+            content=[ToolUseBlock(
+                id="tu_10",
+                name="compare_outputs",
+                input={
+                    "kernel_stem": "kernel",
+                    "tolerance_json": tol_json,
+                },
+            )],
+        ),
+        FakeResponse(
+            content=[ToolUseBlock(
+                id="tu_11",
                 name="finish",
                 input={"rewritten_code": "FINAL", "notes": "done"},
             )],
@@ -294,17 +363,48 @@ def test_run_orchestrator_happy_path(monkeypatch, fake_anthropic):
             return {"rewritten_code": "FINAL", "summary_of_changes": "ok"}
         if type_ == "verifier":
             return {"verdict": "accept", "per_variable": [], "concerns": []}
+        if type_ == "baseline_harness_kokkos":
+            return {
+                "driver_source": "// driver\nint main(){return 0;}\n",
+                "kernel_function_name": "kernel",
+                "inputs_summary": "N=1, seed=42",
+                "output_arrays": ["y"],
+            }
         raise AssertionError(f"unexpected agent: {type_}")
 
     monkeypatch.setattr(orchestrator, "run_agent", stub_run_agent)
 
-    # Four HITL prompts, all approved.
-    _scripted_input(monkeypatch, ["y", "y", "y", "y"])
+    # Stub all four deterministic chain tools that follow harness. Each
+    # returns the standard {status, stdout, stderr, artifacts} shape.
+    ok_chain = {
+        "status": "ok", "stdout": "", "stderr": "", "artifacts": [],
+    }
+    monkeypatch.setattr(
+        orchestrator, "compile_baseline_driver", lambda *a, **kw: ok_chain
+    )
+    monkeypatch.setattr(
+        orchestrator, "run_baseline_driver", lambda *a, **kw: ok_chain
+    )
+    monkeypatch.setattr(
+        orchestrator, "splice_rewritten_kernel", lambda *a, **kw: ok_chain
+    )
+    monkeypatch.setattr(
+        orchestrator, "compile_rewritten_driver", lambda *a, **kw: ok_chain
+    )
+    monkeypatch.setattr(
+        orchestrator, "run_rewritten_driver", lambda *a, **kw: ok_chain
+    )
+    monkeypatch.setattr(
+        orchestrator, "compare_outputs", lambda *a, **kw: ok_chain
+    )
 
-    result = run_orchestrator("path/to/kernel.cu", "kernel source body")
+    # Eleven HITL prompts, all approved.
+    _scripted_input(monkeypatch, ["y"] * 11)
+
+    result = run_orchestrator("path/to/kernel.cpp", "kernel source body")
 
     assert result == {"rewritten_code": "FINAL", "notes": "done"}
-    assert len(fake.messages.calls) == 4
+    assert len(fake.messages.calls) == 11
 
     # First call: just the user message.
     first_messages = fake.messages.calls[0]["messages"]
@@ -329,12 +429,28 @@ def test_run_orchestrator_happy_path(monkeypatch, fake_anthropic):
 
 
 def test_run_orchestrator_rejection_feeds_back_sentinel(
-    monkeypatch, fake_anthropic
+    monkeypatch, fake_anthropic, tmp_path
 ):
     """A HITL 'n' rejects the tool call without invoking run_agent and feeds {'status':'rejected_by_user'} back to the orchestrator."""
-    # Uses a .cu kernel so finish requires only verifier-accept (no
-    # comparator chain). Three turns: spawn_analyst (rejected),
-    # spawn_verifier(accept), finish.
+    # Uses a .cpp kernel under KOKKOS_PROFILE (Phase B unified .cu and
+    # .cpp gating, so there is no shorter path to finish for either
+    # extension). Ten orchestrator turns: rejected spawn_analyst, then
+    # the full happy chain to satisfy the code-side finish-gate.
+    #   1. spawn_analyst              (HITL 'n' -> rejection sentinel)
+    #   2. spawn_verifier(accept)
+    #   3. spawn_baseline_harness
+    #   4. compile_baseline_driver
+    #   5. run_baseline_driver
+    #   6. splice_rewritten_kernel
+    #   7. compile_rewritten_driver
+    #   8. run_rewritten_driver
+    #   9. compare_outputs
+    #  10. finish
+    monkeypatch.chdir(tmp_path)
+    tol_json = (
+        '{"kind":"sig_figs","value":6,'
+        '"source":"advisor_unknown_defaulted"}'
+    )
     fake = fake_anthropic([
         # Turn 1: orchestrator proposes spawn_analyst — user rejects.
         FakeResponse(
@@ -345,7 +461,7 @@ def test_run_orchestrator_rejection_feeds_back_sentinel(
             )],
         ),
         # Turn 2: after seeing rejection, orchestrator calls verifier to
-        # satisfy the finish-gate.
+        # satisfy the verifier prong of the finish-gate.
         FakeResponse(
             content=[ToolUseBlock(
                 id="tu_2",
@@ -354,36 +470,119 @@ def test_run_orchestrator_rejection_feeds_back_sentinel(
                     "original_source": "src",
                     "rewritten_source": "src",
                     "analyst_verdict_json": "{}",
-                    "tolerance_json": (
-                        '{"kind":"sig_figs","value":6,'
-                        '"source":"advisor_unknown_defaulted"}'
-                    ),
+                    "tolerance_json": tol_json,
                 },
             )],
         ),
-        # Turn 3: finish.
+        # Turns 3-9: the full baseline + rewritten chain that the
+        # comparator prong of the finish-gate requires post-Phase-B.
         FakeResponse(
             content=[ToolUseBlock(
                 id="tu_3",
+                name="spawn_baseline_harness",
+                input={"kernel_source": "src", "kernel_stem": "k"},
+            )],
+        ),
+        FakeResponse(
+            content=[ToolUseBlock(
+                id="tu_4",
+                name="compile_baseline_driver",
+                input={"kernel_stem": "k"},
+            )],
+        ),
+        FakeResponse(
+            content=[ToolUseBlock(
+                id="tu_5",
+                name="run_baseline_driver",
+                input={"kernel_stem": "k"},
+            )],
+        ),
+        FakeResponse(
+            content=[ToolUseBlock(
+                id="tu_6",
+                name="splice_rewritten_kernel",
+                input={
+                    "kernel_stem": "k",
+                    "rewritten_kernel_source": "src",
+                },
+            )],
+        ),
+        FakeResponse(
+            content=[ToolUseBlock(
+                id="tu_7",
+                name="compile_rewritten_driver",
+                input={"kernel_stem": "k"},
+            )],
+        ),
+        FakeResponse(
+            content=[ToolUseBlock(
+                id="tu_8",
+                name="run_rewritten_driver",
+                input={"kernel_stem": "k"},
+            )],
+        ),
+        FakeResponse(
+            content=[ToolUseBlock(
+                id="tu_9",
+                name="compare_outputs",
+                input={"kernel_stem": "k", "tolerance_json": tol_json},
+            )],
+        ),
+        # Turn 10: finish.
+        FakeResponse(
+            content=[ToolUseBlock(
+                id="tu_10",
                 name="finish",
                 input={"rewritten_code": "X", "notes": "gave up"},
             )],
         ),
     ])
 
-    # Only the verifier should actually run via _execute_tool; the
-    # analyst call gets rejected and a finish call has no agent.
+    # The analyst call gets rejected, finish has no agent, and the
+    # chain tools are stubbed below. Only verifier + baseline_harness
+    # actually go through run_agent.
     def stub_run_agent(type_, task):
         if type_ == "verifier":
             return {"verdict": "accept", "per_variable": [], "concerns": []}
+        if type_ == "baseline_harness_kokkos":
+            return {
+                "driver_source": "// driver\nint main(){return 0;}\n",
+                "kernel_function_name": "k",
+                "inputs_summary": "N=1, seed=42",
+                "output_arrays": ["y"],
+            }
         raise AssertionError(
             f"run_agent should not be called for {type_!r} in this test"
         )
 
     monkeypatch.setattr(orchestrator, "run_agent", stub_run_agent)
-    _scripted_input(monkeypatch, ["n", "y", "y"])  # reject, approve, finish
 
-    result = run_orchestrator("k.cu", "src")
+    ok_chain = {
+        "status": "ok", "stdout": "", "stderr": "", "artifacts": [],
+    }
+    monkeypatch.setattr(
+        orchestrator, "compile_baseline_driver", lambda *a, **kw: ok_chain
+    )
+    monkeypatch.setattr(
+        orchestrator, "run_baseline_driver", lambda *a, **kw: ok_chain
+    )
+    monkeypatch.setattr(
+        orchestrator, "splice_rewritten_kernel", lambda *a, **kw: ok_chain
+    )
+    monkeypatch.setattr(
+        orchestrator, "compile_rewritten_driver", lambda *a, **kw: ok_chain
+    )
+    monkeypatch.setattr(
+        orchestrator, "run_rewritten_driver", lambda *a, **kw: ok_chain
+    )
+    monkeypatch.setattr(
+        orchestrator, "compare_outputs", lambda *a, **kw: ok_chain
+    )
+
+    # 'n' rejects the first call; the remaining nine all approve.
+    _scripted_input(monkeypatch, ["n"] + ["y"] * 9)
+
+    result = run_orchestrator("k.cpp", "src")
 
     assert result == {"rewritten_code": "X", "notes": "gave up"}
 
@@ -797,21 +996,23 @@ def test_orchestrator_tools_include_spawn_baseline_harness():
     }
 
 
-def test_orchestrator_prompt_mentions_baseline_harness_and_side_artifact():
-    """The orchestrator prompt names baseline_harness, the BASELINE STEP block, and explicitly marks the baseline as a side artifact that is not a precondition for finish."""
+def test_orchestrator_prompt_mentions_baseline_harness_and_dynamic_verification_chain():
+    """The orchestrator prompt names baseline_harness, the BASELINE STEP block, and ties baseline_harness to the dynamic-verification chain (the code-side finish-gate). Phase B genericized the wording from 'side artifact' to chain-membership language because Kokkos and CUDA both wire the baseline into the dynamic-verification chain now."""
     text = ORCHESTRATOR_SYSTEM_PROMPT
     assert "baseline_harness" in text
     assert "BASELINE STEP" in text
     lower = text.lower()
-    assert "side artifact" in lower
-    # The baseline must not gate finish; the analyst->rewriter->verifier
-    # pipeline still does. Surface this as an explicit assertion so a
-    # future prompt edit can't silently flip the semantics.
-    assert "not a precondition for finish" in lower
+    # Phase B: baseline is no longer "just a side artifact" — it's the
+    # first link in the dynamic-verification chain that gates finish on
+    # profiles with dynamic_verification=True. Assert the prompt names
+    # that chain explicitly so a future edit can't silently drop it.
+    assert "dynamic-verification chain" in lower
+    assert "compare_outputs" in text
+    assert "finish-gate" in lower
 
 
 def test_execute_tool_dispatches_spawn_baseline_harness(monkeypatch, tmp_path):
-    """_execute_tool routes spawn_baseline_harness to run_agent('baseline_harness', kernel_source), writes the driver to baselines/<stem>/driver.cpp, and returns the driver_path alongside the result."""
+    """_execute_tool routes spawn_baseline_harness to run_agent('baseline_harness_<profile.id>', kernel_source) — per-language dispatch via the profile id — writes the driver to baselines/<stem>/<profile.driver_filename>, and returns the driver_path alongside the result."""
     monkeypatch.chdir(tmp_path)
     calls = []
 
@@ -835,7 +1036,7 @@ def test_execute_tool_dispatches_spawn_baseline_harness(monkeypatch, tmp_path):
 
     assert result["status"] == "ok"
     assert result["result"]["kernel_function_name"] == "vector_add"
-    assert calls == [("baseline_harness", "KSRC")]
+    assert calls == [("baseline_harness_kokkos", "KSRC")]
 
     # The driver must land at baselines/<stem>/driver.cpp under CWD
     # (the orchestrator writes via a *relative* Path; under
@@ -900,15 +1101,19 @@ def test_format_baseline_block_cpp_with_kernel_name_includes_target_line():
     assert "TARGET KERNEL: vector_add" in block
 
 
-def test_format_baseline_block_cu_tells_orchestrator_to_skip():
-    """For a CUDA .cu kernel, the block explicitly tells the orchestrator NOT to call spawn_baseline_harness (v0 is Kokkos-only)."""
+def test_format_baseline_block_cu_invites_baseline_under_cuda_profile():
+    """For a CUDA .cu kernel under CUDA_PROFILE (dynamic_verification=True), the block INVITES spawn_baseline_harness and surfaces the KERNEL STEM and the CUDA driver filename (driver.cu). Phase B inverted the old 'skipped' assertion because CUDA_PROFILE now ships its own baseline harness and is part of the dynamic-verification chain."""
     block = _format_baseline_block(
-        "test-kernels/cuda/lowerable/vector_add.cu", None, KOKKOS_PROFILE
+        "test-kernels/cuda/lowerable/vector_add.cu", None, CUDA_PROFILE
     )
-    assert "skipped" in block.lower()
-    assert "Do NOT call spawn_baseline_harness" in block
-    # No KERNEL STEM line either; nothing to do.
-    assert "spawn_baseline_harness" in block  # only in the negation
+    assert "BASELINE STEP" in block
+    assert "KERNEL STEM: vector_add" in block
+    assert "spawn_baseline_harness" in block
+    # The driver filename in the block must match the profile, not the
+    # hardcoded Kokkos default — that's the whole point of routing this
+    # through the LanguageProfile.
+    assert "driver.cu" in block
+    assert "skipped" not in block.lower()
 
 
 # ---------- run_orchestrator: baseline block in initial user message ----------
@@ -959,10 +1164,10 @@ def test_run_orchestrator_cpp_with_kernel_name_includes_target_kernel_line(
     assert "KERNEL STEM: vector_add" in first_user
 
 
-def test_run_orchestrator_cu_kernel_skips_baseline_in_first_user_message(
+def test_run_orchestrator_cu_kernel_invites_baseline_in_first_user_message(
     monkeypatch, fake_anthropic
 ):
-    """For a CUDA .cu kernel, the first user message's BASELINE STEP block tells the orchestrator not to call spawn_baseline_harness (v0 is Kokkos-only)."""
+    """For a CUDA .cu kernel, the first user message's BASELINE STEP block INVITES spawn_baseline_harness (CUDA_PROFILE has dynamic_verification=True). Phase B inverted the prior 'skips baseline' assertion because the .cu suffix now resolves to CUDA_PROFILE, which ships its own baseline harness and joins the dynamic-verification chain."""
     # First-user-message-only test: short-circuit on turn 1 with a
     # text+end_turn response so the loop exits before engaging the gate.
     fake = fake_anthropic([
@@ -977,8 +1182,9 @@ def test_run_orchestrator_cu_kernel_skips_baseline_in_first_user_message(
 
     first_user = fake.messages.calls[0]["messages"][0]["content"]
     assert "BASELINE STEP" in first_user
-    assert "skipped" in first_user.lower()
-    assert "Do NOT call spawn_baseline_harness" in first_user
+    assert "KERNEL STEM: vector_add" in first_user
+    assert "spawn_baseline_harness" in first_user
+    assert "skipped" not in first_user.lower()
 
 
 # ---------- compile_baseline_driver: tool schema + prompt + dispatch ----------
@@ -996,12 +1202,17 @@ def test_orchestrator_tools_include_compile_baseline_driver():
 
 
 def test_orchestrator_prompt_mentions_compile_baseline_driver_and_env_var():
-    """The orchestrator prompt names compile_baseline_driver and AGENT_PRECISION_KOKKOS_ROOT, and states the compile is a side artifact (not a precondition for finish)."""
+    """The orchestrator prompt names compile_baseline_driver and AGENT_PRECISION_KOKKOS_ROOT, and asserts that a compile error there does NOT block the analyst -> rewriter -> verifier pipeline (only the dynamic-verification chain, and therefore finish on profiles where the chain is required). Phase B genericized 'side artifact' wording to chain-membership wording because the compiled driver is no longer a dead-end side artifact — it feeds run_baseline_driver / splice / compare."""
     text = ORCHESTRATOR_SYSTEM_PROMPT
     assert "compile_baseline_driver" in text
     assert "AGENT_PRECISION_KOKKOS_ROOT" in text
-    # Must be marked as a side artifact, same as the baseline itself.
-    assert "side artifact" in text.lower() or "not a precondition for finish" in text.lower()
+    # The compile must not block the LLM pipeline even though it now
+    # transitively gates finish on profiles with dynamic_verification=True.
+    # Surface the "does NOT block analyst -> rewriter -> verifier"
+    # invariant explicitly so a future prompt edit can't silently flip it.
+    lower = text.lower()
+    assert "does not block" in lower or "must not block" in lower
+    assert "analyst -> rewriter -> verifier" in text
 
 
 def test_format_baseline_block_cpp_mentions_compile_step():
@@ -1014,12 +1225,12 @@ def test_format_baseline_block_cpp_mentions_compile_step():
     assert "spawn_baseline_harness" in block
 
 
-def test_format_baseline_block_cu_does_not_mention_compile_step():
-    """For a CUDA .cu kernel, the (skipped) BASELINE STEP block must NOT mention compile_baseline_driver — the compile depends on the harness, which is forbidden for .cu inputs."""
+def test_format_baseline_block_cu_mentions_compile_step():
+    """For a CUDA .cu kernel under CUDA_PROFILE, the (invited) BASELINE STEP block DOES mention compile_baseline_driver — Phase B added CUDA to the dynamic-verification chain, so the compile step is now part of the .cu flow too."""
     block = _format_baseline_block(
-        "test-kernels/cuda/lowerable/vector_add.cu", None, KOKKOS_PROFILE
+        "test-kernels/cuda/lowerable/vector_add.cu", None, CUDA_PROFILE
     )
-    assert "compile_baseline_driver" not in block
+    assert "compile_baseline_driver" in block
 
 
 def test_execute_tool_dispatches_compile_baseline_driver(monkeypatch):
@@ -1089,12 +1300,15 @@ def test_orchestrator_tools_include_run_baseline_driver():
 
 
 def test_orchestrator_prompt_mentions_run_baseline_driver_and_env_var():
-    """The orchestrator prompt names run_baseline_driver and AGENT_PRECISION_RUN_TIMEOUT_SEC, and states the run output is a side artifact (not a precondition for finish)."""
+    """The orchestrator prompt names run_baseline_driver and AGENT_PRECISION_RUN_TIMEOUT_SEC, and asserts that a run error there does NOT block the analyst -> rewriter -> verifier pipeline (only the dynamic-verification chain, and therefore finish on profiles where the chain is required). Phase B genericized 'side artifact' wording to chain-membership wording because reference.json now feeds compare_outputs and the code-side finish-gate."""
     text = ORCHESTRATOR_SYSTEM_PROMPT
     assert "run_baseline_driver" in text
     assert "AGENT_PRECISION_RUN_TIMEOUT_SEC" in text
-    # Must be marked as a side artifact, same as the baseline + compile.
-    assert "side artifact" in text.lower() or "not a precondition for finish" in text.lower()
+    # The run must not block the LLM pipeline even though it now
+    # transitively gates finish on profiles with dynamic_verification=True.
+    lower = text.lower()
+    assert "does not block" in lower or "must not block" in lower
+    assert "analyst -> rewriter -> verifier" in text
 
 
 def test_format_baseline_block_cpp_mentions_run_step():
@@ -1107,12 +1321,12 @@ def test_format_baseline_block_cpp_mentions_run_step():
     assert "compile_baseline_driver" in block
 
 
-def test_format_baseline_block_cu_does_not_mention_run_step():
-    """For a CUDA .cu kernel, the (skipped) BASELINE STEP block must NOT mention run_baseline_driver — the run depends on a compile, which depends on the harness, which is forbidden for .cu inputs."""
+def test_format_baseline_block_cu_mentions_run_step():
+    """For a CUDA .cu kernel under CUDA_PROFILE, the (invited) BASELINE STEP block DOES mention run_baseline_driver — Phase B added CUDA to the dynamic-verification chain, so the run step is now part of the .cu flow too."""
     block = _format_baseline_block(
-        "test-kernels/cuda/lowerable/vector_add.cu", None, KOKKOS_PROFILE
+        "test-kernels/cuda/lowerable/vector_add.cu", None, CUDA_PROFILE
     )
-    assert "run_baseline_driver" not in block
+    assert "run_baseline_driver" in block
 
 
 def test_execute_tool_dispatches_run_baseline_driver(monkeypatch):
@@ -1187,14 +1401,17 @@ def test_orchestrator_tools_include_splice_rewritten_kernel():
 
 
 def test_orchestrator_prompt_mentions_splice_rewritten_kernel():
-    """The orchestrator prompt names splice_rewritten_kernel, ties it to a verifier accept after a successful run_baseline_driver, and states a splice error must not block finish."""
+    """The orchestrator prompt names splice_rewritten_kernel, ties it to a verifier accept after a successful run_baseline_driver, and names the spliced driver as feeding the rewritten compile/run/compare chain that the code-side finish-gate enforces on dynamic_verification=True profiles. Phase B removed the old 'must not block finish' wording because splice now IS in the chain that gates finish; the right invariant is that splice depends on a verifier accept AND on a successful baseline chain."""
     text = ORCHESTRATOR_SYSTEM_PROMPT
     assert "splice_rewritten_kernel" in text
     # Must be conditioned on verifier accept, not on the baseline chain alone.
     assert "verdict='accept'" in text
-    # Splice must be flagged as non-blocking for finish, mirroring the
-    # rest of the baseline chain.
-    assert "side artifact" in text.lower() or "not a precondition for finish" in text.lower() or "must NOT block finish" in text
+    # Splice feeds the rewritten compile/run/compare chain that the
+    # code-side finish-gate enforces. Surface that linkage explicitly so
+    # a future prompt edit can't drop the chain-membership semantics.
+    lower = text.lower()
+    assert "rewritten compile/run/compare chain" in lower or "dynamic-verification chain" in lower
+    assert "finish-gate" in lower
 
 
 def test_format_baseline_block_cpp_mentions_splice_step():
@@ -1209,12 +1426,12 @@ def test_format_baseline_block_cpp_mentions_splice_step():
     assert "run_baseline_driver" in block
 
 
-def test_format_baseline_block_cu_does_not_mention_splice_step():
-    """For a CUDA .cu kernel, the (skipped) BASELINE STEP block must NOT mention splice_rewritten_kernel — the splice depends on a baseline driver, which depends on the harness, which is forbidden for .cu inputs."""
+def test_format_baseline_block_cu_mentions_splice_step():
+    """For a CUDA .cu kernel under CUDA_PROFILE, the (invited) BASELINE STEP block DOES mention splice_rewritten_kernel — Phase B added CUDA to the dynamic-verification chain, so the splice step is now part of the .cu flow too."""
     block = _format_baseline_block(
-        "test-kernels/cuda/lowerable/vector_add.cu", None, KOKKOS_PROFILE
+        "test-kernels/cuda/lowerable/vector_add.cu", None, CUDA_PROFILE
     )
-    assert "splice_rewritten_kernel" not in block
+    assert "splice_rewritten_kernel" in block
 
 
 def test_execute_tool_dispatches_splice_rewritten_kernel(monkeypatch):
@@ -1297,17 +1514,17 @@ def test_orchestrator_tools_include_compile_rewritten_driver():
 
 
 def test_orchestrator_prompt_mentions_compile_rewritten_driver():
-    """The orchestrator prompt names compile_rewritten_driver, ties it to a preceding successful splice_rewritten_kernel, and states a rewritten-compile error must not block finish."""
+    """The orchestrator prompt names compile_rewritten_driver, ties it to a preceding successful splice_rewritten_kernel, and states a rewritten-compile error transitively blocks the dynamic-verification chain (and therefore finish on profiles where the chain is required). Phase B removed the old 'must not block finish' wording because the rewritten-compile now IS in the chain that gates finish on Kokkos / CUDA inputs."""
     text = ORCHESTRATOR_SYSTEM_PROMPT
     assert "compile_rewritten_driver" in text
     # Must be conditioned on splice success, not standalone.
     assert "splice_rewritten_kernel" in text
-    # Must be flagged as non-blocking for finish, mirroring the rest of
-    # the baseline + dynamic-verification chain.
-    assert (
-        "must NOT block finish" in text
-        or "not a precondition for finish" in text.lower()
-    )
+    # Compile-rewritten failures transitively block the chain (and
+    # therefore finish on dynamic_verification=True profiles). Assert
+    # the prompt names the chain so a future edit can't silently flip
+    # the gating semantics back to "non-blocking for finish".
+    lower = text.lower()
+    assert "transitively blocks" in lower or "dynamic-verification chain" in lower
 
 
 def test_format_baseline_block_cpp_mentions_compile_rewritten_step():
@@ -1320,12 +1537,12 @@ def test_format_baseline_block_cpp_mentions_compile_rewritten_step():
     assert "splice_rewritten_kernel" in block
 
 
-def test_format_baseline_block_cu_does_not_mention_compile_rewritten_step():
-    """For a CUDA .cu kernel, the (skipped) BASELINE STEP block must NOT mention compile_rewritten_driver — it depends on splice, which depends on the baseline chain, which is forbidden for .cu inputs."""
+def test_format_baseline_block_cu_mentions_compile_rewritten_step():
+    """For a CUDA .cu kernel under CUDA_PROFILE, the (invited) BASELINE STEP block DOES mention compile_rewritten_driver — Phase B added CUDA to the dynamic-verification chain, so the rewritten-compile step is now part of the .cu flow too."""
     block = _format_baseline_block(
-        "test-kernels/cuda/lowerable/vector_add.cu", None, KOKKOS_PROFILE
+        "test-kernels/cuda/lowerable/vector_add.cu", None, CUDA_PROFILE
     )
-    assert "compile_rewritten_driver" not in block
+    assert "compile_rewritten_driver" in block
 
 
 def test_execute_tool_dispatches_compile_rewritten_driver(monkeypatch):
@@ -1403,19 +1620,18 @@ def test_orchestrator_tools_include_run_rewritten_driver():
 
 
 def test_orchestrator_prompt_mentions_run_rewritten_driver():
-    """The orchestrator prompt names run_rewritten_driver, ties it to a preceding successful compile_rewritten_driver, and states a rewritten-run error must not block finish."""
+    """The orchestrator prompt names run_rewritten_driver, ties it to a preceding successful compile_rewritten_driver, and states that a rewritten-run error means the comparator cannot proceed and finish will be blocked on dynamic_verification=True profiles until compare_outputs has successfully run. Phase B removed the old 'must not block finish' wording because the rewritten-run feeds compare_outputs directly."""
     text = ORCHESTRATOR_SYSTEM_PROMPT
     assert "run_rewritten_driver" in text
     # Must be conditioned on the rewritten-compile step succeeding,
     # never a standalone instruction.
     assert "compile_rewritten_driver" in text
-    # Must be flagged as non-blocking for finish, mirroring the rest of
-    # the baseline + dynamic-verification chain. The wording matches
-    # either of the two phrasings used elsewhere in the prompt.
-    assert (
-        "must NOT block finish" in text
-        or "not a precondition for finish" in text.lower()
-    )
+    # The rewritten-run produces the comparator's input; assert the
+    # prompt names that dependency so a future edit can't silently
+    # decouple them.
+    lower = text.lower()
+    assert "compare_outputs" in text
+    assert "comparator cannot proceed" in lower or "dynamic-verification chain" in lower
 
 
 def test_format_baseline_block_cpp_mentions_run_rewritten_step():
@@ -1431,12 +1647,12 @@ def test_format_baseline_block_cpp_mentions_run_rewritten_step():
     assert "splice_rewritten_kernel" in block
 
 
-def test_format_baseline_block_cu_does_not_mention_run_rewritten_step():
-    """For a CUDA .cu kernel, the (skipped) BASELINE STEP block must NOT mention run_rewritten_driver — it depends on compile_rewritten, which depends on splice, which depends on the baseline chain, which is forbidden for .cu inputs."""
+def test_format_baseline_block_cu_mentions_run_rewritten_step():
+    """For a CUDA .cu kernel under CUDA_PROFILE, the (invited) BASELINE STEP block DOES mention run_rewritten_driver — Phase B added CUDA to the dynamic-verification chain, so the rewritten-run step is now part of the .cu flow too."""
     block = _format_baseline_block(
-        "test-kernels/cuda/lowerable/vector_add.cu", None, KOKKOS_PROFILE
+        "test-kernels/cuda/lowerable/vector_add.cu", None, CUDA_PROFILE
     )
-    assert "run_rewritten_driver" not in block
+    assert "run_rewritten_driver" in block
 
 
 def test_execute_tool_dispatches_run_rewritten_driver(monkeypatch):
@@ -1551,12 +1767,12 @@ def test_format_baseline_block_cpp_mentions_compare_outputs_step():
     assert "finish" in block
 
 
-def test_format_baseline_block_cu_does_not_mention_compare_outputs():
-    """For a CUDA .cu kernel, the (skipped) BASELINE STEP block must NOT mention compare_outputs — the whole rewritten chain is skipped for .cu inputs in v0, and the finish-gate falls back to verifier-only."""
+def test_format_baseline_block_cu_mentions_compare_outputs():
+    """For a CUDA .cu kernel under CUDA_PROFILE, the (invited) BASELINE STEP block DOES mention compare_outputs — Phase B added CUDA to the dynamic-verification chain, so compare_outputs is now the finish-gating step on .cu inputs too."""
     block = _format_baseline_block(
-        "test-kernels/cuda/lowerable/vector_add.cu", None, KOKKOS_PROFILE
+        "test-kernels/cuda/lowerable/vector_add.cu", None, CUDA_PROFILE
     )
-    assert "compare_outputs" not in block
+    assert "compare_outputs" in block
 
 
 def test_execute_tool_dispatches_compare_outputs(monkeypatch):
@@ -1816,14 +2032,18 @@ def test_finish_gate_cpp_compare_never_called_blocks_finish(
     assert "compare_status" in payload["stderr"]
 
 
-def test_finish_gate_cu_verifier_accept_allows_finish_without_comparator(
+def test_finish_gate_cu_verifier_accept_alone_blocks_finish_post_phase_b(
     monkeypatch, fake_anthropic, tmp_path
 ):
-    """For a .cu kernel, the dynamic-verification chain is skipped entirely and the finish-gate falls back to verifier-only — finish succeeds on a verifier-accept with no compare_outputs call."""
+    """For a .cu kernel under CUDA_PROFILE (dynamic_verification=True post-Phase-B), the finish-gate now requires compare_outputs status='ok' too — a verifier-accept alone is no longer enough. Phase B added CUDA to the dynamic-verification chain, so the .cu and .cpp gating semantics are unified: this test mirrors test_finish_gate_cpp_compare_never_called_blocks_finish above but for .cu."""
     monkeypatch.chdir(tmp_path)
     fake = fake_anthropic([
         _verifier_accept_response("tu_v"),
         _finish_response("tu_f"),
+        FakeResponse(
+            content=[TextBlock(text="(test stop)")],
+            stop_reason="end_turn",
+        ),
     ])
     monkeypatch.setattr(
         orchestrator,
@@ -1837,5 +2057,18 @@ def test_finish_gate_cu_verifier_accept_allows_finish_without_comparator(
     _scripted_input(monkeypatch, ["y", "y"])
 
     result = run_orchestrator("path/to/vector_add.cu", "src")
-    assert result == {"rewritten_code": "FINAL", "notes": "done"}
-    assert len(fake.messages.calls) == 2
+    # Finish was blocked -> loop continued and hit the text+end_turn
+    # response at turn 3, returning None.
+    assert result is None
+
+    # The blocked-finish tool_result must mention that compare_outputs
+    # was missing for the current rewrite cycle — same shape as the
+    # .cpp sibling test, because the gate is now profile-agnostic.
+    third_messages = fake.messages.calls[2]["messages"]
+    last = third_messages[-1]
+    blocks_by_id = {b["tool_use_id"]: b for b in last["content"]}
+    finish_block = blocks_by_id["tu_f"]
+    assert finish_block["is_error"] is True
+    payload = json.loads(finish_block["content"])
+    assert "compare_outputs" in payload["stderr"]
+    assert "compare_status" in payload["stderr"]
