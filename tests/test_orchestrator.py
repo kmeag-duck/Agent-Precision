@@ -562,6 +562,165 @@ def test_execute_tool_spawn_verifier_includes_tolerance_in_task(monkeypatch):
     assert "user_cli" in captured["task"]
 
 
+# ---------- _execute_tool: spawn_verifier panel mode (opt-in) ----------
+
+
+def _verifier_task_args() -> dict:
+    """Standard four-arg payload for spawn_verifier in panel tests."""
+    return {
+        "original_source": "ORIG",
+        "rewritten_source": "REW",
+        "analyst_verdict_json": '{"variables": []}',
+        "tolerance_json": '{"kind":"sig_figs","value":6,"source":"user_cli"}',
+    }
+
+
+def test_execute_tool_spawn_verifier_default_k_uses_single_shot(monkeypatch):
+    """Without AGENT_PRECISION_VERIFIER_K set, _execute_tool stays on the single-shot run_agent('verifier', ...) path and does NOT invoke run_verifier_panel — preserves existing behavior for callers who have not opted into the panel."""
+    monkeypatch.delenv("AGENT_PRECISION_VERIFIER_K", raising=False)
+
+    def stub_run_agent(type_, task):
+        assert type_ == "verifier"
+        return {"verdict": "accept", "per_variable": [], "concerns": []}
+
+    def fail_panel(*a, **kw):
+        raise AssertionError(
+            "run_verifier_panel must not be called when K is unset (defaults to 1)"
+        )
+
+    monkeypatch.setattr(orchestrator, "run_agent", stub_run_agent)
+    monkeypatch.setattr(orchestrator, "run_verifier_panel", fail_panel)
+
+    result = _execute_tool("spawn_verifier", _verifier_task_args())
+    assert result == {
+        "status": "ok",
+        "result": {"verdict": "accept", "per_variable": [], "concerns": []},
+    }
+    # The single-shot path must NOT carry verifier_aggregator_metadata; that
+    # key is the signal to downstream tooling (and to the trace reader) that
+    # a panel actually ran.
+    assert "verifier_aggregator_metadata" not in result
+
+
+def test_execute_tool_spawn_verifier_k_gt_one_runs_panel_and_aggregates(
+    monkeypatch,
+):
+    """With AGENT_PRECISION_VERIFIER_K=3 and a custom T, _execute_tool calls run_verifier_panel with the first K lenses and temperature, folds the K verdicts through aggregate_verifier_verdicts, and returns the aggregated result plus the disagreement report as verifier_aggregator_metadata."""
+    monkeypatch.setenv("AGENT_PRECISION_VERIFIER_K", "3")
+    monkeypatch.setenv("AGENT_PRECISION_VERIFIER_T", "0.4")
+
+    captured = {}
+
+    def stub_panel(task, lenses, temperature):
+        captured["task"] = task
+        captured["lenses"] = lenses
+        captured["temperature"] = temperature
+        # Two lenses accept, the budget lens rejects with one concern.
+        # Strict aggregation must flip the whole panel to reject and the
+        # report must name 'budget' as the dissenting lens.
+        return [
+            {
+                "verdict": "accept",
+                "per_variable": [
+                    {
+                        "name": "x",
+                        "expected_action": "downcast",
+                        "observed_action": "downcast",
+                        "ok": True,
+                        "note": "",
+                    }
+                ],
+                "concerns": [],
+            },
+            {
+                "verdict": "reject",
+                "per_variable": [],
+                "concerns": ["headroom_argument is hand-wavy"],
+            },
+            {
+                "verdict": "accept",
+                "per_variable": [],
+                "concerns": [],
+            },
+        ]
+
+    def fail_single(*a, **kw):
+        raise AssertionError(
+            "run_agent must not be called directly when K>1 — the panel path owns the calls"
+        )
+
+    monkeypatch.setattr(orchestrator, "run_verifier_panel", stub_panel)
+    monkeypatch.setattr(orchestrator, "run_agent", fail_single)
+
+    result = _execute_tool("spawn_verifier", _verifier_task_args())
+
+    # The task threaded through verifier_panel is the same fully-formed
+    # verifier prompt — same original/rewritten/verdict/tolerance shape.
+    assert "ORIG" in captured["task"]
+    assert "REW" in captured["task"]
+    assert "ANALYST VERDICT" in captured["task"]
+    assert "TOLERANCE" in captured["task"]
+    # The panel got the first K lenses verbatim and the requested temperature.
+    assert [l["name"] for l in captured["lenses"]] == [
+        "faithfulness",
+        "budget",
+        "edge_cases",
+    ]
+    assert captured["temperature"] == 0.4
+
+    assert result["status"] == "ok"
+    # Strict-verdict: budget rejected, so the aggregate is reject.
+    assert result["result"]["verdict"] == "reject"
+    # per_variable from the faithfulness lens (lens 0) survives verbatim.
+    assert result["result"]["per_variable"][0]["name"] == "x"
+    # concerns carry the lens-name prefix so the rewriter retry knows
+    # which lens raised which worry.
+    assert any(
+        c.startswith("[budget]") for c in result["result"]["concerns"]
+    )
+    # The disagreement report rides alongside and names the dissenter.
+    metadata = result["verifier_aggregator_metadata"]
+    assert metadata["k"] == 3
+    assert metadata["dissenting_lenses"] == ["budget"]
+    assert metadata["lens_verdicts"]["faithfulness"] == "accept"
+
+
+def test_execute_tool_spawn_verifier_k_gt_one_default_temperature(monkeypatch):
+    """When AGENT_PRECISION_VERIFIER_K is set but AGENT_PRECISION_VERIFIER_T is not, the panel runs at the documented 0.7 default — chosen for lens diversity, mirroring the analyst ensemble default."""
+    monkeypatch.setenv("AGENT_PRECISION_VERIFIER_K", "2")
+    monkeypatch.delenv("AGENT_PRECISION_VERIFIER_T", raising=False)
+
+    captured = {}
+
+    def stub_panel(task, lenses, temperature):
+        captured["temperature"] = temperature
+        v = {"verdict": "accept", "per_variable": [], "concerns": []}
+        return [v, v]
+
+    monkeypatch.setattr(orchestrator, "run_verifier_panel", stub_panel)
+
+    _execute_tool("spawn_verifier", _verifier_task_args())
+    assert captured["temperature"] == 0.7
+
+
+def test_execute_tool_spawn_verifier_k_exceeds_lenses_raises(monkeypatch):
+    """AGENT_PRECISION_VERIFIER_K cannot exceed the number of defined lenses — lenses ARE the panel, not just a replication multiplier. The error message must be actionable (mention both the requested K and where to add a lens)."""
+    from workflow.verifier_panel import VERIFIER_LENSES
+
+    over = len(VERIFIER_LENSES) + 1
+    monkeypatch.setenv("AGENT_PRECISION_VERIFIER_K", str(over))
+
+    def fail_panel(*a, **kw):
+        raise AssertionError(
+            "run_verifier_panel must not be called when K exceeds lens count"
+        )
+
+    monkeypatch.setattr(orchestrator, "run_verifier_panel", fail_panel)
+
+    with pytest.raises(ValueError, match="VERIFIER_LENSES"):
+        _execute_tool("spawn_verifier", _verifier_task_args())
+
+
 # ---------- run_orchestrator: tolerance plumbing in the initial user message ----------
 
 
