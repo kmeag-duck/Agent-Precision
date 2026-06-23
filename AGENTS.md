@@ -48,7 +48,7 @@ The shim script is expected at `~/argo-shim-lite/claude-argo-proxy.py` (override
 ./scripts/run-argoproxy.sh test-kernels/kokkos/mixed/nbody_force.cpp
 ```
 
-`argo-proxy serve` (the same daemon OpenCode's `provider.argo` depends on) natively exposes an Anthropic-compatible `/v1/messages` route at `http://127.0.0.1:52675/v1/`. The wrapper just `curl`s `/health`, then runs `python -m workflow.run` with `ANTHROPIC_BASE_URL=http://127.0.0.1:52675/v1/` and `ANTHROPIC_AUTH_TOKEN=$USER` (any non-empty string; argo-proxy ignores it).
+`argo-proxy serve` (the same daemon OpenCode's `provider.argo` depends on) natively exposes an Anthropic-compatible `/v1/messages` route at `http://127.0.0.1:52675/v1/`. The wrapper just `curl`s `/health`, then runs `python -m workflow.run` with `ANTHROPIC_BASE_URL=http://127.0.0.1:52675/` and `ANTHROPIC_AUTH_TOKEN=$USER` (any non-empty string; argo-proxy ignores it). The base URL is the bare host root, not `…/v1/`: the anthropic SDK (≥0.x) appends `v1/messages` itself, so a `/v1/` in `ANTHROPIC_BASE_URL` produces a `/v1/v1/messages` request and a 404 from argo-proxy. The `provider.argo` entry in `opencode.json` uses `"baseURL": "http://localhost:52675/v1"` — that's a different SDK convention (OpenAI-route compatibility) and is unaffected by this rule.
 
 Prereq: `argo-proxy serve` is already running. argo-proxy has persistent auth set up at pipx-install time, so there's no per-session Duo prompt.
 

@@ -4,7 +4,8 @@
 #
 # Unlike scripts/run-argo.sh, this needs no SSH tunnel and no per-session Duo:
 # argo-proxy maintains its own persistent auth and serves an Anthropic-compatible
-# /v1/messages route at http://127.0.0.1:52675/v1/.
+# /v1/messages route at http://127.0.0.1:52675/v1/ (the SDK appends
+# `v1/messages` itself, so we set BASE_URL to the bare host root).
 #
 # Prereq: `argo-proxy serve` is already running. Check with:
 #   curl -sf http://127.0.0.1:52675/health
@@ -30,7 +31,12 @@
 set -euo pipefail
 
 PORT="${ARGOPROXY_PORT:-52675}"
-BASE_URL="http://127.0.0.1:${PORT}/v1/"
+# NOTE: no `/v1/` suffix here. The anthropic SDK appends `v1/messages`
+# itself to ANTHROPIC_BASE_URL, so a `/v1/` in the base produces a
+# `/v1/v1/messages` request and a 404 from argo-proxy. The OpenAI-route
+# entry in opencode.json (`baseURL: http://localhost:52675/v1`) is a
+# different SDK convention and is unaffected.
+BASE_URL="http://127.0.0.1:${PORT}/"
 
 if ! curl -sf "http://127.0.0.1:${PORT}/health" >/dev/null; then
     echo "argo-proxy is not responding on :${PORT}. Start it with: argo-proxy serve" >&2
