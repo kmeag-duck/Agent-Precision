@@ -46,7 +46,9 @@ What works today:
 - Tolerance from `--sig-figs` / `--decimal-digits`, else inferred by the advisor; advisor may return `kind='unknown'`, which triggers fallback `{sig_figs: 6, source: 'advisor_unknown_defaulted'}`.
 - Tolerance threaded verbatim to analyst, rewriter, and verifier; analyst returns a `precision_budget` block; verifier audits it.
 - Per-variable methods: `downcast` (narrower hardware type — the throughput win), `emulate` (software pair, currently inline float-float / Dekker — throughput-NEGATIVE; only when downcast violates tolerance), or `keep`. Analyst can additionally suggest a kernel-shape `rework` such as Kahan summation.
-- HITL pause before every agent call (`y` / `n` / `q`); rejection feeds `{"status": "rejected_by_user"}` back so the orchestrator can self-correct.
+- HITL pause before every agent call (`y` / `n` / `q`); rejection feeds `{"status": "rejected_by_user"}` back so the orchestrator can self-correct. `--auto` skips the pause for batch runs and writes a JSONL trace of every executed tool to `baselines/<kernel_stem>/orchestrator_trace.jsonl`.
+- Optional **analyst self-consistency ensemble**: opt-in via `AGENT_PRECISION_ANALYST_K > 1` (with diversity temperature `AGENT_PRECISION_ANALYST_T`, default `0.7`). Runs the analyst K times in parallel and folds the verdicts through `workflow/aggregator.py` — per-variable plurality with `keep > emulate > downcast` conservative tiebreak, strict-majority rework vote, budget+notes from the most-aligned verdict. Default `K=1` preserves the existing single-shot behavior.
+- Optional **verifier perspective-diverse panel**: opt-in via `AGENT_PRECISION_VERIFIER_K > 1` (with `AGENT_PRECISION_VERIFIER_T`, default `0.7`). Runs the verifier K times in parallel under K distinct lenses (faithfulness → budget → edge_cases; defined in `workflow/verifier_panel.py:VERIFIER_LENSES`) and folds the results through `aggregate_verifier_verdicts` — strict-accept (any dissent flips to reject), per-variable owned by the faithfulness lens, concerns unioned and prefixed with `[<lens>]` for richer rewriter-retry feedback. `K` is capped at the number of defined lenses.
 - Registry-driven agent definitions: one entry in `workflow/registry.py` per agent type; the generic runner is untouched.
 - Three execution backends: direct `api.anthropic.com`, Argo via local `argo-proxy`, and Argo via SSH tunnel + shim (fallback).
 
@@ -74,11 +76,22 @@ scripts forward all extra arguments to `python -m workflow.run`.
 ```text
 --sig-figs N         relative tolerance: ~N significant figures of agreement
 --decimal-digits N   absolute tolerance: ~N decimal places of agreement
+--auto               skip the HITL pause; write JSONL trace to
+                     baselines/<kernel_stem>/orchestrator_trace.jsonl
 ```
 
-If neither flag is given, the orchestrator calls the `precision_advisor`
-agent to infer one from the kernel source (see "Status" for the
-`kind='unknown'` fallback).
+If neither tolerance flag is given, the orchestrator calls the
+`precision_advisor` agent to infer one from the kernel source (see
+"Status" for the `kind='unknown'` fallback).
+
+**Optional ensemble env vars** (default behavior is unchanged when unset):
+
+```text
+AGENT_PRECISION_ANALYST_K=N    run analyst N times in parallel and aggregate
+AGENT_PRECISION_ANALYST_T=F    sampling temperature for the analyst ensemble (default 0.7)
+AGENT_PRECISION_VERIFIER_K=N   run verifier under N distinct lenses (N <= 3)
+AGENT_PRECISION_VERIFIER_T=F   sampling temperature for the verifier panel (default 0.7)
+```
 
 **Direct (Anthropic API).** `.env` is not auto-loaded.
 
@@ -207,6 +220,32 @@ violate that tolerance. The rewriter is forbidden from silently
 substituting one method for another (e.g. downcasting when asked to
 emulate), so the verifier's per-variable `ok` check has actual meaning.
 
+The analyst and verifier each have an optional K-fold mode that the
+orchestrator picks up from environment variables (default `K=1`,
+behavior unchanged when unset; see "Run"):
+
+- `AGENT_PRECISION_ANALYST_K > 1` → the analyst is called K times in
+  parallel at `AGENT_PRECISION_ANALYST_T` (default `0.7`) and its
+  verdicts are folded by `workflow/aggregator.py` into a single
+  schema-conformant verdict (per-variable plurality with
+  `keep > emulate > downcast` conservative tiebreak; strict-majority
+  rework; budget+notes from the most-aligned source verdict). The
+  disagreement report rides alongside the result as
+  `aggregator_metadata` for the orchestrator trace.
+- `AGENT_PRECISION_VERIFIER_K > 1` (capped at the number of defined
+  lenses, currently 3) → the verifier is called K times in parallel
+  under K distinct lenses (`faithfulness`, `budget`, `edge_cases`;
+  defined in `workflow/verifier_panel.py:VERIFIER_LENSES`) at
+  `AGENT_PRECISION_VERIFIER_T` (default `0.7`). Each lens is a
+  per-call system-prompt suffix appended via
+  `run_agent(..., system_prompt_suffix=...)`, so the base verifier
+  prompt in `registry.py` stays the single source of truth. The K
+  verdicts fold to a single schema-conformant verdict: strict-accept
+  (any single lens reject flips the whole verdict), `per_variable`
+  from the faithfulness lens verbatim, `concerns` unioned across
+  lenses and prefixed with `[<lens>] ` so a rewriter-retry prompt
+  sees which lens raised which concern.
+
 The `baseline_harness` is orthogonal to the analyst → rewriter → verifier
 pipeline: it is invited (by the initial user message's BASELINE STEP
 block) for Kokkos `.cpp` inputs only, called at most once per run, and
@@ -271,10 +310,28 @@ exiting.
   - `run_agent.py` — generic agent runner. Forces structured output via
     `tool_choice={"type":"tool","name":"submit_result"}` whose input schema
     is the registry entry's `output_schema`. Never edited per-agent.
+    Also exports `run_agent_ensemble(type, task, k, temperature)` — a
+    `ThreadPoolExecutor` fan-out used by the analyst self-consistency
+    ensemble and (via the verifier panel) the per-lens verifier runs.
+  - `aggregator.py` — deterministic K-fold aggregator for analyst
+    verdicts. Per-variable plurality with `keep > emulate > downcast`
+    conservative tiebreak; strict-majority rework vote; budget +
+    overall_notes echoed from the most-aligned source verdict. Returns
+    `(aggregated_verdict, disagreement_report)` for the orchestrator
+    trace.
+  - `verifier_panel.py` — `VERIFIER_LENSES` (faithfulness → budget →
+    edge_cases), `run_verifier_panel` (parallel fan-out per lens via
+    `run_agent` with `system_prompt_suffix=lens['suffix']`), and
+    `aggregate_verifier_verdicts` (strict-accept; per_variable from the
+    faithfulness lens; concerns unioned, deduped, prefixed `[<lens>]`).
   - `orchestrator.py` — router + HITL loop. One tool per agent type plus
-    `finish`.
+    `finish`. `--auto` mode bypasses the HITL pause and journals every
+    executed tool to `baselines/<kernel_stem>/orchestrator_trace.jsonl`.
+    Ensemble/panel dispatch lives in `_execute_tool`'s `spawn_analyst`
+    and `spawn_verifier` branches, gated on the `AGENT_PRECISION_*_K`
+    env vars.
   - `run.py` — CLI entrypoint
-    (`python -m workflow.run <kernel_file> [--sig-figs N | --decimal-digits N]`).
+    (`python -m workflow.run <kernel_file> [--sig-figs N | --decimal-digits N] [--auto]`).
     Normalizes tolerance flags into `{kind, value, source='user_cli'}`
     or `None`, then hands off to the orchestrator.
 - `test-kernels/` — 17 kernels under
@@ -292,7 +349,10 @@ exiting.
   `baselines/<kernel_stem>/rewritten/{driver.cpp, driver, reference.json,
   comparison.json}` (from `splice_rewritten_kernel` →
   `compile_rewritten_driver` → `run_rewritten_driver` → `compare_outputs`).
-  Gitignored.
+  Under `--auto`, this directory also receives
+  `baselines/<kernel_stem>/orchestrator_trace.jsonl` (one JSONL record per
+  executed tool: `{turn, tool_name, tool_input, exec_result}`, truncated
+  at the start of each auto run). Gitignored.
 - `scripts/` — Argo backend wrappers (`run-argoproxy.sh`, `run-argo.sh`).
 - `flowchart.md` — high-level orchestrator flowchart (HITL branches,
   tool dispatch); a companion to the sequence diagram above.
