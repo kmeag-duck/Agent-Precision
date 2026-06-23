@@ -1185,6 +1185,25 @@ def run_orchestrator(
             tools=ORCHESTRATOR_TOOLS,
             messages=messages,
         )
+
+        # Defensive guard: some backends (notably some Argo proxy
+        # configurations) return HTTP 200 with a body the SDK accepts
+        # but cannot fully unmarshal into content blocks, leaving
+        # `response.content` as None instead of an empty list. Iterating
+        # that produces a cryptic TypeError far from the source. Fail
+        # loudly here with the response id and stop_reason so the
+        # operator can correlate against the proxy logs.
+        if response.content is None:
+            print(
+                f"\nOrchestrator received a response with content=None. "
+                f"stop_reason={response.stop_reason}, "
+                f"response_id={getattr(response, 'id', '<unknown>')}. "
+                f"This usually indicates a backend/proxy returned a "
+                f"malformed message body; retry, or inspect the proxy "
+                f"logs. Exiting."
+            )
+            return None
+
         messages.append({"role": "assistant", "content": response.content})
 
         # surface any text the orchestrator emitted (its reasoning)

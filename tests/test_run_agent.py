@@ -79,6 +79,19 @@ def test_raises_when_agent_does_not_call_submit_result(fake_anthropic):
         run_agent("analyst", "task")
 
 
+def test_raises_when_response_content_is_none(fake_anthropic):
+    """run_agent raises a useful RuntimeError naming stop_reason and response id when the SDK returns a response with content=None — guards against backend/proxy bugs that would otherwise surface as a cryptic TypeError on iteration."""
+    fake_anthropic([
+        FakeResponse(
+            content=None,
+            stop_reason="end_turn",
+        ),
+    ])
+
+    with pytest.raises(RuntimeError, match="content=None"):
+        run_agent("analyst", "task")
+
+
 def test_ignores_non_submit_result_tool_use(fake_anthropic):
     """run_agent matches the response block by name, skipping unrelated text blocks before submit_result.
 
