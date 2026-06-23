@@ -15,11 +15,13 @@ per-variable precision decisions — that is the analyst's job.
 """
 
 import json
+import os
 from pathlib import Path
 
 import anthropic
 
-from .run_agent import run_agent
+from .aggregator import aggregate_analyst_verdicts
+from .run_agent import run_agent, run_agent_ensemble
 from .tools import (
     compare_outputs,
     compile_baseline_driver,
@@ -752,6 +754,31 @@ def _execute_tool(tool_name: str, tool_input: dict) -> dict:
         result = run_agent("precision_advisor", tool_input["kernel_source"])
         return {"status": "ok", "result": result}
     if tool_name == "spawn_analyst":
+        # Optional self-consistency ensemble: when AGENT_PRECISION_ANALYST_K
+        # is > 1, run the analyst K times in parallel at
+        # AGENT_PRECISION_ANALYST_T (default 0.7 for genuine diversity)
+        # and fold the K verdicts through aggregate_analyst_verdicts.
+        # Default K=1 preserves the single-shot behavior so existing runs
+        # are unaffected unless the operator opts in. The aggregator
+        # output conforms to the analyst schema, so the verifier (which
+        # reads analyst_verdict_json downstream) needs no changes.
+        k = int(os.environ.get("AGENT_PRECISION_ANALYST_K", "1"))
+        if k > 1:
+            temperature = float(
+                os.environ.get("AGENT_PRECISION_ANALYST_T", "0.7")
+            )
+            verdicts = run_agent_ensemble(
+                "analyst",
+                tool_input["kernel_source"],
+                k=k,
+                temperature=temperature,
+            )
+            aggregated, report = aggregate_analyst_verdicts(verdicts)
+            return {
+                "status": "ok",
+                "result": aggregated,
+                "aggregator_metadata": report,
+            }
         result = run_agent("analyst", tool_input["kernel_source"])
         return {"status": "ok", "result": result}
     if tool_name == "spawn_rewriter":

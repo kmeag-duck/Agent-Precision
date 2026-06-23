@@ -86,6 +86,141 @@ def test_execute_tool_dispatches_spawn_analyst(monkeypatch):
     assert calls == [("analyst", "SOURCE")]
 
 
+def test_execute_tool_spawn_analyst_default_k_uses_single_shot(monkeypatch):
+    """Without AGENT_PRECISION_ANALYST_K set, _execute_tool stays on the single-shot run_agent path and does NOT invoke run_agent_ensemble — preserves existing behavior for callers who have not opted into the ensemble."""
+    monkeypatch.delenv("AGENT_PRECISION_ANALYST_K", raising=False)
+
+    def stub_run_agent(type_, task):
+        return {"variables": [], "overall_notes": "single"}
+
+    def fail_ensemble(*a, **kw):
+        raise AssertionError(
+            "run_agent_ensemble must not be called when K is unset (defaults to 1)"
+        )
+
+    monkeypatch.setattr(orchestrator, "run_agent", stub_run_agent)
+    monkeypatch.setattr(orchestrator, "run_agent_ensemble", fail_ensemble)
+
+    result = _execute_tool("spawn_analyst", {"kernel_source": "SRC"})
+    assert result == {
+        "status": "ok",
+        "result": {"variables": [], "overall_notes": "single"},
+    }
+    # The single-shot path must NOT carry aggregator_metadata; that key
+    # is the signal to downstream tooling (and to the trace reader) that
+    # an ensemble actually ran.
+    assert "aggregator_metadata" not in result
+
+
+def test_execute_tool_spawn_analyst_k_gt_one_runs_ensemble_and_aggregates(
+    monkeypatch,
+):
+    """With AGENT_PRECISION_ANALYST_K=3 and a custom T, _execute_tool calls run_agent_ensemble with the requested k and temperature, folds the K verdicts through aggregate_analyst_verdicts, and returns the aggregated result plus the disagreement report as aggregator_metadata."""
+    monkeypatch.setenv("AGENT_PRECISION_ANALYST_K", "3")
+    monkeypatch.setenv("AGENT_PRECISION_ANALYST_T", "0.4")
+
+    captured = {}
+
+    def stub_ensemble(type_, task, k, temperature):
+        captured["type"] = type_
+        captured["task"] = task
+        captured["k"] = k
+        captured["temperature"] = temperature
+        # Two verdicts agree on x=downcast, one disagrees → aggregator
+        # should pick downcast and record the disagreement.
+        budget = {
+            "target_kind": "sig_figs",
+            "target_value": 6,
+            "source": "user_cli",
+            "claimed_output_precision": "~7 sf",
+            "headroom_argument": "ok",
+        }
+        empty_rework = {
+            "suggested": False,
+            "transformation": "",
+            "rationale": "",
+            "affected_variables": [],
+        }
+
+        def v(action):
+            return {
+                "variables": [
+                    {
+                        "name": "x",
+                        "action": action,
+                        "target_precision": "float" if action == "downcast" else "",
+                        "emulation_type": "",
+                        "reason": action,
+                    }
+                ],
+                "rework": empty_rework,
+                "precision_budget": budget,
+                "overall_notes": f"notes-{action}",
+            }
+
+        return [v("downcast"), v("downcast"), v("keep")]
+
+    def fail_single(*a, **kw):
+        raise AssertionError(
+            "run_agent must not be called directly when K>1 — the ensemble path owns the calls"
+        )
+
+    monkeypatch.setattr(orchestrator, "run_agent_ensemble", stub_ensemble)
+    monkeypatch.setattr(orchestrator, "run_agent", fail_single)
+
+    result = _execute_tool("spawn_analyst", {"kernel_source": "SRC"})
+
+    assert captured == {
+        "type": "analyst",
+        "task": "SRC",
+        "k": 3,
+        "temperature": 0.4,
+    }
+    assert result["status"] == "ok"
+    # The aggregator chose downcast on x (2-1 vote).
+    assert result["result"]["variables"][0]["action"] == "downcast"
+    assert result["result"]["variables"][0]["target_precision"] == "float"
+    # The disagreement report rides alongside the result and names x.
+    metadata = result["aggregator_metadata"]
+    assert metadata["k"] == 3
+    assert "x" in metadata["variable_disagreements"]
+    assert metadata["variable_disagreements"]["x"]["winning_action"] == "downcast"
+
+
+def test_execute_tool_spawn_analyst_k_gt_one_default_temperature(monkeypatch):
+    """When AGENT_PRECISION_ANALYST_K is set but AGENT_PRECISION_ANALYST_T is not, the ensemble runs at the documented 0.7 default — chosen for vote diversity, not consistency."""
+    monkeypatch.setenv("AGENT_PRECISION_ANALYST_K", "2")
+    monkeypatch.delenv("AGENT_PRECISION_ANALYST_T", raising=False)
+
+    captured = {}
+
+    def stub_ensemble(type_, task, k, temperature):
+        captured["temperature"] = temperature
+        v = {
+            "variables": [],
+            "rework": {
+                "suggested": False,
+                "transformation": "",
+                "rationale": "",
+                "affected_variables": [],
+            },
+            "precision_budget": {
+                "target_kind": "sig_figs",
+                "target_value": 6,
+                "source": "user_cli",
+                "claimed_output_precision": "",
+                "headroom_argument": "",
+            },
+            "overall_notes": "",
+        }
+        return [v, v]
+
+    monkeypatch.setattr(orchestrator, "run_agent_ensemble", stub_ensemble)
+
+    _execute_tool("spawn_analyst", {"kernel_source": "SRC"})
+    assert captured["temperature"] == 0.7
+
+
 def test_execute_tool_dispatches_spawn_rewriter(monkeypatch):
     """_execute_tool routes spawn_rewriter to run_agent('rewriter', task_prompt) and wraps the result."""
     calls = []
