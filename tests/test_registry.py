@@ -670,3 +670,177 @@ def test_baseline_harness_cuda_prompt_does_not_mention_hip():
     assert "hipMemcpy" not in prompt
     assert "<hip/hip_runtime.h>" not in prompt
     assert "hipError_t" not in prompt
+
+
+# ---------- Baseline harness: SYCL profile ----------
+#
+# Phase C-2 added SYCL as the fourth language profile. Its baseline_harness
+# entry is registered under AGENTS["baseline_harness_sycl"] by the PROFILES
+# loop in registry.py. SYCL differs structurally from CUDA / HIP in that
+# kernels are lambdas submitted to a queue rather than free `__global__`
+# functions with `<<<...>>>` launch syntax, so the prompt tokens differ:
+# `sycl::queue`, `sycl::buffer`, `sycl::accessor`, `host_accessor`,
+# `<sycl/sycl.hpp>`, `in_order`, `parallel_for`, `sycl::exception`,
+# `icpx`. The splice sentinels and the precision-alias contract are still
+# shared with the other profiles (splice scope is language-independent),
+# but the alias attaches to the buffer element type (`<BufferName>Type`)
+# rather than to a function parameter, because SYCL has no free-standing
+# kernel function header to alias.
+#
+# UNIT-TESTED, NOT SMOKE-VALIDATED. There is no SYCL toolchain (icpx,
+# clang++ -fsycl, dpcpp) on the development host, so these tests assert
+# prompt content only — no end-to-end driver compilation or execution.
+
+
+def test_baseline_harness_sycl_entry_exists():
+    """AGENTS["baseline_harness_sycl"] is registered with the same required keys as every other agent entry; the PROFILES loop in registry.py populates it from SYCL_PROFILE."""
+    spec = AGENTS["baseline_harness_sycl"]
+    assert isinstance(spec["system_prompt"], str)
+    assert spec["system_prompt"].strip()
+    assert spec["output_schema"]["type"] == "object"
+    assert spec["model"]
+    assert spec["supports_temperature"] is False
+
+
+def test_baseline_harness_sycl_schema_required_fields():
+    """The SYCL baseline_harness schema has the same required fields as Kokkos / CUDA / HIP — splice + comparator + run tools are language-agnostic, so the submit_result payload shape is shared across profiles."""
+    schema = AGENTS["baseline_harness_sycl"]["output_schema"]
+    assert set(schema["required"]) == {
+        "driver_source",
+        "kernel_function_name",
+        "inputs_summary",
+        "output_arrays",
+    }
+    assert schema["properties"]["output_arrays"]["type"] == "array"
+    assert schema["properties"]["output_arrays"]["items"]["type"] == "string"
+
+
+def test_baseline_harness_sycl_prompt_mentions_sycl_header_and_queue():
+    """The SYCL baseline_harness prompt names <sycl/sycl.hpp> (the canonical include) and `sycl::queue` (the central runtime object) so the model is anchored on the SYCL execution model rather than on CUDA's stream/launch model."""
+    prompt = AGENTS["baseline_harness_sycl"]["system_prompt"]
+    assert "<sycl/sycl.hpp>" in prompt
+    assert "sycl::queue" in prompt
+
+
+def test_baseline_harness_sycl_prompt_mandates_in_order_queue():
+    """The SYCL baseline_harness prompt mandates the in-order queue property — `sycl::property::queue::in_order{}`. SYCL queues are out-of-order by default; without this, two `parallel_for` submissions to the same queue can complete in either order and the reference becomes non-reproducible. The other three profiles do not need this rule because their default execution order is already sequential (Kokkos::Serial, CUDA stream 0, HIP stream 0)."""
+    prompt = AGENTS["baseline_harness_sycl"]["system_prompt"]
+    assert "sycl::property::queue::in_order" in prompt
+    lower = prompt.lower()
+    assert "in-order" in lower or "in_order" in lower
+
+
+def test_baseline_harness_sycl_prompt_mandates_buffer_accessor_memory_model():
+    """The SYCL baseline_harness prompt mandates the `sycl::buffer` + `sycl::accessor` memory model and forbids USM. Buffers are portable across all SYCL implementations and force a well-defined host-side sync point via `host_accessor`, which makes the baseline reproducible. USM (`sycl::malloc_device`) would require explicit `q.wait()` plus manual `memcpy`, with weaker portability across implementations."""
+    prompt = AGENTS["baseline_harness_sycl"]["system_prompt"]
+    assert "sycl::buffer" in prompt
+    assert "sycl::accessor" in prompt
+    assert "host_accessor" in prompt
+
+
+def test_baseline_harness_sycl_prompt_mentions_sycl_exception_handling():
+    """The SYCL baseline_harness prompt names `sycl::exception` and mandates a try/catch around throwing SYCL operations. SYCL surfaces device errors through exceptions, not error codes; an uncaught exception terminates with a confusing `std::terminate` rather than a useful diagnostic. This is structurally different from CUDA / HIP error handling (cudaError_t / hipError_t), so the prompt must teach it explicitly."""
+    prompt = AGENTS["baseline_harness_sycl"]["system_prompt"]
+    assert "sycl::exception" in prompt
+    lower = prompt.lower()
+    assert "try" in lower and "catch" in lower
+
+
+def test_baseline_harness_sycl_prompt_mandates_determinism():
+    """The SYCL baseline_harness prompt forbids floating-point `sycl::atomic_ref` ops in the reference computation (non-deterministic ordering), mandates a fixed nd-range or range launch shape, and requires a fixed RNG seed — the three things needed for the reference to be bit-identical across runs. Same determinism contract as Kokkos / CUDA / HIP, expressed in SYCL vocabulary."""
+    prompt = AGENTS["baseline_harness_sycl"]["system_prompt"]
+    assert "sycl::atomic_ref" in prompt
+    lower = prompt.lower()
+    assert "fixed" in lower
+    assert "seed" in lower
+    assert "fixed" in lower or "reproducible" in lower
+
+
+def test_baseline_harness_sycl_prompt_mentions_reference_json_and_format():
+    """The SYCL baseline_harness prompt names reference.json (the output file) and requires %.17g formatting so the reference preserves full double precision — same contract as the Kokkos / CUDA / HIP prompts."""
+    prompt = AGENTS["baseline_harness_sycl"]["system_prompt"]
+    assert "reference.json" in prompt
+    assert "%.17g" in prompt
+
+
+def test_baseline_harness_sycl_prompt_mentions_target_kernel_and_no_invented_values():
+    """The SYCL baseline_harness prompt names TARGET KERNEL (the disambiguator the orchestrator may prepend) and forbids inventing numerical output values — same contract as the Kokkos / CUDA / HIP prompts."""
+    prompt = AGENTS["baseline_harness_sycl"]["system_prompt"]
+    assert "TARGET KERNEL" in prompt
+    lower = prompt.lower()
+    assert "do not invent" in lower or "not invent" in lower or "never invent" in lower
+
+
+def test_baseline_harness_sycl_prompt_mandates_kernel_splice_sentinels():
+    """The SYCL baseline_harness prompt mandates the exact splice sentinels (language-independent contract — splice_rewritten_kernel is shared across profiles)."""
+    prompt = AGENTS["baseline_harness_sycl"]["system_prompt"]
+    assert "// ---- KERNEL BEGIN ----" in prompt
+    assert "// ---- KERNEL END ----" in prompt
+
+
+def test_baseline_harness_sycl_prompt_mandates_precision_alias_contract():
+    """The SYCL baseline_harness prompt mandates a per-buffer `using <BufferName>Type` alias contract. Unlike Kokkos / CUDA / HIP — where the alias attaches to a kernel function parameter — SYCL kernels are lambdas with no free-standing function header, so the alias attaches to the buffer element type instead (`sycl::buffer<aType> a_buf(...)`). The accessor types then propagate from the buffer template automatically, so the lambda body stays byte-for-byte identical. Integer buffers are excluded for the same reason as in the other profiles."""
+    prompt = AGENTS["baseline_harness_sycl"]["system_prompt"]
+    assert "<BufferName>Type" in prompt
+    assert "using" in prompt
+    lower = prompt.lower()
+    assert "integer buffer" in lower or "integer buffers" in lower
+
+
+def test_baseline_harness_sycl_prompt_requires_alias_derived_staging_vector():
+    """SYCL's staging rule: when a host `std::vector` backs a `sycl::buffer<aType>`, the vector's element type must be declared as `std::vector<aType>` so that redefining `aType` to `float` does not break the wrap (a hardcoded `std::vector<double>` paired with `sycl::buffer<aType>` would either silently reinterpret bytes or fail to compile under a precision downcast). This is the SYCL analog of CUDA / HIP's `std::remove_const_t<std::remove_pointer_t<...>>` staging rule and of Kokkos's `typename ...::non_const_value_type` rule, but expressed in terms that match SYCL's buffer-element-type model."""
+    prompt = AGENTS["baseline_harness_sycl"]["system_prompt"]
+    assert "std::vector<aType>" in prompt
+    normalized = " ".join(prompt.lower().split())
+    assert "do not hardcode" in normalized or "do not" in normalized
+
+
+def test_baseline_harness_sycl_prompt_does_not_mention_kokkos():
+    """The SYCL baseline_harness prompt must not mention Kokkos-specific tokens — those would mislead the model into emitting a hybrid driver. Cross-prompt isolation is the whole point of having one profile per language."""
+    prompt = AGENTS["baseline_harness_sycl"]["system_prompt"]
+    assert "Kokkos::initialize" not in prompt
+    assert "Kokkos::Serial" not in prompt
+    assert "Kokkos::View" not in prompt
+    assert "non_const_value_type" not in prompt
+    assert "KOKKOS_LAMBDA" not in prompt
+
+
+def test_baseline_harness_sycl_prompt_does_not_mention_cuda_or_hip_runtime_tokens():
+    """The SYCL baseline_harness prompt must not mention CUDA / HIP runtime tokens (cudaMalloc, cudaMemcpy, hipMalloc, hipMemcpy, the runtime headers, the error-code types, `__global__`, atomicAdd, the `<<<...>>>` launch syntax). SYCL's execution model is structurally different — kernels are lambdas — so any of these tokens in the prompt would be actively misleading rather than just stylistically wrong."""
+    prompt = AGENTS["baseline_harness_sycl"]["system_prompt"]
+    assert "cudaMalloc" not in prompt
+    assert "cudaMemcpy" not in prompt
+    assert "<cuda_runtime.h>" not in prompt
+    assert "hipMalloc" not in prompt
+    assert "hipMemcpy" not in prompt
+    assert "<hip/hip_runtime.h>" not in prompt
+    assert "__global__" not in prompt
+    assert "atomicAdd" not in prompt
+    assert "<<<" not in prompt
+
+
+def test_baseline_harness_kokkos_prompt_does_not_mention_sycl():
+    """Mirror of the SYCL isolation test: the Kokkos baseline_harness prompt must not mention SYCL-specific tokens. Together with the corresponding CUDA / HIP analogues below, defends against accidental cross-contamination across all four profiles."""
+    prompt = AGENTS["baseline_harness_kokkos"]["system_prompt"]
+    assert "sycl::queue" not in prompt
+    assert "sycl::buffer" not in prompt
+    assert "<sycl/sycl.hpp>" not in prompt
+    assert "host_accessor" not in prompt
+
+
+def test_baseline_harness_cuda_prompt_does_not_mention_sycl():
+    """Mirror of the SYCL isolation test for the CUDA prompt."""
+    prompt = AGENTS["baseline_harness_cuda"]["system_prompt"]
+    assert "sycl::queue" not in prompt
+    assert "sycl::buffer" not in prompt
+    assert "<sycl/sycl.hpp>" not in prompt
+    assert "host_accessor" not in prompt
+
+
+def test_baseline_harness_hip_prompt_does_not_mention_sycl():
+    """Mirror of the SYCL isolation test for the HIP prompt."""
+    prompt = AGENTS["baseline_harness_hip"]["system_prompt"]
+    assert "sycl::queue" not in prompt
+    assert "sycl::buffer" not in prompt
+    assert "<sycl/sycl.hpp>" not in prompt
+    assert "host_accessor" not in prompt

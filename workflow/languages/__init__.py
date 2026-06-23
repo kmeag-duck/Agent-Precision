@@ -24,16 +24,19 @@ from .base import LanguageProfile
 from .cuda import CUDA_PROFILE
 from .hip import HIP_PROFILE
 from .kokkos import KOKKOS_PROFILE
+from .sycl import SYCL_PROFILE
 
 # Ordered registry. Insertion order is the tie-break order in
 # detect_language()'s content-probe pass for ambiguous .cpp inputs:
-# Kokkos first preserves the historical default behavior, then SYCL /
-# HIP-cpp / OpenMP-offload as those profiles land. CUDA owns `.cu`
-# exclusively and so never participates in the content-probe pass —
-# its position in the registry is irrelevant to detection but kept
-# next to Kokkos for readability.
+# Kokkos first preserves the historical default behavior, then SYCL,
+# then OpenMP-offload (and eventually HIP-in-cpp) as those profiles
+# land. CUDA owns `.cu` exclusively and HIP owns `.hip` exclusively,
+# so neither participates in the content-probe pass — their positions
+# in the registry are irrelevant to detection but kept grouped for
+# readability.
 PROFILES: dict[str, LanguageProfile] = {
     KOKKOS_PROFILE.id: KOKKOS_PROFILE,
+    SYCL_PROFILE.id: SYCL_PROFILE,
     CUDA_PROFILE.id: CUDA_PROFILE,
     HIP_PROFILE.id: HIP_PROFILE,
 }
@@ -94,6 +97,7 @@ __all__ = [
     "LanguageProfile",
     "PROFILES",
     "KOKKOS_PROFILE",
+    "SYCL_PROFILE",
     "CUDA_PROFILE",
     "HIP_PROFILE",
     "get_profile_by_id",

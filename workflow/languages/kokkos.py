@@ -89,16 +89,22 @@ def _preflight() -> dict | None:
 def _detect_from_source(kernel_source: str) -> bool:
     """Probe a `.cpp` source to decide whether it's a Kokkos kernel.
 
-    Looks for the canonical include line or any use of the Kokkos::
-    namespace. Both are structural markers — a stray "Kokkos" in a
-    comment won't trigger the include check, and a bare reference to
-    "Kokkos" without "::" won't trigger the namespace check. The
-    combined heuristic is what `detect_language()` uses to disambiguate
-    a .cpp file between Kokkos and SYCL / HIP-cpp / OpenMP-offload.
+    Looks for any of three structural markers: the canonical include
+    line, any use of the Kokkos:: namespace, or the KOKKOS_LAMBDA macro
+    (the standard Kokkos parallel-construct lambda wrapper, which is
+    unmistakably Kokkos-only). All three are structural — a stray
+    "Kokkos" in a comment won't trigger the include check, a bare
+    reference to "Kokkos" without "::" won't trigger the namespace
+    check, and KOKKOS_LAMBDA is a vendor-prefixed macro that no other
+    .cpp-claiming framework defines. The combined heuristic is what
+    `detect_language()` uses to disambiguate a .cpp file between Kokkos
+    and SYCL / HIP-cpp / OpenMP-offload.
     """
     if "<Kokkos_Core.hpp>" in kernel_source:
         return True
     if "Kokkos::" in kernel_source:
+        return True
+    if "KOKKOS_LAMBDA" in kernel_source:
         return True
     return False
 

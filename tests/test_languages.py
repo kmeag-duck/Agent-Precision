@@ -1,11 +1,15 @@
 """Tests for workflow.languages — language-profile registry + detection.
 
 Phase B added CUDA as the second language profile. Phase C-1 added HIP
-as the third. The registry must expose all three profiles, detection by
-source suffix must route `.cu` to CUDA, `.hip` to HIP, and `.cpp` to
-Kokkos, and `get_profile_by_id` must raise on an unknown id (no silent
-Kokkos fallback — a typo'd `language_id` from the orchestrator must
-surface as an error).
+as the third. Phase C-2 added SYCL as the fourth — and SYCL is the
+first profile that shares the `.cpp` suffix with Kokkos, so this
+module also exercises the content-probe tie-break path of
+detect_language(). The registry must expose all four profiles,
+detection by source suffix must route `.cu` to CUDA, `.hip` to HIP,
+and `.cpp` to Kokkos OR SYCL based on a content probe (Kokkos wins on
+ambiguity via insertion order in PROFILES), and `get_profile_by_id`
+must raise on an unknown id (no silent Kokkos fallback — a typo'd
+`language_id` from the orchestrator must surface as an error).
 
 These tests are pure data assertions on the in-memory PROFILES dict and
 on detect_language() / get_profile_by_id() — no subprocess, no network,
@@ -19,6 +23,7 @@ from workflow.languages import (
     HIP_PROFILE,
     KOKKOS_PROFILE,
     PROFILES,
+    SYCL_PROFILE,
     detect_language,
     get_profile_by_id,
 )
@@ -40,6 +45,20 @@ def test_profiles_contains_hip():
     """The PROFILES registry exposes the Phase C-1 HIP profile under its canonical id `hip`, keyed by its own `.id` field — same invariant the kokkos/cuda check applies."""
     assert "hip" in PROFILES
     assert PROFILES["hip"] is HIP_PROFILE
+
+
+def test_profiles_contains_sycl():
+    """The PROFILES registry exposes the Phase C-2 SYCL profile under its canonical id `sycl`, keyed by its own `.id` field — same invariant the kokkos / cuda / hip checks apply."""
+    assert "sycl" in PROFILES
+    assert PROFILES["sycl"] is SYCL_PROFILE
+
+
+def test_profiles_insertion_order_puts_kokkos_before_sycl():
+    """In PROFILES, KOKKOS_PROFILE appears before SYCL_PROFILE; this insertion order is the tie-break order in detect_language()'s content-probe pass for `.cpp` inputs. Kokkos first preserves the historical default behavior (a `.cpp` with no SYCL or Kokkos markers still routes to Kokkos)."""
+    ids = list(PROFILES.keys())
+    assert ids.index("kokkos") < ids.index("sycl"), (
+        f"PROFILES insertion order broken: kokkos must precede sycl, got {ids}"
+    )
 
 
 def test_every_profile_is_a_language_profile_dataclass():
@@ -104,9 +123,39 @@ def test_detect_language_hip_does_not_inspect_source_for_dot_hip():
     assert detect_language("kernel.hip", "") is HIP_PROFILE
 
 
-def test_detect_language_cpp_returns_kokkos():
-    """A `.cpp` source path resolves to KOKKOS_PROFILE; Kokkos is the only profile that claims `.cpp` today, so the suffix alone disambiguates."""
+def test_detect_language_cpp_with_no_markers_returns_kokkos():
+    """A `.cpp` source with neither Kokkos nor SYCL markers falls back to KOKKOS_PROFILE via insertion-order tie-break in PROFILES. This preserves the v0 behavior where any unrecognized `.cpp` was treated as Kokkos — important because SYCL joining the `.cpp` pool in Phase C-2 must not silently re-route legacy Kokkos kernels that happen to lack a `Kokkos::` token in the snippet shown to the probe."""
     assert detect_language("path/to/kernel.cpp", "void kernel() {}\n") is KOKKOS_PROFILE
+
+
+def test_detect_language_cpp_with_kokkos_markers_returns_kokkos():
+    """A `.cpp` source carrying canonical Kokkos markers (`#include <Kokkos_Core.hpp>` or `Kokkos::` namespace use or KOKKOS_LAMBDA) routes to KOKKOS_PROFILE. The Kokkos probe is consulted first because Kokkos precedes SYCL in PROFILES."""
+    assert detect_language("k.cpp", "#include <Kokkos_Core.hpp>\nvoid f() {}\n") is KOKKOS_PROFILE
+    assert detect_language("k.cpp", "void f() { Kokkos::parallel_for(...); }\n") is KOKKOS_PROFILE
+    assert detect_language("k.cpp", "void f() { auto g = KOKKOS_LAMBDA(int i){}; }\n") is KOKKOS_PROFILE
+
+
+def test_detect_language_cpp_with_sycl_markers_returns_sycl():
+    """A `.cpp` source carrying canonical SYCL markers (`<sycl/sycl.hpp>` include, `sycl::queue`, or `sycl::buffer`) routes to SYCL_PROFILE. With Kokkos's probe returning False for these inputs, SYCL is the first candidate whose probe returns True and wins the content-probe pass."""
+    assert detect_language("k.cpp", "#include <sycl/sycl.hpp>\nint main() {}\n") is SYCL_PROFILE
+    assert detect_language("k.cpp", "void f() { sycl::queue q; }\n") is SYCL_PROFILE
+    assert detect_language("k.cpp", "void f() { sycl::buffer<double> b(n); }\n") is SYCL_PROFILE
+
+
+def test_detect_language_cpp_with_both_kokkos_and_sycl_markers_returns_kokkos():
+    """A pathological `.cpp` source that triggers BOTH the Kokkos and SYCL probes (e.g. a Kokkos kernel that also references `sycl::queue` in a comment-stripped string) routes to KOKKOS_PROFILE. Kokkos precedes SYCL in PROFILES, so its probe is consulted first and the first True wins — this is the documented insertion-order tie-break."""
+    mixed = (
+        "#include <Kokkos_Core.hpp>\n"
+        "#include <sycl/sycl.hpp>\n"
+        "void f() { Kokkos::parallel_for(...); sycl::queue q; }\n"
+    )
+    assert detect_language("k.cpp", mixed) is KOKKOS_PROFILE
+
+
+def test_detect_language_cpp_suffix_is_case_insensitive():
+    """`.CPP` (uppercase) routes through the same suffix-normalization path as `.cpp`; SYCL markers in the body still win when Kokkos's probe returns False. Mirrors the `.CU` / `.HIP` case-insensitivity invariants."""
+    assert detect_language("PATH/KERNEL.CPP", "sycl::queue q;\n") is SYCL_PROFILE
+    assert detect_language("PATH/KERNEL.CPP", "") is KOKKOS_PROFILE
 
 
 def test_detect_language_cu_suffix_is_case_insensitive():
@@ -179,6 +228,39 @@ def test_hip_profile_id_and_display_name():
     assert HIP_PROFILE.display_name == "HIP C++"
 
 
+def test_sycl_profile_claims_dot_cpp():
+    """SYCL_PROFILE.source_suffixes contains `.cpp`; unlike CUDA (`.cu`) and HIP (`.hip`), SYCL is NOT the exclusive owner of its suffix — Kokkos also claims `.cpp`. This is the configuration that forces detect_language() to consult content probes for `.cpp` inputs."""
+    assert ".cpp" in SYCL_PROFILE.source_suffixes
+    cpp_claimants = [
+        name for name, p in PROFILES.items() if ".cpp" in p.source_suffixes
+    ]
+    # Order matters: Kokkos must precede SYCL so its probe is consulted first.
+    assert cpp_claimants == ["kokkos", "sycl"], (
+        f"Unexpected .cpp claimants or order: {cpp_claimants}"
+    )
+
+
+def test_sycl_profile_driver_filename_is_dot_cpp():
+    """SYCL_PROFILE.driver_filename is `driver.cpp` so the compile and splice tools target the right extension; this is the same value Kokkos uses, which is correct — the splice and compile machinery is keyed off `kernel_stem` and per-profile `driver_filename`, not off uniqueness across profiles."""
+    assert SYCL_PROFILE.driver_filename == "driver.cpp"
+
+
+def test_sycl_profile_dynamic_verification_is_true():
+    """SYCL_PROFILE enables the dynamic-verification chain — same finish-gate behavior as Kokkos / CUDA / HIP. The chain is language-agnostic; the profile only chooses the compile command and harness prompt."""
+    assert SYCL_PROFILE.dynamic_verification is True
+
+
+def test_sycl_profile_id_and_display_name():
+    """SYCL_PROFILE.id is the lowercase `sycl` token used in PROFILES keys and the orchestrator's `baseline_harness_<id>` tool-name suffix; display_name is the human-readable `SYCL C++` shown in logs."""
+    assert SYCL_PROFILE.id == "sycl"
+    assert SYCL_PROFILE.display_name == "SYCL C++"
+
+
+def test_sycl_profile_env_required_is_empty():
+    """SYCL_PROFILE.env_required is empty — `AGENT_PRECISION_SYCL_CXX` is optional (defaults to `icpx`), and SYCL has no required-at-call-time env var equivalent to Kokkos's `AGENT_PRECISION_KOKKOS_ROOT`. Compiler presence is checked in preflight, not declared as required env."""
+    assert SYCL_PROFILE.env_required == ()
+
+
 # ---------- get_profile_by_id ----------
 
 
@@ -187,6 +269,7 @@ def test_get_profile_by_id_returns_registered_profile():
     assert get_profile_by_id("kokkos") is KOKKOS_PROFILE
     assert get_profile_by_id("cuda") is CUDA_PROFILE
     assert get_profile_by_id("hip") is HIP_PROFILE
+    assert get_profile_by_id("sycl") is SYCL_PROFILE
 
 
 def test_get_profile_by_id_raises_on_unknown_id():
@@ -201,3 +284,4 @@ def test_get_profile_by_id_raises_on_unknown_id():
     assert "kokkos" in msg
     assert "cuda" in msg
     assert "hip" in msg
+    assert "sycl" in msg
