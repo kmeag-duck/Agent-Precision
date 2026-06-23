@@ -24,6 +24,7 @@ from .base import LanguageProfile
 from .cuda import CUDA_PROFILE
 from .hip import HIP_PROFILE
 from .kokkos import KOKKOS_PROFILE
+from .omp_offload import OMP_OFFLOAD_PROFILE
 from .sycl import SYCL_PROFILE
 
 # Ordered registry. Insertion order is the tie-break order in
@@ -37,6 +38,7 @@ from .sycl import SYCL_PROFILE
 PROFILES: dict[str, LanguageProfile] = {
     KOKKOS_PROFILE.id: KOKKOS_PROFILE,
     SYCL_PROFILE.id: SYCL_PROFILE,
+    OMP_OFFLOAD_PROFILE.id: OMP_OFFLOAD_PROFILE,
     CUDA_PROFILE.id: CUDA_PROFILE,
     HIP_PROFILE.id: HIP_PROFILE,
 }
@@ -98,6 +100,7 @@ __all__ = [
     "PROFILES",
     "KOKKOS_PROFILE",
     "SYCL_PROFILE",
+    "OMP_OFFLOAD_PROFILE",
     "CUDA_PROFILE",
     "HIP_PROFILE",
     "get_profile_by_id",

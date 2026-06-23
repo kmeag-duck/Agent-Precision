@@ -1,15 +1,17 @@
 """Tests for workflow.languages — language-profile registry + detection.
 
 Phase B added CUDA as the second language profile. Phase C-1 added HIP
-as the third. Phase C-2 added SYCL as the fourth — and SYCL is the
-first profile that shares the `.cpp` suffix with Kokkos, so this
-module also exercises the content-probe tie-break path of
-detect_language(). The registry must expose all four profiles,
-detection by source suffix must route `.cu` to CUDA, `.hip` to HIP,
-and `.cpp` to Kokkos OR SYCL based on a content probe (Kokkos wins on
-ambiguity via insertion order in PROFILES), and `get_profile_by_id`
-must raise on an unknown id (no silent Kokkos fallback — a typo'd
-`language_id` from the orchestrator must surface as an error).
+as the third. Phase C-2 added SYCL as the fourth. Phase C-3 added
+OpenMP target-offload as the fifth — the second `.cpp`-claiming
+profile after SYCL, so the content-probe tie-break in
+detect_language() is now a 3-way decision among Kokkos / SYCL /
+OMP-offload. The registry must expose all five profiles, detection by
+source suffix must route `.cu` to CUDA, `.hip` to HIP, and `.cpp` to
+Kokkos OR SYCL OR OMP-offload based on a content probe (insertion
+order in PROFILES — Kokkos, then SYCL, then OMP-offload — breaks
+multi-probe ties), and `get_profile_by_id` must raise on an unknown
+id (no silent Kokkos fallback — a typo'd `language_id` from the
+orchestrator must surface as an error).
 
 These tests are pure data assertions on the in-memory PROFILES dict and
 on detect_language() / get_profile_by_id() — no subprocess, no network,
@@ -22,6 +24,7 @@ from workflow.languages import (
     CUDA_PROFILE,
     HIP_PROFILE,
     KOKKOS_PROFILE,
+    OMP_OFFLOAD_PROFILE,
     PROFILES,
     SYCL_PROFILE,
     detect_language,
@@ -229,13 +232,14 @@ def test_hip_profile_id_and_display_name():
 
 
 def test_sycl_profile_claims_dot_cpp():
-    """SYCL_PROFILE.source_suffixes contains `.cpp`; unlike CUDA (`.cu`) and HIP (`.hip`), SYCL is NOT the exclusive owner of its suffix — Kokkos also claims `.cpp`. This is the configuration that forces detect_language() to consult content probes for `.cpp` inputs."""
+    """SYCL_PROFILE.source_suffixes contains `.cpp`; unlike CUDA (`.cu`) and HIP (`.hip`), SYCL is NOT the exclusive owner of its suffix — Kokkos and OMP-offload also claim `.cpp`. This is the configuration that forces detect_language() to consult content probes for `.cpp` inputs."""
     assert ".cpp" in SYCL_PROFILE.source_suffixes
     cpp_claimants = [
         name for name, p in PROFILES.items() if ".cpp" in p.source_suffixes
     ]
-    # Order matters: Kokkos must precede SYCL so its probe is consulted first.
-    assert cpp_claimants == ["kokkos", "sycl"], (
+    # Order matters: Kokkos must precede SYCL must precede OMP-offload so probes
+    # are consulted in insertion order for ambiguous `.cpp` inputs.
+    assert cpp_claimants == ["kokkos", "sycl", "omp_offload"], (
         f"Unexpected .cpp claimants or order: {cpp_claimants}"
     )
 
@@ -270,6 +274,7 @@ def test_get_profile_by_id_returns_registered_profile():
     assert get_profile_by_id("cuda") is CUDA_PROFILE
     assert get_profile_by_id("hip") is HIP_PROFILE
     assert get_profile_by_id("sycl") is SYCL_PROFILE
+    assert get_profile_by_id("omp_offload") is OMP_OFFLOAD_PROFILE
 
 
 def test_get_profile_by_id_raises_on_unknown_id():
@@ -285,3 +290,108 @@ def test_get_profile_by_id_raises_on_unknown_id():
     assert "cuda" in msg
     assert "hip" in msg
     assert "sycl" in msg
+    assert "omp_offload" in msg
+
+
+# ---------- OMP-offload profile ----------
+
+
+def test_profiles_contains_omp_offload():
+    """The PROFILES registry exposes the Phase C-3 OMP-offload profile under its canonical id `omp_offload`, keyed by its own `.id` field — same invariant the kokkos / cuda / hip / sycl checks apply."""
+    assert "omp_offload" in PROFILES
+    assert PROFILES["omp_offload"] is OMP_OFFLOAD_PROFILE
+
+
+def test_profiles_insertion_order_puts_sycl_before_omp_offload():
+    """In PROFILES, SYCL_PROFILE appears before OMP_OFFLOAD_PROFILE; this insertion order is the tie-break order in detect_language()'s content-probe pass for `.cpp` inputs that match multiple probes. Kokkos -> SYCL -> OMP-offload is the documented order; later additions must extend this chain rather than reorder it."""
+    ids = list(PROFILES.keys())
+    assert ids.index("sycl") < ids.index("omp_offload"), (
+        f"PROFILES insertion order broken: sycl must precede omp_offload, got {ids}"
+    )
+
+
+def test_omp_offload_profile_claims_dot_cpp():
+    """OMP_OFFLOAD_PROFILE.source_suffixes contains `.cpp`; it is the second non-exclusive `.cpp` claimant after SYCL. This forces detect_language() to consult content probes for `.cpp` inputs across THREE candidates."""
+    assert ".cpp" in OMP_OFFLOAD_PROFILE.source_suffixes
+    cpp_claimants = [
+        name for name, p in PROFILES.items() if ".cpp" in p.source_suffixes
+    ]
+    assert cpp_claimants == ["kokkos", "sycl", "omp_offload"], (
+        f"Unexpected .cpp claimants or order: {cpp_claimants}"
+    )
+
+
+def test_omp_offload_profile_driver_filename_is_dot_cpp():
+    """OMP_OFFLOAD_PROFILE.driver_filename is `driver.cpp` — same as Kokkos and SYCL. The splice and compile machinery is keyed off `kernel_stem` and per-profile `driver_filename`, not off uniqueness across profiles."""
+    assert OMP_OFFLOAD_PROFILE.driver_filename == "driver.cpp"
+
+
+def test_omp_offload_profile_dynamic_verification_is_true():
+    """OMP_OFFLOAD_PROFILE enables the dynamic-verification chain — same finish-gate behavior as Kokkos / CUDA / HIP / SYCL. The chain is language-agnostic; the profile only chooses the compile command and harness prompt."""
+    assert OMP_OFFLOAD_PROFILE.dynamic_verification is True
+
+
+def test_omp_offload_profile_id_and_display_name():
+    """OMP_OFFLOAD_PROFILE.id is the lowercase `omp_offload` token used in PROFILES keys and the orchestrator's `baseline_harness_<id>` tool-name suffix; display_name is the human-readable `OpenMP target-offload C++` shown in logs."""
+    assert OMP_OFFLOAD_PROFILE.id == "omp_offload"
+    assert OMP_OFFLOAD_PROFILE.display_name == "OpenMP target-offload C++"
+
+
+def test_omp_offload_profile_env_required_is_empty():
+    """OMP_OFFLOAD_PROFILE.env_required is empty — `AGENT_PRECISION_OMP_CXX` and `AGENT_PRECISION_OMP_TARGET` are both optional (defaults `clang++` and `nvptx64-nvidia-cuda`), and OMP-offload has no required-at-call-time env equivalent to Kokkos's `AGENT_PRECISION_KOKKOS_ROOT`. Compiler presence is checked in preflight."""
+    assert OMP_OFFLOAD_PROFILE.env_required == ()
+
+
+def test_detect_language_cpp_with_omp_offload_marker_returns_omp_offload():
+    """A `.cpp` source carrying the canonical OMP-offload marker (`#pragma omp target`) routes to OMP_OFFLOAD_PROFILE. The Kokkos and SYCL probes return False for these inputs (no `Kokkos::`, no `sycl::`), so OMP-offload's probe is the first to return True and wins the content-probe pass."""
+    assert (
+        detect_language("k.cpp", "void f() { #pragma omp target\n}\n")
+        is OMP_OFFLOAD_PROFILE
+    )
+    # Variants that should all match: the probe is a prefix substring check.
+    assert (
+        detect_language(
+            "k.cpp", "void f() { #pragma omp target teams num_teams(1) {} }\n"
+        )
+        is OMP_OFFLOAD_PROFILE
+    )
+    assert (
+        detect_language("k.cpp", "void f() { #pragma omp target data map(to:a) }\n")
+        is OMP_OFFLOAD_PROFILE
+    )
+
+
+def test_detect_language_cpp_with_host_only_omp_does_not_return_omp_offload():
+    """A `.cpp` source using `#pragma omp parallel` / `#pragma omp for` but NOT `#pragma omp target` is host-only OpenMP — it does NOT need the offload toolchain. The probe is strict about requiring the `target` token, so host-only OMP falls through to the insertion-order tie-break (Kokkos default)."""
+    host_only = (
+        "void f(int N) {\n"
+        "    #pragma omp parallel for\n"
+        "    for (int i = 0; i < N; ++i) {}\n"
+        "}\n"
+    )
+    # No Kokkos / SYCL / OMP-target markers — falls back to Kokkos via insertion-order.
+    assert detect_language("k.cpp", host_only) is KOKKOS_PROFILE
+
+
+def test_detect_language_cpp_with_kokkos_and_omp_offload_markers_returns_kokkos():
+    """A pathological `.cpp` source that triggers BOTH the Kokkos and OMP-offload probes routes to KOKKOS_PROFILE — Kokkos precedes OMP-offload in PROFILES, so its probe is consulted first and the first True wins. Same insertion-order tie-break that resolves Kokkos vs SYCL collisions."""
+    mixed = (
+        "#include <Kokkos_Core.hpp>\n"
+        "void f() {\n"
+        "    #pragma omp target\n"
+        "    Kokkos::parallel_for(...);\n"
+        "}\n"
+    )
+    assert detect_language("k.cpp", mixed) is KOKKOS_PROFILE
+
+
+def test_detect_language_cpp_with_sycl_and_omp_offload_markers_returns_sycl():
+    """A pathological `.cpp` source that triggers BOTH the SYCL and OMP-offload probes (but NOT Kokkos) routes to SYCL_PROFILE — SYCL precedes OMP-offload in PROFILES. Documents the full 3-way tie-break chain Kokkos -> SYCL -> OMP-offload."""
+    mixed = (
+        "#include <sycl/sycl.hpp>\n"
+        "void f() {\n"
+        "    #pragma omp target\n"
+        "    sycl::queue q;\n"
+        "}\n"
+    )
+    assert detect_language("k.cpp", mixed) is SYCL_PROFILE

@@ -22,16 +22,15 @@ flowchart TD
   D -- "spawn_analyst" --> A["Analyst agent<br/>(K-fold ensemble via<br/>AGENT_PRECISION_ANALYST_K;<br/>aggregator.aggregate_analyst_verdicts)"]
   D -- "spawn_rewriter" --> R["Rewriter agent"]
   D -- "spawn_verifier" --> V["Verifier agent<br/>(K-lens panel via<br/>AGENT_PRECISION_VERIFIER_K;<br/>verifier_panel.aggregate_verifier_verdicts)"]
-  D -- "spawn_baseline_harness<br/>(Kokkos .cpp only)" --> B["Baseline-harness agent"]
-  D -- "compile_baseline_driver<br/>(deterministic; after baseline_harness)" --> C["g++ subprocess<br/>(AGENT_PRECISION_KOKKOS_ROOT)"]
+  D -- "spawn_baseline_harness_&lt;id&gt;<br/>(one per language profile;<br/>id ∈ {kokkos, cuda, hip, sycl, omp_offload})" --> B["Baseline-harness agent<br/>(per-profile system prompt)"]
+  D -- "compile_baseline_driver<br/>(deterministic; after baseline_harness)" --> C["compiler subprocess<br/>(per profile: g++/nvcc/hipcc/icpx/clang++;<br/>AGENT_PRECISION_KOKKOS_ROOT / CUDA_ARCH /<br/>HIP_ARCH / SYCL_CXX / OMP_CXX / OMP_TARGET)"]
   D -- "run_baseline_driver<br/>(deterministic; after compile_baseline_driver)" --> N["./driver subprocess<br/>(AGENT_PRECISION_RUN_TIMEOUT_SEC)<br/>writes baselines/&lt;stem&gt;/reference.json"]
-  D -- "splice_rewritten_kernel<br/>(deterministic; after verifier accept + run_baseline_driver)" --> S["text I/O: replace between<br/>KERNEL BEGIN / END sentinels<br/>writes baselines/&lt;stem&gt;/rewritten/driver.cpp"]
-  D -- "compile_rewritten_driver<br/>(deterministic; after splice)" --> CR["g++ subprocess<br/>(AGENT_PRECISION_KOKKOS_ROOT)<br/>writes baselines/&lt;stem&gt;/rewritten/driver"]
+  D -- "splice_rewritten_kernel<br/>(deterministic; after verifier accept + run_baseline_driver)" --> S["text I/O: replace between<br/>KERNEL BEGIN / END sentinels<br/>writes baselines/&lt;stem&gt;/rewritten/driver.&lt;ext&gt;<br/>(.cpp for kokkos/sycl/omp_offload, .cu for cuda, .hip for hip)"]
+  D -- "compile_rewritten_driver<br/>(deterministic; after splice)" --> CR["compiler subprocess<br/>(same per-profile compiler as baseline)<br/>writes baselines/&lt;stem&gt;/rewritten/driver"]
   D -- "run_rewritten_driver<br/>(deterministic; after compile_rewritten_driver)" --> NR["./driver subprocess<br/>(AGENT_PRECISION_RUN_TIMEOUT_SEC)<br/>writes baselines/&lt;stem&gt;/rewritten/reference.json"]
   D -- "compare_outputs<br/>(deterministic; after run_rewritten_driver)" --> CMP["arithmetic + file I/O:<br/>diff baseline vs rewritten reference.json<br/>under tolerance_json<br/>writes baselines/&lt;stem&gt;/rewritten/comparison.json"]
   D -- "finish" --> G{"finish-gate<br/>(code-side)"}
-  G -- ".cpp: verifier accept AND compare_outputs ok" --> F(["print final kernel + notes"])
-  G -- ".cu: verifier accept" --> F
+  G -- "verifier accept AND compare_outputs ok<br/>(for any profile with dynamic_verification=True;<br/>currently all five)" --> F(["print final kernel + notes"])
   G -- "blocked: synthetic {status:'error', is_error:true} tool_result<br/>(comparator error → prefer spawn_analyst on retry)" --> O
   P -- "{kind, value, rationale, confidence, alternative}" --> O
   A -- "{variables, rework, precision_budget, overall_notes}" --> O
@@ -60,9 +59,10 @@ routed by the orchestrator loop — the agent or deterministic tool
 returns its result to the orchestrator, which then issues the next
 tool call. Errors, rejections, and verifier `reject` branches are
 deliberately omitted here; see the top-level flowchart above for those.
-For a CUDA `.cu` input, steps 2–4 and 8–11 are skipped (verifier-only
-gate) and the chain reduces to advisor → analyst → rewriter →
-verifier(accept) → finish.
+The same 12-step shape applies to CUDA, HIP, SYCL, and OpenMP-offload
+— only step 2's `spawn_baseline_harness_<id>` agent, the driver file
+extension (`.cu` / `.hip` / `.cpp`), and the compiler invoked in steps
+3 and 9 change.
 
 ```mermaid
 flowchart TD
@@ -70,7 +70,7 @@ flowchart TD
 
   Orch ==> S1
   S1["1. spawn_precision_advisor<br/><i>(only when no --sig-figs/--decimal-digits)</i><br/>→ tolerance {kind, value, source}"]
-  S2["2. spawn_baseline_harness<br/><i>(Kokkos .cpp only)</i><br/>→ writes baselines/&lt;stem&gt;/driver.cpp"]
+  S2["2. spawn_baseline_harness_&lt;id&gt;<br/><i>(one per language profile; id resolved from suffix + source content)</i><br/>→ writes baselines/&lt;stem&gt;/driver.&lt;ext&gt;"]
   S3["3. compile_baseline_driver<br/>→ baselines/&lt;stem&gt;/driver"]
   S4["4. run_baseline_driver<br/>→ baselines/&lt;stem&gt;/reference.json"]
   S5["5. spawn_analyst<br/>→ {variables, rework, precision_budget, overall_notes}"]

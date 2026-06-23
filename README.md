@@ -1,8 +1,9 @@
 # Agent-Precision
 
-An LLM orchestrator that rewrites numerical kernels (Kokkos C++ / CUDA) to
-use less floating-point storage where it is safe to do so, given a
-user-stated tolerance on the kernel's output precision.
+An LLM orchestrator that rewrites numerical kernels (Kokkos, CUDA, HIP,
+SYCL, and OpenMP-offload) to use less floating-point storage where it is
+safe to do so, given a user-stated tolerance on the kernel's output
+precision.
 
 **Why precision matters for throughput.** Modern GPUs accelerate `float`
 much more than `double` (and accelerate narrower-than-`float` types more
@@ -42,7 +43,7 @@ vocabulary and plumbing".
 What works today:
 
 - Core pipeline `(precision_advisor →)? analyst → rewriter → verifier`. `finish` is gated in **code** (not just in the system prompt) on the most recent `spawn_verifier` returning `verdict='accept'`; on a Kokkos `.cpp` input, `finish` additionally requires the most recent `compare_outputs` to have returned `status='ok'` for the current rewrite cycle. A premature `finish` is turned into a synthetic `{status:'error', is_error:true}` tool result naming what's missing, so the orchestrator can self-correct without exiting.
-- Dynamic verification chain for Kokkos `.cpp` kernels: **harness → compile → run → splice → compile_rewritten → run_rewritten → compare_outputs**, ending in a tolerance check that gates `finish`. The five LLM agents are reused as-is; the six deterministic (non-LLM) tools in `workflow/tools.py` (`compile_baseline_driver`, `run_baseline_driver`, `splice_rewritten_kernel`, `compile_rewritten_driver`, `run_rewritten_driver`, `compare_outputs`) all return the uniform `{status, stdout, stderr, artifacts}` shape. `baseline_harness` writes `baselines/<kernel_stem>/driver.cpp`; the baseline compile/run trio produces `baselines/<kernel_stem>/{driver, reference.json}`; the rewritten chain (splice → compile_rewritten → run_rewritten) produces `baselines/<kernel_stem>/rewritten/{driver.cpp, driver, reference.json}` from the rewriter's output without ever touching the baseline tree; `compare_outputs` diffs the two `reference.json` files under the same `tolerance_json` that was passed to `spawn_verifier` and writes `baselines/<kernel_stem>/rewritten/comparison.json` on both pass and fail paths. CUDA `.cu` inputs skip this entire chain in v0 and fall back to the verifier-only gate.
+- Dynamic verification chain (any profile whose `LanguageProfile.dynamic_verification` is `True` — currently all five): **harness → compile → run → splice → compile_rewritten → run_rewritten → compare_outputs**, ending in a tolerance check that gates `finish`. The five LLM agents are reused as-is; the six deterministic (non-LLM) tools in `workflow/tools.py` (`compile_baseline_driver`, `run_baseline_driver`, `splice_rewritten_kernel`, `compile_rewritten_driver`, `run_rewritten_driver`, `compare_outputs`) all return the uniform `{status, stdout, stderr, artifacts}` shape. `baseline_harness` writes `baselines/<kernel_stem>/<driver_filename>` (`.cpp` for Kokkos/SYCL/OpenMP-offload, `.cu` for CUDA, `.hip` for HIP); the baseline compile/run trio produces `baselines/<kernel_stem>/{driver, reference.json}`; the rewritten chain (splice → compile_rewritten → run_rewritten) produces `baselines/<kernel_stem>/rewritten/{driver.<ext>, driver, reference.json}` from the rewriter's output without ever touching the baseline tree; `compare_outputs` diffs the two `reference.json` files under the same `tolerance_json` that was passed to `spawn_verifier` and writes `baselines/<kernel_stem>/rewritten/comparison.json` on both pass and fail paths. Kokkos is smoke-validated end-to-end; CUDA is smoke-validated through the comparator step (on `vector_add.cu --sig-figs 6 --auto`); HIP, SYCL, and OpenMP-offload ship unit-tested only — no host with the respective toolchain (`hipcc`, `icpx`/`clang++ -fsycl`, `clang++ -fopenmp -fopenmp-targets=...`) was available at implementation time.
 - Tolerance from `--sig-figs` / `--decimal-digits`, else inferred by the advisor; advisor may return `kind='unknown'`, which triggers fallback `{sig_figs: 6, source: 'advisor_unknown_defaulted'}`.
 - Tolerance threaded verbatim to analyst, rewriter, and verifier; analyst returns a `precision_budget` block; verifier audits it.
 - Per-variable methods: `downcast` (narrower hardware type — the throughput win), `emulate` (software pair, currently inline float-float / Dekker — throughput-NEGATIVE; only when downcast violates tolerance), or `keep`. Analyst can additionally suggest a kernel-shape `rework` such as Kahan summation.
@@ -55,7 +56,7 @@ What works today:
 What is intentionally **not** here yet:
 
 - The `verifier` agent itself remains a **static / textual** check on faithfulness of code to verdict; mechanical verification of the rewritten kernel is now done by the `compare_outputs` tool downstream of it (not by the verifier agent). No micro-benchmark of the rewritten kernel — `compare_outputs` checks numerical agreement under tolerance, not throughput.
-- CUDA `.cu` inputs do not yet exercise the dynamic-verification chain; only the verifier-accept gate runs there.
+- End-to-end smoke validation for HIP, SYCL, and OpenMP-offload (the relevant toolchains were not available on the development host). All three are exercised by the unit tests in `tests/test_tools.py` / `tests/test_registry.py` / `tests/test_languages.py` but no real kernel in each language has been driven through the full chain yet.
 - No automated evaluation across the `test-kernels/` corpus.
 - No framework (LangGraph etc.). See "Design notes" and "Roadmap".
 
@@ -121,10 +122,12 @@ Argo paths exist).
 
 Intended happy path through the conversation for a Kokkos `.cpp` input
 when no tolerance flag is passed (so the advisor is called once up
-front, and the full dynamic-verification chain runs). For a CUDA `.cu`
-input, every "baseline / rewritten chain" turn is skipped and the path
-goes verifier-accept → `finish` directly. For the corresponding
-high-level flowchart (HITL branches, tool dispatch, finish-gate), see
+front, and the full dynamic-verification chain runs). The same shape
+applies to CUDA, HIP, SYCL, and OpenMP-offload — only the driver file
+extension (`.cu` / `.hip` / `.cpp`) and the compiler invoked by the
+deterministic tools change; the orchestrator loop, finish-gate, and
+HITL contract are language-agnostic. For the corresponding high-level
+flowchart (HITL branches, tool dispatch, finish-gate), see
 `flowchart.md`.
 
 ```mermaid
@@ -207,7 +210,7 @@ the verifier's verdict was wrong rather than just the implementation.
 | `analyst`            | `claude-opus-4-7` | kernel source + tolerance block (`target_kind`, `target_value`, `source`)                   | `variables[{name, action, target_precision, emulation_type, reason}]`, `rework{suggested, transformation, rationale, affected_variables}`, `precision_budget{target_kind, target_value, source, claimed_output_precision, headroom_argument}`, `overall_notes` | `workflow/registry.py`     |
 | `rewriter`           | `claude-opus-4-7` | `task_prompt` (source + verdict + any rework + tolerance, composed by orch.)                | `rewritten_code`, `summary_of_changes`                                                                                                                                                                                                                          | `workflow/registry.py`     |
 | `verifier`           | `claude-opus-4-7` | original source, rewritten source, analyst verdict (JSON string), tolerance (JSON string)   | `verdict` (`accept`/`reject`), `per_variable[{name, expected_action, observed_action, ok}]`, `concerns`                                                                                                                                                         | `workflow/registry.py`     |
-| `baseline_harness`   | `claude-opus-4-7` | original Kokkos C++ kernel source (Kokkos `.cpp` only; orchestrator skips for `.cu`)        | `driver_source`, `kernel_function_name`, `inputs_summary`, `output_arrays`                                                                                                                                                                                      | `workflow/registry.py`     |
+| `baseline_harness_<id>` | `claude-opus-4-7` | original kernel source (one harness agent per language profile; orchestrator dispatches by `LanguageProfile.id` resolved from the file suffix and source content) | `driver_source`, `kernel_function_name`, `inputs_summary`, `output_arrays` | `workflow/registry.py` (auto-registered from `workflow/languages/PROFILES`) |
 | `orchestrator`       | `claude-opus-4-7` | kernel path + source + optional tolerance (from CLI) + optional `kernel_name`               | one `finish(rewritten_code, notes)` call                                                                                                                                                                                                                        | `workflow/orchestrator.py` |
 
 The analyst receives the kernel source only — no file path, no orchestrator
@@ -246,19 +249,26 @@ behavior unchanged when unset; see "Run"):
   lenses and prefixed with `[<lens>] ` so a rewriter-retry prompt
   sees which lens raised which concern.
 
-The `baseline_harness` is orthogonal to the analyst → rewriter → verifier
-pipeline: it is invited (by the initial user message's BASELINE STEP
-block) for Kokkos `.cpp` inputs only, called at most once per run, and
-its output is a driver source. The orchestrator then chains two
-deterministic (non-LLM) tools after it — `compile_baseline_driver` (once,
-same `kernel_stem`) and `run_baseline_driver` (once, same `kernel_stem`)
-— to produce `baselines/<kernel_stem>/{driver,reference.json}`. The
-driver pins `Kokkos::Serial` and a fixed RNG seed (42 by default) so the
-reference output is reproducible. The harness mandates splice sentinels
-(`// ---- KERNEL BEGIN ----` / `// ---- KERNEL END ----`) around the
-inlined kernel as a forward-looking contract for a future mechanical
-comparator that will swap in the rewritten kernel between them. See
-`AGENTS.md` ("Baseline harness (side artifact)") for the full scope.
+The `baseline_harness_<id>` agents are orthogonal to the analyst →
+rewriter → verifier pipeline: one is invited (by the initial user
+message's BASELINE STEP block, parameterized by the resolved
+`LanguageProfile`) per run, only when the input matches a profile whose
+`dynamic_verification` is `True` and whose `source_suffixes` cover the
+file, and its output is a driver source. The orchestrator then chains
+two deterministic (non-LLM) tools after it — `compile_baseline_driver`
+(once, same `kernel_stem`) and `run_baseline_driver` (once, same
+`kernel_stem`) — to produce `baselines/<kernel_stem>/{driver,
+reference.json}`. Each driver pins a serial execution backend and a
+fixed RNG seed (42 by default) so the reference output is reproducible
+— Kokkos uses `Kokkos::Serial`; CUDA / HIP launch with `<<<1,1>>>`;
+SYCL uses an in-order queue with a single-item range; OpenMP-offload
+uses `omp_set_num_threads(1)` plus `num_teams(1) thread_limit(1)`. Each
+harness mandates the splice sentinels (`// ---- KERNEL BEGIN ----` /
+`// ---- KERNEL END ----`) around the inlined kernel; the downstream
+`splice_rewritten_kernel` tool then swaps in the rewritten kernel
+between them for the rewritten chain. See `AGENTS.md` ("Baseline
+harness and dynamic verification chain") for the full scope and per-
+profile contracts (precision aliases, env vars, language probes).
 
 ## Orchestrator tools
 
@@ -268,36 +278,37 @@ comparator that will swap in the rewritten kernel between them. See
 | `spawn_analyst`            | dispatch to analyst           | `kernel_source: string` (must contain a labeled tolerance block: `target_kind`, `target_value`, `source`)                      | analyst's structured output, or `{"status":"rejected_by_user"}`          |
 | `spawn_rewriter`           | dispatch to rewriter          | `task_prompt: string`                                                                                                          | rewriter's structured output, or `{"status":"rejected_by_user"}`         |
 | `spawn_verifier`           | dispatch to verifier          | `original_source: string`, `rewritten_source: string`, `analyst_verdict_json: string`, `tolerance_json: string`                | verifier's structured output, or `{"status":"rejected_by_user"}`         |
-| `spawn_baseline_harness`   | dispatch to baseline_harness  | `kernel_source: string`, `kernel_stem: string` (Kokkos `.cpp` only; at most once per run)                                      | harness output + `driver_path` (orchestrator writes `baselines/<kernel_stem>/driver.cpp`), or `{"status":"rejected_by_user"}` |
+| `spawn_baseline_harness_<id>` | dispatch to the language-specific baseline_harness agent | `kernel_source: string`, `kernel_stem: string` (one harness per `LanguageProfile.id`; at most once per run; only when `profile.dynamic_verification` is `True`) | harness output + `driver_path` (orchestrator writes `baselines/<kernel_stem>/<driver_filename>` — `.cpp`/`.cu`/`.hip` per profile), or `{"status":"rejected_by_user"}` |
 | `compile_baseline_driver`  | `g++` the harness driver (deterministic, non-LLM) | `kernel_stem: string` (at most once per run; only after a successful `spawn_baseline_harness` with same stem; needs `AGENT_PRECISION_KOKKOS_ROOT`) | `{status, stdout, stderr, artifacts}` (artifacts = `[baselines/<stem>/driver]` on success, `[]` otherwise), or `{"status":"rejected_by_user"}` |
 | `run_baseline_driver`      | exec the compiled driver to capture reference output (deterministic, non-LLM) | `kernel_stem: string` (at most once per run; only after a successful `compile_baseline_driver` with same stem; bounded by `AGENT_PRECISION_RUN_TIMEOUT_SEC`, default 60 s) | `{status, stdout, stderr, artifacts}` (artifacts = `[baselines/<stem>/reference.json]` on success, `[]` otherwise), or `{"status":"rejected_by_user"}` |
 | `splice_rewritten_kernel`  | replace text between `// ---- KERNEL BEGIN/END ----` sentinels in the baseline driver with the rewriter's output (deterministic, non-LLM; pure text I/O) | `kernel_stem: string`, `rewritten_kernel_source: string` (at most once per accepted verifier verdict; only after a successful `run_baseline_driver` + `spawn_verifier(accept)` with same stem) | `{status, stdout, stderr, artifacts}` (artifacts = `[baselines/<stem>/rewritten/driver.cpp]` on success, `[]` otherwise), or `{"status":"rejected_by_user"}` |
 | `compile_rewritten_driver` | `g++` the spliced rewritten driver (deterministic, non-LLM) | `kernel_stem: string` (at most once per accepted verifier verdict; only after a successful `splice_rewritten_kernel` with same stem; needs `AGENT_PRECISION_KOKKOS_ROOT`) | `{status, stdout, stderr, artifacts}` (artifacts = `[baselines/<stem>/rewritten/driver]` on success, `[]` otherwise), or `{"status":"rejected_by_user"}` |
 | `run_rewritten_driver`     | exec the rewritten driver to capture its reference output (deterministic, non-LLM; never touches the baseline tree) | `kernel_stem: string` (at most once per accepted verifier verdict; only after a successful `compile_rewritten_driver` with same stem; bounded by `AGENT_PRECISION_RUN_TIMEOUT_SEC`) | `{status, stdout, stderr, artifacts}` (artifacts = `[baselines/<stem>/rewritten/reference.json]` on success, `[]` otherwise), or `{"status":"rejected_by_user"}` |
 | `compare_outputs`          | numerically diff baseline vs rewritten `reference.json` under tolerance; gates `finish` on `.cpp` (deterministic, non-LLM; no subprocess) | `kernel_stem: string`, `tolerance_json: string` (same `{kind,value,source}` string passed to `spawn_verifier`; at most once per accepted verifier verdict; only after a successful `run_rewritten_driver`) | `{status, stdout, stderr, artifacts}` (artifacts = `[baselines/<stem>/rewritten/comparison.json]` on both pass and fail; `status='ok'` iff every value agrees and no shape mismatch), or `{"status":"rejected_by_user"}` |
-| `finish`                   | end the workflow              | `rewritten_code`, `notes`                                                                                                      | (terminates; nothing fed back) — but the orchestrator's `_FinishGateState` blocks the call (with a synthetic `is_error` tool result) until the gate is satisfied: verifier `verdict='accept'` for `.cu`, plus `compare_outputs status='ok'` for `.cpp` |
+| `finish`                   | end the workflow              | `rewritten_code`, `notes`                                                                                                      | (terminates; nothing fed back) — but the orchestrator's `_FinishGateState` blocks the call (with a synthetic `is_error` tool result) until the gate is satisfied: verifier `verdict='accept'`, plus `compare_outputs status='ok'` for any profile with `dynamic_verification=True` (currently all five) |
 
 The orchestrator's system prompt enforces that `spawn_precision_advisor`
 is called at most once, only when the CLI passed no tolerance, and only
-before `spawn_analyst`; that `spawn_baseline_harness` is called at most
-once and only for Kokkos `.cpp` inputs; and that the seven-step
-deterministic chain — `compile_baseline_driver` → `run_baseline_driver` →
-`splice_rewritten_kernel` → `compile_rewritten_driver` →
-`run_rewritten_driver` → `compare_outputs` — each fires at most once
-per accepted verifier verdict, only as the deterministic follow-up to a
-successful preceding step, and always with the same `kernel_stem`.
-Those rules are trusted to the orchestrator LLM. Three things are
-policed in Python instead: (1) the filesystem write for
-`spawn_baseline_harness` and the splice writes both compute their paths
-from the orchestrator-supplied `kernel_stem` (not from the agent's
-output) so a misbehaving agent cannot redirect them; (2) every "run"
-tool deletes any stale `reference.json` at its target path before
-invoking the subprocess, so a failed run cannot leave a misleadingly-
-stale reference in place; and (3) the **finish-gate** in
+before `spawn_analyst`; that exactly one `spawn_baseline_harness_<id>`
+tool exists per run (the one matching the resolved
+`LanguageProfile.id`) and is called at most once; and that the
+seven-step deterministic chain — `compile_baseline_driver` →
+`run_baseline_driver` → `splice_rewritten_kernel` →
+`compile_rewritten_driver` → `run_rewritten_driver` → `compare_outputs`
+— each fires at most once per accepted verifier verdict, only as the
+deterministic follow-up to a successful preceding step, and always with
+the same `kernel_stem`. Those rules are trusted to the orchestrator
+LLM. Three things are policed in Python instead: (1) the filesystem
+write for `spawn_baseline_harness_<id>` and the splice writes both
+compute their paths from the orchestrator-supplied `kernel_stem` (not
+from the agent's output) so a misbehaving agent cannot redirect them;
+(2) every "run" tool deletes any stale `reference.json` at its target
+path before invoking the subprocess, so a failed run cannot leave a
+misleadingly-stale reference in place; and (3) the **finish-gate** in
 `_FinishGateState` blocks `finish` until the most recent
-`spawn_verifier` returned `verdict='accept'` AND, on `.cpp` inputs, the
-most recent `compare_outputs` returned `status='ok'` for the current
-rewrite cycle. On a gate violation the loop synthesizes a `{status:
+`spawn_verifier` returned `verdict='accept'` AND, on any profile with
+`dynamic_verification=True`, the most recent `compare_outputs` returned
+`status='ok'` for the current rewrite cycle. On a gate violation the loop synthesizes a `{status:
 'error', is_error: true}` tool result naming what's missing, so the
 orchestrator can self-correct on its next turn rather than silently
 exiting.
@@ -305,8 +316,19 @@ exiting.
 ## Repo layout
 
 - `workflow/`
+  - `languages/` — one module per supported language profile (`kokkos.py`,
+    `cuda.py`, `hip.py`, `sycl.py`, `omp_offload.py`) plus `base.py`
+    (the `LanguageProfile` dataclass, the shared splice sentinels, and
+    `make_error_result`). Each module exposes a `*_PROFILE` instance;
+    `workflow/languages/__init__.py` collects them into the ordered
+    `PROFILES` list. `registry.py` walks `PROFILES` to auto-register a
+    `baseline_harness_<id>` agent per profile (no per-language edit to
+    `AGENTS`), and `workflow/tools.py:_resolve_profile` dispatches the
+    six deterministic tools by `language_id`.
   - `registry.py` — agent definitions (`AGENTS` dict: system prompt, output
-    schema, model). Single source of truth.
+    schema, model). Single source of truth for the five non-harness
+    agents; the per-language `baseline_harness_<id>` entries are
+    appended at import time from `workflow/languages/PROFILES`.
   - `run_agent.py` — generic agent runner. Forces structured output via
     `tool_choice={"type":"tool","name":"submit_result"}` whose input schema
     is the registry entry's `output_schema`. Never edited per-agent.
@@ -399,7 +421,7 @@ Authoritative list lives in `AGENTS.md` under "Planned next steps"; this
 is a reader-facing summary.
 
 1. **Kernel-extractor agent** — slice a single target kernel out of a multi-kernel translation unit before analyst + baseline_harness run.
-2. **CUDA dynamic-verification chain** — extend splice/compile_rewritten/run_rewritten/compare_outputs to `.cu` inputs so the finish-gate enforces baseline-equivalence there too (v0 falls back to verifier-only on `.cu`).
+2. **Smoke-validation of HIP / SYCL / OpenMP-offload profiles** — these three profiles ship unit-tested only (no `hipcc` / `icpx` / `clang++ -fopenmp -fopenmp-targets=...` toolchain was available at implementation time). Once a host with the respective runtime is available, drive a real kernel through the full chain and confirm the comparator step passes; remove the "unit-tested but not smoke-validated" caveat from `AGENTS.md`.
 3. **JLSE / async toolchain migration** — move compile/run to a remote scheduler.
 4. **Emulation library upgrade** — replace inline Dekker float-float with a vendored header.
 5. **Corpus evaluation** — run the workflow across all 17 `test-kernels/`, feeding each kernel's expected tolerance from `test-kernels/SUMMARY.md`, and compare verdicts against ground-truth labels.

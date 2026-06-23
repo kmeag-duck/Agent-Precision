@@ -844,3 +844,177 @@ def test_baseline_harness_hip_prompt_does_not_mention_sycl():
     assert "sycl::buffer" not in prompt
     assert "<sycl/sycl.hpp>" not in prompt
     assert "host_accessor" not in prompt
+
+
+# ---------- Baseline harness: OpenMP target-offload profile ----------
+
+# Phase C-3 added OpenMP target-offload as the fifth language profile.
+# Its baseline_harness entry is registered under
+# AGENTS["baseline_harness_omp_offload"] by the PROFILES loop in
+# registry.py. OMP-offload differs structurally from CUDA / HIP in
+# that kernels are plain C/C++ functions (not __global__), launched
+# from a `#pragma omp target` region with explicit map() clauses; it
+# differs from SYCL in that there is no queue, so determinism is
+# enforced via `omp_set_num_threads(1)` and a prohibition on
+# reductions. The prompt must teach this execution model and the
+# associated reproducibility rules.
+#
+# UNIT-TESTED, NOT SMOKE-VALIDATED. No host with an OMP-offload
+# toolchain (clang++ -fopenmp -fopenmp-targets=..., icpx, nvc++)
+# was available at implementation time, so these tests assert the
+# data shape and prompt content rather than runtime behavior.
+
+
+def test_baseline_harness_omp_offload_entry_exists():
+    """AGENTS["baseline_harness_omp_offload"] is registered with the same required keys as every other agent entry; the PROFILES loop in registry.py populates it from OMP_OFFLOAD_PROFILE."""
+    spec = AGENTS["baseline_harness_omp_offload"]
+    assert "system_prompt" in spec
+    assert "output_schema" in spec
+    assert "model" in spec
+    assert "supports_temperature" in spec
+    assert spec["supports_temperature"] is False
+
+
+def test_baseline_harness_omp_offload_schema_required_fields():
+    """The OMP-offload baseline_harness schema has the same required fields as Kokkos / CUDA / HIP / SYCL — splice + comparator + run tools are language-agnostic, so the submit_result payload shape is shared across profiles."""
+    schema = AGENTS["baseline_harness_omp_offload"]["output_schema"]
+    assert set(schema["required"]) == {
+        "driver_source",
+        "kernel_function_name",
+        "inputs_summary",
+        "output_arrays",
+    }
+
+
+def test_baseline_harness_omp_offload_prompt_mentions_omp_target_directive():
+    """The OMP-offload baseline_harness prompt names `#pragma omp target` (the directive that triggers device-side execution) so the model is anchored on the OMP-offload execution model rather than on a stream / queue / launch-syntax model from another profile."""
+    prompt = AGENTS["baseline_harness_omp_offload"]["system_prompt"]
+    assert "#pragma omp target" in prompt
+
+
+def test_baseline_harness_omp_offload_prompt_mandates_single_thread_determinism():
+    """The OMP-offload baseline_harness prompt mandates `omp_set_num_threads(1)` for host-side determinism. OMP has no in-order queue equivalent (unlike SYCL); single-thread execution is the only portable way to get a reproducible reference across clang++ / icpx / nvc++. The other four profiles do not need this rule because their default execution order is already sequential (Kokkos::Serial, CUDA stream 0, HIP stream 0, SYCL in_order queue)."""
+    prompt = AGENTS["baseline_harness_omp_offload"]["system_prompt"]
+    assert "omp_set_num_threads(1)" in prompt
+
+
+def test_baseline_harness_omp_offload_prompt_forbids_floating_point_reductions():
+    """The OMP-offload baseline_harness prompt forbids `reduction(+:...)` (and the wider class of floating-point reduction clauses) in the reference computation. OMP reduction order is unspecified across teams / threads; without this prohibition the reference is non-reproducible across compiler versions. This is the OMP analog of SYCL's `sycl::atomic_ref` prohibition and CUDA's `atomicAdd` prohibition."""
+    prompt = AGENTS["baseline_harness_omp_offload"]["system_prompt"]
+    assert "reduction(+:" in prompt or "reduction(" in prompt
+
+
+def test_baseline_harness_omp_offload_prompt_mandates_explicit_map_clauses():
+    """The OMP-offload baseline_harness prompt mandates explicit `map(to:...)`, `map(from:...)`, and `map(tofrom:...)` clauses for every array crossing the host/device boundary. Implicit / default mapping is fragile across compilers and would make the reference non-portable. This rule is structurally unique to OMP-offload — CUDA / HIP do explicit cudaMemcpy / hipMemcpy, SYCL uses buffer + accessor, and Kokkos relies on View deep_copy."""
+    prompt = AGENTS["baseline_harness_omp_offload"]["system_prompt"]
+    assert "map(to:" in prompt
+    assert "map(from:" in prompt
+    assert "map(tofrom:" in prompt
+
+
+def test_baseline_harness_omp_offload_prompt_mandates_single_team_single_thread_launch():
+    """The OMP-offload baseline_harness prompt mandates single-team / single-thread device-side launch bounds (`num_teams(1)` and `thread_limit(1)`). This is the device-side analog of `omp_set_num_threads(1)`: the slowest configuration, but the only one that guarantees reproducibility across compilers and devices for the baseline. A future smoke phase may relax this once cross-compiler reproducibility is established."""
+    prompt = AGENTS["baseline_harness_omp_offload"]["system_prompt"]
+    assert "num_teams(1)" in prompt
+    assert "thread_limit(1)" in prompt
+
+
+def test_baseline_harness_omp_offload_prompt_mentions_reference_json_and_format():
+    """The OMP-offload baseline_harness prompt names reference.json (the output file) and requires %.17g formatting so the reference preserves full double precision — same contract as the Kokkos / CUDA / HIP / SYCL prompts."""
+    prompt = AGENTS["baseline_harness_omp_offload"]["system_prompt"]
+    assert "reference.json" in prompt
+    assert "%.17g" in prompt
+
+
+def test_baseline_harness_omp_offload_prompt_mentions_target_kernel_and_no_invented_values():
+    """The OMP-offload baseline_harness prompt names TARGET KERNEL (the disambiguator the orchestrator may prepend) and forbids inventing numerical output values — same contract as the Kokkos / CUDA / HIP / SYCL prompts."""
+    prompt = AGENTS["baseline_harness_omp_offload"]["system_prompt"]
+    assert "TARGET KERNEL" in prompt
+    assert "invent" in prompt or "invented" in prompt
+
+
+def test_baseline_harness_omp_offload_prompt_mandates_kernel_splice_sentinels():
+    """The OMP-offload baseline_harness prompt mandates the exact splice sentinels (language-independent contract — splice_rewritten_kernel is shared across profiles)."""
+    prompt = AGENTS["baseline_harness_omp_offload"]["system_prompt"]
+    assert "// ---- KERNEL BEGIN ----" in prompt
+    assert "// ---- KERNEL END ----" in prompt
+
+
+def test_baseline_harness_omp_offload_prompt_mandates_precision_alias_contract():
+    """The OMP-offload baseline_harness prompt mandates a per-parameter `using <ParamName>Type` alias contract — same structural shape as Kokkos / CUDA / HIP (where the alias attaches to a kernel function parameter), since OMP-offload kernels are also plain functions. Integer parameters are excluded for the same reason as in the other profiles."""
+    prompt = AGENTS["baseline_harness_omp_offload"]["system_prompt"]
+    assert "<ParamName>Type" in prompt
+    # Concrete example tokens should appear so the model has a worked example.
+    assert "aType" in prompt
+    assert "using cType" in prompt or "cType" in prompt
+
+
+def test_baseline_harness_omp_offload_prompt_requires_alias_derived_host_buffers():
+    """OMP-offload's staging rule: host vectors backing a mapped array must derive their element type from the alias (`std::vector<aType>`), not hardcode `std::vector<double>`. A precision downcast that redefines `aType` to `float` would otherwise break the `map(to:...)` clause by transferring sizeof(double) bytes per element on the host and sizeof(float) on the device. This is the OMP analog of SYCL's `std::vector<aType>` rule and CUDA / HIP's staging-pointer rule."""
+    prompt = AGENTS["baseline_harness_omp_offload"]["system_prompt"]
+    assert "std::vector<aType>" in prompt
+
+
+def test_baseline_harness_omp_offload_prompt_does_not_mention_kokkos():
+    """The OMP-offload baseline_harness prompt must not mention Kokkos-specific tokens — those would mislead the model into emitting a hybrid driver. Cross-prompt isolation is the whole point of having one profile per language."""
+    prompt = AGENTS["baseline_harness_omp_offload"]["system_prompt"]
+    assert "Kokkos::initialize" not in prompt
+    assert "Kokkos::Serial" not in prompt
+    assert "Kokkos::View" not in prompt
+    assert "non_const_value_type" not in prompt
+    assert "KOKKOS_LAMBDA" not in prompt
+
+
+def test_baseline_harness_omp_offload_prompt_does_not_mention_cuda_or_hip_runtime_tokens():
+    """The OMP-offload baseline_harness prompt must not mention CUDA / HIP runtime tokens (cudaMalloc, cudaMemcpy, hipMalloc, hipMemcpy, the runtime headers, `__global__`, atomicAdd, `<<<...>>>` launch syntax). OMP-offload's execution model is structurally different — `#pragma omp target` regions calling plain functions — so any of these tokens would actively mislead the model."""
+    prompt = AGENTS["baseline_harness_omp_offload"]["system_prompt"]
+    assert "cudaMalloc" not in prompt
+    assert "cudaMemcpy" not in prompt
+    assert "<cuda_runtime.h>" not in prompt
+    assert "hipMalloc" not in prompt
+    assert "hipMemcpy" not in prompt
+    assert "<hip/hip_runtime.h>" not in prompt
+    assert "__global__" not in prompt
+    assert "atomicAdd" not in prompt
+    assert "<<<" not in prompt
+
+
+def test_baseline_harness_omp_offload_prompt_does_not_mention_sycl():
+    """The OMP-offload baseline_harness prompt must not mention SYCL-specific tokens — they would actively mislead the model. SYCL queues / buffers / accessors are a different execution model from OMP target regions + map clauses."""
+    prompt = AGENTS["baseline_harness_omp_offload"]["system_prompt"]
+    assert "sycl::queue" not in prompt
+    assert "sycl::buffer" not in prompt
+    assert "<sycl/sycl.hpp>" not in prompt
+    assert "host_accessor" not in prompt
+
+
+def test_baseline_harness_kokkos_prompt_does_not_mention_omp_offload():
+    """Mirror of the OMP-offload isolation test: the Kokkos baseline_harness prompt must not mention OMP target-offload-specific tokens."""
+    prompt = AGENTS["baseline_harness_kokkos"]["system_prompt"]
+    assert "#pragma omp target" not in prompt
+    assert "omp_set_num_threads" not in prompt
+    assert "-fopenmp-targets" not in prompt
+
+
+def test_baseline_harness_cuda_prompt_does_not_mention_omp_offload():
+    """Mirror of the OMP-offload isolation test for the CUDA prompt."""
+    prompt = AGENTS["baseline_harness_cuda"]["system_prompt"]
+    assert "#pragma omp target" not in prompt
+    assert "omp_set_num_threads" not in prompt
+    assert "-fopenmp-targets" not in prompt
+
+
+def test_baseline_harness_hip_prompt_does_not_mention_omp_offload():
+    """Mirror of the OMP-offload isolation test for the HIP prompt."""
+    prompt = AGENTS["baseline_harness_hip"]["system_prompt"]
+    assert "#pragma omp target" not in prompt
+    assert "omp_set_num_threads" not in prompt
+    assert "-fopenmp-targets" not in prompt
+
+
+def test_baseline_harness_sycl_prompt_does_not_mention_omp_offload():
+    """Mirror of the OMP-offload isolation test for the SYCL prompt."""
+    prompt = AGENTS["baseline_harness_sycl"]["system_prompt"]
+    assert "#pragma omp target" not in prompt
+    assert "omp_set_num_threads" not in prompt
+    assert "-fopenmp-targets" not in prompt

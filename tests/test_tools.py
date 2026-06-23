@@ -32,6 +32,7 @@ import subprocess
 from workflow import tools
 from workflow.languages import cuda as cuda_profile
 from workflow.languages import hip as hip_profile
+from workflow.languages import omp_offload as omp_offload_profile
 from workflow.languages import sycl as sycl_profile
 from workflow.languages.cuda import (
     ARCH_ENV as CUDA_ARCH_ENV,
@@ -42,6 +43,13 @@ from workflow.languages.hip import (
     ARCH_ENV as HIP_ARCH_ENV,
     DEFAULT_ARCH as HIP_DEFAULT_ARCH,
     HIPCC,
+)
+from workflow.languages.omp_offload import (
+    CXX_ENV as OMP_CXX_ENV,
+    DEFAULT_CXX as OMP_DEFAULT_CXX,
+    DEFAULT_TARGET as OMP_DEFAULT_TARGET,
+    OMP_FLAG,
+    TARGET_ENV as OMP_TARGET_ENV,
 )
 from workflow.languages.sycl import (
     CXX_ENV as SYCL_CXX_ENV,
@@ -2760,6 +2768,300 @@ def test_splice_rewritten_kernel_sycl_reads_and_writes_dot_cpp(
     )
 
     result = splice_rewritten_kernel("k", new_kernel, "sycl")
+
+    assert result["status"] == "ok"
+    assert result["artifacts"] == ["baselines/k/rewritten/driver.cpp"]
+
+    out_path = tmp_path / "baselines" / "k" / "rewritten" / "driver.cpp"
+    assert out_path.is_file()
+    # The HIP / CUDA filenames must not appear in either tree.
+    assert not (tmp_path / "baselines" / "k" / "rewritten" / "driver.hip").exists()
+    assert not (tmp_path / "baselines" / "k" / "rewritten" / "driver.cu").exists()
+    assert not (tmp_path / "baselines" / "k" / "driver.hip").exists()
+    assert not (tmp_path / "baselines" / "k" / "driver.cu").exists()
+
+    text = out_path.read_text()
+    out_lines = text.split("\n")
+    assert out_lines.count(KERNEL_BEGIN_SENTINEL) == 1
+    assert out_lines.count(KERNEL_END_SENTINEL) == 1
+    begin = out_lines.index(KERNEL_BEGIN_SENTINEL)
+    end = out_lines.index(KERNEL_END_SENTINEL)
+    spliced = "\n".join(out_lines[begin + 1 : end])
+    assert spliced == new_kernel.rstrip("\n")
+
+
+# ---------- OMP-offload profile: compile + splice ----------
+#
+# These tests exercise the OMP-offload language profile
+# (workflow.languages.omp_offload) through the same public tool
+# wrappers as the Kokkos / CUDA / HIP / SYCL tests above. Phase C-3
+# added OMP-offload as the fifth profile, so the wrappers must
+# dispatch on `language_id="omp_offload"` to the OMP-offload compile
+# command shape (the resolved compiler from AGENT_PRECISION_OMP_CXX,
+# defaulting to `clang++`, with -fopenmp and
+# -fopenmp-targets=<triple> where the triple resolves from
+# AGENT_PRECISION_OMP_TARGET, defaulting to `nvptx64-nvidia-cuda`),
+# the compiler-on-PATH preflight, and the `driver.cpp` filename
+# (shared with Kokkos and SYCL).
+#
+# UNIT-TESTED, NOT SMOKE-VALIDATED. No host with an OMP-offload
+# toolchain (clang++ with offload runtime, icpx, nvc++) was
+# available at implementation time, so the subprocess.run calls are
+# monkeypatched the same way the CUDA / HIP / SYCL tests
+# monkeypatch nvcc / hipcc / icpx. End-to-end smoke is deferred
+# until such a host is available.
+
+
+def _stage_omp_offload_driver(tmp_path, stem, body="int main(){return 0;}\n"):
+    """Write a placeholder baselines/<stem>/driver.cpp under tmp_path.
+
+    OMP-offload shares the `.cpp` driver_filename with Kokkos and
+    SYCL. The same staging file is acceptable for all three
+    profiles; what changes per profile is the compile command, not
+    the source filename.
+    """
+    driver_dir = tmp_path / "baselines" / stem
+    driver_dir.mkdir(parents=True)
+    (driver_dir / "driver.cpp").write_text(body)
+    return driver_dir
+
+
+def _stage_omp_offload_baseline_driver(tmp_path, stem, body=_BASELINE_DRIVER_TEMPLATE):
+    """Write a baseline driver.cpp at baselines/<stem>/ under tmp_path.
+
+    The body content is the Kokkos-flavored template the splice tests
+    use; splice_rewritten_kernel only cares about the sentinel lines,
+    not the surrounding C++. Identical to the Kokkos / SYCL baseline-
+    driver staging — only the language_id passed to the tool wrapper
+    changes.
+    """
+    d = tmp_path / "baselines" / stem
+    d.mkdir(parents=True)
+    (d / "driver.cpp").write_text(body)
+    return d
+
+
+def test_compile_baseline_driver_omp_offload_invokes_default_compiler_with_flags(
+    monkeypatch, tmp_path
+):
+    """For language_id='omp_offload', compile_baseline_driver shells out to the resolved compiler (default `clang++`) with -std=c++17, -O2, -fopenmp, and -fopenmp-targets=<triple> (default `nvptx64-nvidia-cuda`), plus the driver.cpp source path."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv(OMP_CXX_ENV, raising=False)
+    monkeypatch.delenv(OMP_TARGET_ENV, raising=False)
+    _stage_omp_offload_driver(tmp_path, "vector_add")
+    monkeypatch.setattr(
+        omp_offload_profile.shutil, "which", lambda name: f"/usr/bin/{name}"
+    )
+
+    captured = {}
+
+    class FakeProc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(cmd, capture_output, text, check):
+        captured["cmd"] = cmd
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = compile_baseline_driver("vector_add", "omp_offload")
+
+    assert result["status"] == "ok"
+    assert result["artifacts"] == ["baselines/vector_add/driver"]
+    cmd = captured["cmd"]
+    assert cmd[0] == OMP_DEFAULT_CXX == "clang++"
+    assert "-std=c++17" in cmd
+    assert "-O2" in cmd
+    assert OMP_FLAG in cmd
+    assert OMP_FLAG == "-fopenmp"  # invariant the docs promise
+    # Target triple flag — the most distinctive OMP-offload-specific flag.
+    assert f"-fopenmp-targets={OMP_DEFAULT_TARGET}" in cmd
+    assert OMP_DEFAULT_TARGET == "nvptx64-nvidia-cuda"  # invariant the docs promise
+    # Driver source is the .cpp input, output is baselines/<stem>/driver.
+    assert "baselines/vector_add/driver.cpp" in cmd
+    assert "-o" in cmd
+    assert cmd[cmd.index("-o") + 1] == "baselines/vector_add/driver"
+    # The OMP-offload profile must NOT inherit other profiles' flags.
+    # -lkokkoscore is Kokkos-link; -arch= is nvcc; --offload-arch= is
+    # hipcc; -fsycl is SYCL.
+    assert "-lkokkoscore" not in cmd
+    assert "-lkokkoscontainers" not in cmd
+    assert not any(a.startswith("-arch=") for a in cmd)
+    assert not any(a.startswith("--offload-arch=") for a in cmd)
+    assert "-fsycl" not in cmd
+
+
+def test_compile_baseline_driver_omp_offload_honors_cxx_env_override(
+    monkeypatch, tmp_path
+):
+    """AGENT_PRECISION_OMP_CXX=icpx replaces the default compiler driver in the OMP-offload compile command. The env value is taken verbatim — there is no allowlist validation in `_resolve_compiler`; a typo (e.g. `gcc`) is caught downstream by the compiler's own "unrecognized option" / "no offload target" diagnostics rather than by a Python-side check."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv(OMP_CXX_ENV, "icpx")
+    monkeypatch.delenv(OMP_TARGET_ENV, raising=False)
+    _stage_omp_offload_driver(tmp_path, "vector_add")
+    monkeypatch.setattr(
+        omp_offload_profile.shutil, "which", lambda name: f"/usr/bin/{name}"
+    )
+
+    captured = {}
+
+    class FakeProc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(cmd, capture_output, text, check):
+        captured["cmd"] = cmd
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = compile_baseline_driver("vector_add", "omp_offload")
+
+    assert result["status"] == "ok"
+    cmd = captured["cmd"]
+    assert cmd[0] == "icpx"
+    assert OMP_DEFAULT_CXX not in cmd  # the default `clang++` is no longer the driver
+    assert OMP_FLAG in cmd  # -fopenmp still present regardless of compiler choice
+    assert f"-fopenmp-targets={OMP_DEFAULT_TARGET}" in cmd  # default target preserved
+
+
+def test_compile_baseline_driver_omp_offload_honors_target_env_override(
+    monkeypatch, tmp_path
+):
+    """AGENT_PRECISION_OMP_TARGET=amdgcn-amd-amdhsa replaces the default target triple in `-fopenmp-targets=<triple>`. The env value is taken verbatim — no Python-side allowlist of valid triples, because the universe of valid triples is compiler-version-dependent."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv(OMP_CXX_ENV, raising=False)
+    monkeypatch.setenv(OMP_TARGET_ENV, "amdgcn-amd-amdhsa")
+    _stage_omp_offload_driver(tmp_path, "vector_add")
+    monkeypatch.setattr(
+        omp_offload_profile.shutil, "which", lambda name: f"/usr/bin/{name}"
+    )
+
+    captured = {}
+
+    class FakeProc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(cmd, capture_output, text, check):
+        captured["cmd"] = cmd
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = compile_baseline_driver("vector_add", "omp_offload")
+
+    assert result["status"] == "ok"
+    cmd = captured["cmd"]
+    assert "-fopenmp-targets=amdgcn-amd-amdhsa" in cmd
+    # The default triple must NOT also appear (no double-target flag).
+    assert f"-fopenmp-targets={OMP_DEFAULT_TARGET}" not in cmd
+
+
+def test_compile_baseline_driver_omp_offload_errors_when_compiler_missing(
+    monkeypatch, tmp_path
+):
+    """When shutil.which(<resolved compiler>) returns None, compile_baseline_driver returns status='error' WITHOUT invoking subprocess.run and the stderr names the missing compiler. Mirrors the nvcc-missing / hipcc-missing / icpx-missing tests for CUDA / HIP / SYCL. The error message must also name AGENT_PRECISION_OMP_CXX so an operator on a host with a non-default OMP compiler knows the escape hatch."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv(OMP_CXX_ENV, raising=False)
+    # No need to stage a source file — preflight runs before the
+    # source-exists check.
+    monkeypatch.setattr(omp_offload_profile.shutil, "which", lambda name: None)
+
+    def fail_run(*a, **kw):
+        raise AssertionError(
+            "subprocess.run must not be called when OMP-offload compiler is missing"
+        )
+
+    monkeypatch.setattr(subprocess, "run", fail_run)
+
+    result = compile_baseline_driver("vector_add", "omp_offload")
+
+    assert result["status"] == "error"
+    assert OMP_DEFAULT_CXX in result["stderr"]
+    assert OMP_CXX_ENV in result["stderr"]
+    assert result["artifacts"] == []
+
+
+def test_compile_baseline_driver_omp_offload_errors_when_driver_source_missing(
+    monkeypatch, tmp_path
+):
+    """When the OMP-offload driver source is absent, compile_baseline_driver returns status='error' (no subprocess) and the error names driver.cpp (not driver.hip or driver.cu)."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        omp_offload_profile.shutil, "which", lambda name: f"/usr/bin/{name}"
+    )
+
+    def fail_run(*a, **kw):
+        raise AssertionError(
+            "subprocess.run must not be called when driver source missing"
+        )
+
+    monkeypatch.setattr(subprocess, "run", fail_run)
+
+    result = compile_baseline_driver("vector_add", "omp_offload")
+
+    assert result["status"] == "error"
+    assert "driver.cpp" in result["stderr"]
+    assert "driver.hip" not in result["stderr"]
+    assert "driver.cu" not in result["stderr"]
+    assert result["artifacts"] == []
+
+
+def test_compile_baseline_driver_omp_offload_result_keys_are_stable(
+    monkeypatch, tmp_path
+):
+    """Every OMP-offload code path returns a dict with exactly {status, stdout, stderr, artifacts} — the uniform schema shared with the Kokkos / CUDA / HIP / SYCL paths."""
+    expected_keys = {"status", "stdout", "stderr", "artifacts"}
+    monkeypatch.chdir(tmp_path)
+
+    # 1) OMP compiler missing
+    monkeypatch.setattr(omp_offload_profile.shutil, "which", lambda name: None)
+    assert set(compile_baseline_driver("x", "omp_offload").keys()) == expected_keys
+
+    # 2) success
+    monkeypatch.setattr(
+        omp_offload_profile.shutil, "which", lambda name: f"/usr/bin/{name}"
+    )
+    _stage_omp_offload_driver(tmp_path, "x")
+
+    class OkProc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: OkProc())
+    assert set(compile_baseline_driver("x", "omp_offload").keys()) == expected_keys
+
+    # 3) compile failure
+    class FailProc:
+        returncode = 2
+        stdout = ""
+        stderr = "boom"
+
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: FailProc())
+    assert set(compile_baseline_driver("x", "omp_offload").keys()) == expected_keys
+
+
+def test_splice_rewritten_kernel_omp_offload_reads_and_writes_dot_cpp(
+    monkeypatch, tmp_path
+):
+    """For language_id='omp_offload', splice_rewritten_kernel reads baselines/<stem>/driver.cpp and writes baselines/<stem>/rewritten/driver.cpp — same filename as the Kokkos and SYCL profiles (all use .cpp), NOT driver.cu or driver.hip. The splice logic itself is shared across profiles; this test just confirms the OMP-offload dispatch path resolves to the right driver_filename."""
+    monkeypatch.chdir(tmp_path)
+    _stage_omp_offload_baseline_driver(tmp_path, "k")
+    _ban_subprocess(monkeypatch)
+
+    new_kernel = (
+        "using aType = float;\n"
+        "using cType = float;\n"
+        "// OMP-offload kernel body would go here, called from `#pragma omp target`\n"
+    )
+
+    result = splice_rewritten_kernel("k", new_kernel, "omp_offload")
 
     assert result["status"] == "ok"
     assert result["artifacts"] == ["baselines/k/rewritten/driver.cpp"]
