@@ -61,7 +61,7 @@ def test_compile_baseline_driver_errors_when_env_unset(monkeypatch, tmp_path):
 
     monkeypatch.setattr(subprocess, "run", fail_run)
 
-    result = compile_baseline_driver("nbody_force")
+    result = compile_baseline_driver("nbody_force", "kokkos")
 
     assert result["status"] == "error"
     assert KOKKOS_ROOT_ENV in result["stderr"]
@@ -85,7 +85,7 @@ def test_compile_baseline_driver_errors_when_env_points_at_non_kokkos(
 
     monkeypatch.setattr(subprocess, "run", fail_run)
 
-    result = compile_baseline_driver("nbody_force")
+    result = compile_baseline_driver("nbody_force", "kokkos")
 
     assert result["status"] == "error"
     assert "include/" in result["stderr"] or "lib/" in result["stderr"]
@@ -118,7 +118,7 @@ def test_compile_baseline_driver_errors_when_driver_source_missing(
 
     monkeypatch.setattr(subprocess, "run", fail_run)
 
-    result = compile_baseline_driver("nbody_force")
+    result = compile_baseline_driver("nbody_force", "kokkos")
 
     assert result["status"] == "error"
     assert "driver.cpp" in result["stderr"]
@@ -161,7 +161,7 @@ def test_compile_baseline_driver_success_returns_artifacts_and_uses_env_root(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    result = compile_baseline_driver("nbody_force")
+    result = compile_baseline_driver("nbody_force", "kokkos")
 
     assert result["status"] == "ok"
     assert result["artifacts"] == ["baselines/nbody_force/driver"]
@@ -204,7 +204,7 @@ def test_compile_baseline_driver_compile_failure_propagates_stderr(
         subprocess, "run", lambda *a, **kw: FakeProc()
     )
 
-    result = compile_baseline_driver("nbody_force")
+    result = compile_baseline_driver("nbody_force", "kokkos")
 
     assert result["status"] == "error"
     assert "exited with code 1" in result["stderr"]
@@ -224,7 +224,7 @@ def test_compile_baseline_driver_handles_missing_gxx(monkeypatch, tmp_path):
 
     monkeypatch.setattr(subprocess, "run", raise_fnf)
 
-    result = compile_baseline_driver("nbody_force")
+    result = compile_baseline_driver("nbody_force", "kokkos")
 
     assert result["status"] == "error"
     assert "g++" in result["stderr"]
@@ -241,7 +241,7 @@ def test_compile_baseline_driver_result_keys_are_stable(monkeypatch, tmp_path):
     # 1) env unset
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv(KOKKOS_ROOT_ENV, raising=False)
-    assert set(compile_baseline_driver("x").keys()) == expected_keys
+    assert set(compile_baseline_driver("x", "kokkos").keys()) == expected_keys
 
     # 2) success
     root = _make_fake_kokkos_root(tmp_path)
@@ -254,7 +254,7 @@ def test_compile_baseline_driver_result_keys_are_stable(monkeypatch, tmp_path):
         stderr = ""
 
     monkeypatch.setattr(subprocess, "run", lambda *a, **kw: OkProc())
-    assert set(compile_baseline_driver("x").keys()) == expected_keys
+    assert set(compile_baseline_driver("x", "kokkos").keys()) == expected_keys
 
     # 3) failure
     class FailProc:
@@ -263,7 +263,7 @@ def test_compile_baseline_driver_result_keys_are_stable(monkeypatch, tmp_path):
         stderr = "boom"
 
     monkeypatch.setattr(subprocess, "run", lambda *a, **kw: FailProc())
-    assert set(compile_baseline_driver("x").keys()) == expected_keys
+    assert set(compile_baseline_driver("x", "kokkos").keys()) == expected_keys
 
 
 # ---------- run_baseline_driver: env-var parsing ----------
@@ -314,7 +314,7 @@ def test_run_baseline_driver_uses_default_timeout_when_env_unset(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    result = run_baseline_driver("nbody_force")
+    result = run_baseline_driver("nbody_force", "kokkos")
 
     assert result["status"] == "ok"
     assert captured["kwargs"]["timeout"] == DEFAULT_RUN_TIMEOUT_SEC
@@ -341,7 +341,7 @@ def test_run_baseline_driver_honors_env_timeout_override(monkeypatch, tmp_path):
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    run_baseline_driver("nbody_force")
+    run_baseline_driver("nbody_force", "kokkos")
 
     assert captured["timeout"] == 120
 
@@ -360,7 +360,7 @@ def test_run_baseline_driver_rejects_invalid_env_timeout(monkeypatch, tmp_path):
 
     for bad in ["not_an_int", "0", "-5", "3.14"]:
         monkeypatch.setenv(RUN_TIMEOUT_ENV, bad)
-        result = run_baseline_driver("nbody_force")
+        result = run_baseline_driver("nbody_force", "kokkos")
         assert result["status"] == "error"
         assert RUN_TIMEOUT_ENV in result["stderr"]
         assert result["artifacts"] == []
@@ -382,7 +382,7 @@ def test_run_baseline_driver_errors_when_driver_binary_missing(
 
     monkeypatch.setattr(subprocess, "run", fail_run)
 
-    result = run_baseline_driver("nbody_force")
+    result = run_baseline_driver("nbody_force", "kokkos")
 
     assert result["status"] == "error"
     assert "driver" in result["stderr"].lower()
@@ -408,7 +408,7 @@ def test_run_baseline_driver_errors_when_driver_binary_not_executable(
 
     monkeypatch.setattr(subprocess, "run", fail_run)
 
-    result = run_baseline_driver("nbody_force")
+    result = run_baseline_driver("nbody_force", "kokkos")
 
     assert result["status"] == "error"
     assert "executable" in result["stderr"].lower()
@@ -442,7 +442,7 @@ def test_run_baseline_driver_invokes_driver_with_per_stem_cwd(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    run_baseline_driver("nbody_force")
+    run_baseline_driver("nbody_force", "kokkos")
 
     assert captured["cmd"] == ["./driver"]
     # cwd is the per-stem dir, relative or absolute is fine but it must
@@ -478,7 +478,7 @@ def test_run_baseline_driver_success_returns_reference_json_artifact(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    result = run_baseline_driver("nbody_force")
+    result = run_baseline_driver("nbody_force", "kokkos")
 
     assert result["status"] == "ok"
     assert result["stdout"] == "all good"
@@ -497,7 +497,7 @@ def test_run_baseline_driver_errors_on_nonzero_exit(monkeypatch, tmp_path):
 
     monkeypatch.setattr(subprocess, "run", lambda *a, **kw: FailProc())
 
-    result = run_baseline_driver("nbody_force")
+    result = run_baseline_driver("nbody_force", "kokkos")
 
     assert result["status"] == "error"
     assert "code 7" in result["stderr"]
@@ -520,7 +520,7 @@ def test_run_baseline_driver_errors_when_reference_json_missing(
 
     monkeypatch.setattr(subprocess, "run", lambda *a, **kw: OkProc())
 
-    result = run_baseline_driver("nbody_force")
+    result = run_baseline_driver("nbody_force", "kokkos")
 
     assert result["status"] == "error"
     assert "reference.json" in result["stderr"]
@@ -542,7 +542,7 @@ def test_run_baseline_driver_errors_on_invalid_reference_json(
 
     monkeypatch.setattr(subprocess, "run", lambda *a, **kw: OkProc())
 
-    result = run_baseline_driver("nbody_force")
+    result = run_baseline_driver("nbody_force", "kokkos")
 
     assert result["status"] == "error"
     assert "reference.json" in result["stderr"]
@@ -573,7 +573,7 @@ def test_run_baseline_driver_deletes_stale_reference_before_run(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    result = run_baseline_driver("nbody_force")
+    result = run_baseline_driver("nbody_force", "kokkos")
 
     assert observed_at_run["stale_exists"] is False
     # And the failure is still reported (we don't accidentally pass).
@@ -591,7 +591,7 @@ def test_run_baseline_driver_errors_on_timeout(monkeypatch, tmp_path):
 
     monkeypatch.setattr(subprocess, "run", raise_timeout)
 
-    result = run_baseline_driver("nbody_force")
+    result = run_baseline_driver("nbody_force", "kokkos")
 
     assert result["status"] == "error"
     assert "timeout" in result["stderr"].lower()
@@ -612,7 +612,7 @@ def test_run_baseline_driver_handles_file_not_found_at_exec(
 
     monkeypatch.setattr(subprocess, "run", raise_fnf)
 
-    result = run_baseline_driver("nbody_force")
+    result = run_baseline_driver("nbody_force", "kokkos")
 
     assert result["status"] == "error"
     assert "driver" in result["stderr"].lower()
@@ -629,11 +629,11 @@ def test_run_baseline_driver_result_keys_are_stable(monkeypatch, tmp_path):
 
     # 1) bad env timeout
     monkeypatch.setenv(RUN_TIMEOUT_ENV, "not_an_int")
-    assert set(run_baseline_driver("x").keys()) == expected_keys
+    assert set(run_baseline_driver("x", "kokkos").keys()) == expected_keys
     monkeypatch.delenv(RUN_TIMEOUT_ENV, raising=False)
 
     # 2) missing binary
-    assert set(run_baseline_driver("x").keys()) == expected_keys
+    assert set(run_baseline_driver("x", "kokkos").keys()) == expected_keys
 
     # 3) success
     _stage_driver_binary(tmp_path, "x", reference_payload={"ok": 1})
@@ -644,7 +644,7 @@ def test_run_baseline_driver_result_keys_are_stable(monkeypatch, tmp_path):
         stderr = ""
 
     monkeypatch.setattr(subprocess, "run", lambda *a, **kw: OkProc())
-    assert set(run_baseline_driver("x").keys()) == expected_keys
+    assert set(run_baseline_driver("x", "kokkos").keys()) == expected_keys
 
     # 4) non-zero exit
     class FailProc:
@@ -653,14 +653,14 @@ def test_run_baseline_driver_result_keys_are_stable(monkeypatch, tmp_path):
         stderr = "boom"
 
     monkeypatch.setattr(subprocess, "run", lambda *a, **kw: FailProc())
-    assert set(run_baseline_driver("x").keys()) == expected_keys
+    assert set(run_baseline_driver("x", "kokkos").keys()) == expected_keys
 
     # 5) timeout
     def raise_timeout(*a, **kw):
         raise subprocess.TimeoutExpired(cmd=["./driver"], timeout=1)
 
     monkeypatch.setattr(subprocess, "run", raise_timeout)
-    assert set(run_baseline_driver("x").keys()) == expected_keys
+    assert set(run_baseline_driver("x", "kokkos").keys()) == expected_keys
 
 
 # ---------- splice_rewritten_kernel ----------
@@ -728,7 +728,7 @@ def test_splice_rewritten_kernel_success_writes_rewritten_driver(
         "}\n"
     )
 
-    result = splice_rewritten_kernel("k", new_kernel)
+    result = splice_rewritten_kernel("k", new_kernel, "kokkos")
 
     assert result["status"] == "ok"
     assert result["stdout"] == ""
@@ -757,7 +757,7 @@ def test_splice_rewritten_kernel_does_not_touch_baseline(monkeypatch, tmp_path):
     _ban_subprocess(monkeypatch)
     before = (driver_dir / "driver.cpp").read_bytes()
 
-    splice_rewritten_kernel("k", "void kernel() {}\n")
+    splice_rewritten_kernel("k", "void kernel() {}\n", "kokkos")
 
     after = (driver_dir / "driver.cpp").read_bytes()
     assert before == after
@@ -771,7 +771,7 @@ def test_splice_rewritten_kernel_preserves_bytes_outside_sentinels(
     _stage_baseline_driver(tmp_path, "k")
     _ban_subprocess(monkeypatch)
 
-    splice_rewritten_kernel("k", "void kernel() { /* new */ }\n")
+    splice_rewritten_kernel("k", "void kernel() { /* new */ }\n", "kokkos")
 
     baseline = (tmp_path / "baselines" / "k" / "driver.cpp").read_text()
     rewritten = (
@@ -799,7 +799,7 @@ def test_splice_rewritten_kernel_round_trip_is_byte_identical(
     _stage_baseline_driver(tmp_path, "k")
     _ban_subprocess(monkeypatch)
 
-    result = splice_rewritten_kernel("k", _ORIGINAL_KERNEL_BODY)
+    result = splice_rewritten_kernel("k", _ORIGINAL_KERNEL_BODY, "kokkos")
 
     assert result["status"] == "ok"
     baseline = (tmp_path / "baselines" / "k" / "driver.cpp").read_bytes()
@@ -817,12 +817,12 @@ def test_splice_rewritten_kernel_overwrites_prior_rewritten(
     _stage_baseline_driver(tmp_path, "k")
     _ban_subprocess(monkeypatch)
 
-    r1 = splice_rewritten_kernel("k", "void kernel() { /* v1 */ }\n")
+    r1 = splice_rewritten_kernel("k", "void kernel() { /* v1 */ }\n", "kokkos")
     assert r1["status"] == "ok"
     first = (tmp_path / "baselines" / "k" / "rewritten" / "driver.cpp").read_text()
     assert "v1" in first
 
-    r2 = splice_rewritten_kernel("k", "void kernel() { /* v2 */ }\n")
+    r2 = splice_rewritten_kernel("k", "void kernel() { /* v2 */ }\n", "kokkos")
     assert r2["status"] == "ok"
     second = (tmp_path / "baselines" / "k" / "rewritten" / "driver.cpp").read_text()
     assert "v2" in second
@@ -836,7 +836,7 @@ def test_splice_rewritten_kernel_errors_when_baseline_missing(
     monkeypatch.chdir(tmp_path)
     _ban_subprocess(monkeypatch)
 
-    result = splice_rewritten_kernel("k", "void kernel() {}\n")
+    result = splice_rewritten_kernel("k", "void kernel() {}\n", "kokkos")
 
     assert result["status"] == "error"
     assert "driver.cpp" in result["stderr"]
@@ -852,7 +852,7 @@ def test_splice_rewritten_kernel_errors_when_rewritten_source_empty(
     _stage_baseline_driver(tmp_path, "k")
     _ban_subprocess(monkeypatch)
 
-    result = splice_rewritten_kernel("k", "")
+    result = splice_rewritten_kernel("k", "", "kokkos")
 
     assert result["status"] == "error"
     assert result["artifacts"] == []
@@ -868,7 +868,7 @@ def test_splice_rewritten_kernel_errors_when_begin_sentinel_missing(
     _stage_baseline_driver(tmp_path, "k", body=bad)
     _ban_subprocess(monkeypatch)
 
-    result = splice_rewritten_kernel("k", "void kernel() {}\n")
+    result = splice_rewritten_kernel("k", "void kernel() {}\n", "kokkos")
 
     assert result["status"] == "error"
     assert KERNEL_BEGIN_SENTINEL in result["stderr"]
@@ -884,7 +884,7 @@ def test_splice_rewritten_kernel_errors_when_end_sentinel_missing(
     _stage_baseline_driver(tmp_path, "k", body=bad)
     _ban_subprocess(monkeypatch)
 
-    result = splice_rewritten_kernel("k", "void kernel() {}\n")
+    result = splice_rewritten_kernel("k", "void kernel() {}\n", "kokkos")
 
     assert result["status"] == "error"
     assert KERNEL_END_SENTINEL in result["stderr"]
@@ -900,7 +900,7 @@ def test_splice_rewritten_kernel_errors_when_begin_sentinel_duplicated(
     _stage_baseline_driver(tmp_path, "k", body=bad)
     _ban_subprocess(monkeypatch)
 
-    result = splice_rewritten_kernel("k", "void kernel() {}\n")
+    result = splice_rewritten_kernel("k", "void kernel() {}\n", "kokkos")
 
     assert result["status"] == "error"
     assert KERNEL_BEGIN_SENTINEL in result["stderr"]
@@ -916,7 +916,7 @@ def test_splice_rewritten_kernel_errors_when_end_sentinel_duplicated(
     _stage_baseline_driver(tmp_path, "k", body=bad)
     _ban_subprocess(monkeypatch)
 
-    result = splice_rewritten_kernel("k", "void kernel() {}\n")
+    result = splice_rewritten_kernel("k", "void kernel() {}\n", "kokkos")
 
     assert result["status"] == "error"
     assert KERNEL_END_SENTINEL in result["stderr"]
@@ -942,7 +942,7 @@ def test_splice_rewritten_kernel_errors_when_sentinels_out_of_order(
     _stage_baseline_driver(tmp_path, "k", body=bad)
     _ban_subprocess(monkeypatch)
 
-    result = splice_rewritten_kernel("k", "void kernel() {}\n")
+    result = splice_rewritten_kernel("k", "void kernel() {}\n", "kokkos")
 
     assert result["status"] == "error"
     # Both sentinel strings should be named in the diagnostic.
@@ -961,7 +961,7 @@ def test_splice_rewritten_kernel_rejects_indented_sentinel(monkeypatch, tmp_path
     _stage_baseline_driver(tmp_path, "k", body=bad)
     _ban_subprocess(monkeypatch)
 
-    result = splice_rewritten_kernel("k", "void kernel() {}\n")
+    result = splice_rewritten_kernel("k", "void kernel() {}\n", "kokkos")
 
     assert result["status"] == "error"
     assert KERNEL_BEGIN_SENTINEL in result["stderr"]
@@ -979,7 +979,7 @@ def test_splice_rewritten_kernel_rejects_trailing_whitespace_sentinel(
     _stage_baseline_driver(tmp_path, "k", body=bad)
     _ban_subprocess(monkeypatch)
 
-    result = splice_rewritten_kernel("k", "void kernel() {}\n")
+    result = splice_rewritten_kernel("k", "void kernel() {}\n", "kokkos")
 
     assert result["status"] == "error"
     assert KERNEL_END_SENTINEL in result["stderr"]
@@ -993,18 +993,18 @@ def test_splice_rewritten_kernel_result_keys_are_stable(monkeypatch, tmp_path):
     _ban_subprocess(monkeypatch)
 
     # 1) empty rewritten source
-    assert set(splice_rewritten_kernel("k", "").keys()) == expected_keys
+    assert set(splice_rewritten_kernel("k", "", "kokkos").keys()) == expected_keys
 
     # 2) missing baseline
     assert (
-        set(splice_rewritten_kernel("k", "void kernel() {}\n").keys())
+        set(splice_rewritten_kernel("k", "void kernel() {}\n", "kokkos").keys())
         == expected_keys
     )
 
     # 3) success
     _stage_baseline_driver(tmp_path, "k")
     assert (
-        set(splice_rewritten_kernel("k", "void kernel() {}\n").keys())
+        set(splice_rewritten_kernel("k", "void kernel() {}\n", "kokkos").keys())
         == expected_keys
     )
 
@@ -1016,7 +1016,7 @@ def test_splice_rewritten_kernel_result_keys_are_stable(monkeypatch, tmp_path):
         body=_BASELINE_DRIVER_TEMPLATE.replace(KERNEL_BEGIN_SENTINEL, "// x"),
     )
     assert (
-        set(splice_rewritten_kernel(bad_stem, "void kernel() {}\n").keys())
+        set(splice_rewritten_kernel(bad_stem, "void kernel() {}\n", "kokkos").keys())
         == expected_keys
     )
 
@@ -1048,7 +1048,7 @@ def test_compile_rewritten_driver_errors_when_env_unset(monkeypatch, tmp_path):
 
     monkeypatch.setattr(subprocess, "run", fail_run)
 
-    result = compile_rewritten_driver("nbody_force")
+    result = compile_rewritten_driver("nbody_force", "kokkos")
 
     assert result["status"] == "error"
     assert KOKKOS_ROOT_ENV in result["stderr"]
@@ -1071,7 +1071,7 @@ def test_compile_rewritten_driver_errors_when_env_points_at_non_kokkos(
 
     monkeypatch.setattr(subprocess, "run", fail_run)
 
-    result = compile_rewritten_driver("nbody_force")
+    result = compile_rewritten_driver("nbody_force", "kokkos")
 
     assert result["status"] == "error"
     assert "include/" in result["stderr"] or "lib/" in result["stderr"]
@@ -1093,7 +1093,7 @@ def test_compile_rewritten_driver_errors_when_driver_source_missing(
 
     monkeypatch.setattr(subprocess, "run", fail_run)
 
-    result = compile_rewritten_driver("nbody_force")
+    result = compile_rewritten_driver("nbody_force", "kokkos")
 
     assert result["status"] == "error"
     # Path must point at the rewritten subdirectory, not the baseline.
@@ -1126,7 +1126,7 @@ def test_compile_rewritten_driver_success_targets_rewritten_subdir(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    result = compile_rewritten_driver("nbody_force")
+    result = compile_rewritten_driver("nbody_force", "kokkos")
 
     assert result["status"] == "ok"
     assert result["artifacts"] == [
@@ -1164,8 +1164,8 @@ def test_compile_rewritten_driver_shares_compile_flags_with_baseline(
         lambda cmd, **kw: (cmds.append(cmd), FakeProc())[1],
     )
 
-    compile_baseline_driver("k")
-    compile_rewritten_driver("k")
+    compile_baseline_driver("k", "kokkos")
+    compile_rewritten_driver("k", "kokkos")
 
     base_cmd, rewritten_cmd = cmds
     # Strip the source path and the -o target path; the rest of the
@@ -1200,7 +1200,7 @@ def test_compile_rewritten_driver_compile_failure_propagates_stderr(
         subprocess, "run", lambda *a, **kw: FakeProc()
     )
 
-    result = compile_rewritten_driver("nbody_force")
+    result = compile_rewritten_driver("nbody_force", "kokkos")
 
     assert result["status"] == "error"
     assert "exited with code 1" in result["stderr"]
@@ -1220,7 +1220,7 @@ def test_compile_rewritten_driver_handles_missing_gxx(monkeypatch, tmp_path):
 
     monkeypatch.setattr(subprocess, "run", raise_fnf)
 
-    result = compile_rewritten_driver("nbody_force")
+    result = compile_rewritten_driver("nbody_force", "kokkos")
 
     assert result["status"] == "error"
     assert "g++" in result["stderr"]
@@ -1251,7 +1251,7 @@ def test_compile_rewritten_driver_does_not_touch_baseline_binary(
         subprocess, "run", lambda *a, **kw: FakeProc()
     )
 
-    compile_rewritten_driver("k")
+    compile_rewritten_driver("k", "kokkos")
 
     assert baseline_bin.read_bytes() == b"ORIGINAL BASELINE BINARY"
 
@@ -1265,12 +1265,12 @@ def test_compile_rewritten_driver_result_keys_are_stable(
     # 1) env unset
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv(KOKKOS_ROOT_ENV, raising=False)
-    assert set(compile_rewritten_driver("x").keys()) == expected_keys
+    assert set(compile_rewritten_driver("x", "kokkos").keys()) == expected_keys
 
     # 2) env set but no rewritten source
     root = _make_fake_kokkos_root(tmp_path)
     monkeypatch.setenv(KOKKOS_ROOT_ENV, str(root))
-    assert set(compile_rewritten_driver("x").keys()) == expected_keys
+    assert set(compile_rewritten_driver("x", "kokkos").keys()) == expected_keys
 
     # 3) success
     _stage_rewritten_driver(tmp_path, "x")
@@ -1281,7 +1281,7 @@ def test_compile_rewritten_driver_result_keys_are_stable(
         stderr = ""
 
     monkeypatch.setattr(subprocess, "run", lambda *a, **kw: OkProc())
-    assert set(compile_rewritten_driver("x").keys()) == expected_keys
+    assert set(compile_rewritten_driver("x", "kokkos").keys()) == expected_keys
 
     # 4) failure
     class FailProc:
@@ -1290,7 +1290,7 @@ def test_compile_rewritten_driver_result_keys_are_stable(
         stderr = "boom"
 
     monkeypatch.setattr(subprocess, "run", lambda *a, **kw: FailProc())
-    assert set(compile_rewritten_driver("x").keys()) == expected_keys
+    assert set(compile_rewritten_driver("x", "kokkos").keys()) == expected_keys
 
 
 # ---------- run_rewritten_driver: env-var + preflight + cwd + success ----------
@@ -1333,7 +1333,7 @@ def test_run_rewritten_driver_rejects_invalid_env_timeout(monkeypatch, tmp_path)
 
     for bad in ["not_an_int", "0", "-5", "3.14"]:
         monkeypatch.setenv(RUN_TIMEOUT_ENV, bad)
-        result = run_rewritten_driver("nbody_force")
+        result = run_rewritten_driver("nbody_force", "kokkos")
         assert result["status"] == "error"
         assert RUN_TIMEOUT_ENV in result["stderr"]
         assert result["artifacts"] == []
@@ -1352,7 +1352,7 @@ def test_run_rewritten_driver_errors_when_driver_binary_missing(
 
     monkeypatch.setattr(subprocess, "run", fail_run)
 
-    result = run_rewritten_driver("nbody_force")
+    result = run_rewritten_driver("nbody_force", "kokkos")
 
     assert result["status"] == "error"
     # Path must point at the rewritten subdirectory, not the baseline.
@@ -1381,7 +1381,7 @@ def test_run_rewritten_driver_errors_when_driver_binary_not_executable(
 
     monkeypatch.setattr(subprocess, "run", fail_run)
 
-    result = run_rewritten_driver("nbody_force")
+    result = run_rewritten_driver("nbody_force", "kokkos")
 
     assert result["status"] == "error"
     assert "executable" in result["stderr"].lower()
@@ -1414,7 +1414,7 @@ def test_run_rewritten_driver_invokes_driver_with_rewritten_subdir_cwd(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    run_rewritten_driver("nbody_force")
+    run_rewritten_driver("nbody_force", "kokkos")
 
     assert captured["cmd"] == ["./driver"]
     # cwd is the per-stem rewritten dir.
@@ -1449,7 +1449,7 @@ def test_run_rewritten_driver_success_returns_rewritten_reference_artifact(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    result = run_rewritten_driver("nbody_force")
+    result = run_rewritten_driver("nbody_force", "kokkos")
 
     assert result["status"] == "ok"
     assert result["stdout"] == "all good"
@@ -1481,7 +1481,7 @@ def test_run_rewritten_driver_does_not_touch_baseline_reference(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    run_rewritten_driver("nbody_force")
+    run_rewritten_driver("nbody_force", "kokkos")
 
     # Baseline file must be byte-identical to what we wrote.
     assert (baseline_dir / "reference.json").read_bytes() == sentinel_bytes
@@ -1509,7 +1509,7 @@ def test_run_rewritten_driver_deletes_stale_rewritten_reference_before_run(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    result = run_rewritten_driver("nbody_force")
+    result = run_rewritten_driver("nbody_force", "kokkos")
 
     assert observed_at_run["stale_exists"] is False
     assert result["status"] == "error"
@@ -1526,7 +1526,7 @@ def test_run_rewritten_driver_errors_on_timeout(monkeypatch, tmp_path):
 
     monkeypatch.setattr(subprocess, "run", raise_timeout)
 
-    result = run_rewritten_driver("nbody_force")
+    result = run_rewritten_driver("nbody_force", "kokkos")
 
     assert result["status"] == "error"
     assert "timeout" in result["stderr"].lower()
@@ -1542,11 +1542,11 @@ def test_run_rewritten_driver_result_keys_are_stable(monkeypatch, tmp_path):
 
     # 1) bad env timeout
     monkeypatch.setenv(RUN_TIMEOUT_ENV, "not_an_int")
-    assert set(run_rewritten_driver("x").keys()) == expected_keys
+    assert set(run_rewritten_driver("x", "kokkos").keys()) == expected_keys
     monkeypatch.delenv(RUN_TIMEOUT_ENV, raising=False)
 
     # 2) missing binary
-    assert set(run_rewritten_driver("x").keys()) == expected_keys
+    assert set(run_rewritten_driver("x", "kokkos").keys()) == expected_keys
 
     # 3) success
     _stage_rewritten_driver_binary(tmp_path, "x", reference_payload={"ok": 1})
@@ -1557,7 +1557,7 @@ def test_run_rewritten_driver_result_keys_are_stable(monkeypatch, tmp_path):
         stderr = ""
 
     monkeypatch.setattr(subprocess, "run", lambda *a, **kw: OkProc())
-    assert set(run_rewritten_driver("x").keys()) == expected_keys
+    assert set(run_rewritten_driver("x", "kokkos").keys()) == expected_keys
 
     # 4) non-zero exit
     class FailProc:
@@ -1566,14 +1566,14 @@ def test_run_rewritten_driver_result_keys_are_stable(monkeypatch, tmp_path):
         stderr = "boom"
 
     monkeypatch.setattr(subprocess, "run", lambda *a, **kw: FailProc())
-    assert set(run_rewritten_driver("x").keys()) == expected_keys
+    assert set(run_rewritten_driver("x", "kokkos").keys()) == expected_keys
 
     # 5) timeout
     def raise_timeout(*a, **kw):
         raise subprocess.TimeoutExpired(cmd=["./driver"], timeout=1)
 
     monkeypatch.setattr(subprocess, "run", raise_timeout)
-    assert set(run_rewritten_driver("x").keys()) == expected_keys
+    assert set(run_rewritten_driver("x", "kokkos").keys()) == expected_keys
 
 
 # ---------- compare_outputs: shape + tolerance + special values + artifact ----------
@@ -1627,7 +1627,7 @@ def test_compare_outputs_errors_when_both_references_missing(
     """If neither baseline/<stem>/reference.json nor baselines/<stem>/rewritten/reference.json exists, compare_outputs returns status='error' (no comparison.json is written because there is no rewritten dir to put it in)."""
     monkeypatch.chdir(tmp_path)
 
-    result = compare_outputs("nbody_force", _tolerance("sig_figs", 3))
+    result = compare_outputs("nbody_force", _tolerance("sig_figs", 3), "kokkos")
 
     assert result["status"] == "error"
     assert "baseline" in result["stderr"].lower()
@@ -1643,7 +1643,7 @@ def test_compare_outputs_errors_when_baseline_missing(monkeypatch, tmp_path):
         json.dumps(_well_shaped({"out": [1.0]}))
     )
 
-    result = compare_outputs("x", _tolerance("sig_figs", 3))
+    result = compare_outputs("x", _tolerance("sig_figs", 3), "kokkos")
 
     assert result["status"] == "error"
     assert "baseline" in result["stderr"].lower()
@@ -1660,7 +1660,7 @@ def test_compare_outputs_errors_when_rewritten_missing(monkeypatch, tmp_path):
         json.dumps(_well_shaped({"out": [1.0]}))
     )
 
-    result = compare_outputs("x", _tolerance("sig_figs", 3))
+    result = compare_outputs("x", _tolerance("sig_figs", 3), "kokkos")
 
     assert result["status"] == "error"
     assert "rewritten" in result["stderr"].lower()
@@ -1681,7 +1681,7 @@ def test_compare_outputs_errors_on_invalid_json_either_side(
         baseline_payload="{not json",
         rewritten_payload=_well_shaped({"out": [1.0]}),
     )
-    r1 = compare_outputs("a", _tolerance("sig_figs", 3))
+    r1 = compare_outputs("a", _tolerance("sig_figs", 3), "kokkos")
     assert r1["status"] == "error"
     assert "baseline" in r1["stderr"].lower()
 
@@ -1692,7 +1692,7 @@ def test_compare_outputs_errors_on_invalid_json_either_side(
         baseline_payload=_well_shaped({"out": [1.0]}),
         rewritten_payload="{also not json",
     )
-    r2 = compare_outputs("b", _tolerance("sig_figs", 3))
+    r2 = compare_outputs("b", _tolerance("sig_figs", 3), "kokkos")
     assert r2["status"] == "error"
     assert "rewritten" in r2["stderr"].lower()
 
@@ -1710,14 +1710,14 @@ def test_compare_outputs_errors_on_malformed_tolerance_json(
     )
 
     # Unparseable.
-    bad1 = compare_outputs("x", "{not json")
+    bad1 = compare_outputs("x", "{not json", "kokkos")
     assert bad1["status"] == "error"
     assert "tolerance_json" in bad1["stderr"]
     assert bad1["artifacts"] == []
 
     # Wrong kind.
     bad2 = compare_outputs(
-        "x", json.dumps({"kind": "ulps", "value": 3, "source": "user_cli"})
+        "x", json.dumps({"kind": "ulps", "value": 3, "source": "user_cli"}), "kokkos"
     )
     assert bad2["status"] == "error"
     assert "kind" in bad2["stderr"]
@@ -1725,7 +1725,7 @@ def test_compare_outputs_errors_on_malformed_tolerance_json(
     # Bad value (non-positive or non-int).
     bad3 = compare_outputs(
         "x",
-        json.dumps({"kind": "sig_figs", "value": 0, "source": "user_cli"}),
+        json.dumps({"kind": "sig_figs", "value": 0, "source": "user_cli"}), "kokkos"
     )
     assert bad3["status"] == "error"
     assert "value" in bad3["stderr"]
@@ -1734,7 +1734,7 @@ def test_compare_outputs_errors_on_malformed_tolerance_json(
         "x",
         json.dumps(
             {"kind": "sig_figs", "value": "three", "source": "user_cli"}
-        ),
+        ), "kokkos"
     )
     assert bad4["status"] == "error"
 
@@ -1761,7 +1761,7 @@ def test_compare_outputs_shape_mismatch_writes_shape_error_artifact(
             "outputs": {"a": [1.0]},
         },
     )
-    r_topk = compare_outputs("topk", _tolerance("sig_figs", 3))
+    r_topk = compare_outputs("topk", _tolerance("sig_figs", 3), "kokkos")
     assert r_topk["status"] == "error"
     doc_topk = json.loads(
         (
@@ -1782,7 +1782,7 @@ def test_compare_outputs_shape_mismatch_writes_shape_error_artifact(
         baseline_payload=_well_shaped({"a": [1.0], "b": [2.0]}),
         rewritten_payload=_well_shaped({"a": [1.0], "c": [2.0]}),
     )
-    r_names = compare_outputs("names", _tolerance("sig_figs", 3))
+    r_names = compare_outputs("names", _tolerance("sig_figs", 3), "kokkos")
     assert r_names["status"] == "error"
     doc_names = json.loads(
         (
@@ -1806,7 +1806,7 @@ def test_compare_outputs_shape_mismatch_writes_shape_error_artifact(
         baseline_payload=_well_shaped({"a": [1.0, 2.0, 3.0]}),
         rewritten_payload=_well_shaped({"a": [1.0, 2.0]}),
     )
-    r_lens = compare_outputs("lens", _tolerance("sig_figs", 3))
+    r_lens = compare_outputs("lens", _tolerance("sig_figs", 3), "kokkos")
     assert r_lens["status"] == "error"
     doc_lens = json.loads(
         (
@@ -1834,7 +1834,7 @@ def test_compare_outputs_sig_figs_passes_inside_threshold(
         baseline_payload=_well_shaped({"a": [1.0, 0.0]}),
         rewritten_payload=_well_shaped({"a": [1.0009, 0.0]}),
     )
-    result = compare_outputs("inside", _tolerance("sig_figs", 3))
+    result = compare_outputs("inside", _tolerance("sig_figs", 3), "kokkos")
     assert result["status"] == "ok"
     assert result["artifacts"] == [
         "baselines/inside/rewritten/comparison.json"
@@ -1866,7 +1866,7 @@ def test_compare_outputs_sig_figs_fails_just_outside_threshold(
         baseline_payload=_well_shaped({"a": [1.0]}),
         rewritten_payload=_well_shaped({"a": [1.01]}),
     )
-    result = compare_outputs("outside", _tolerance("sig_figs", 3))
+    result = compare_outputs("outside", _tolerance("sig_figs", 3), "kokkos")
     assert result["status"] == "error"
     assert "1/1" in result["stderr"]
     doc = json.loads(
@@ -1899,7 +1899,7 @@ def test_compare_outputs_decimal_digits_pass_and_fail(
         baseline_payload=_well_shaped({"a": [1000.0], "b": [1.0]}),
         rewritten_payload=_well_shaped({"a": [1000.00005], "b": [1.001]}),
     )
-    result = compare_outputs("dd", _tolerance("decimal_digits", 4))
+    result = compare_outputs("dd", _tolerance("decimal_digits", 4), "kokkos")
     assert result["status"] == "error"
     doc = json.loads(
         (
@@ -1926,7 +1926,7 @@ def test_compare_outputs_nan_always_mismatches(monkeypatch, tmp_path):
     (baseline_dir / "reference.json").write_text(raw_base)
     (baseline_dir / "rewritten" / "reference.json").write_text(raw_rewr)
 
-    result = compare_outputs("nans", _tolerance("sig_figs", 3))
+    result = compare_outputs("nans", _tolerance("sig_figs", 3), "kokkos")
     assert result["status"] == "error"
     doc = json.loads(
         (baseline_dir / "rewritten" / "comparison.json").read_text()
@@ -1952,7 +1952,7 @@ def test_compare_outputs_inf_rules(monkeypatch, tmp_path):
     (baseline_dir / "reference.json").write_text(raw_base)
     (baseline_dir / "rewritten" / "reference.json").write_text(raw_rewr)
 
-    result = compare_outputs("infs", _tolerance("sig_figs", 3))
+    result = compare_outputs("infs", _tolerance("sig_figs", 3), "kokkos")
     assert result["status"] == "error"
     doc = json.loads(
         (baseline_dir / "rewritten" / "comparison.json").read_text()
@@ -1975,7 +1975,7 @@ def test_compare_outputs_truncates_mismatch_list_with_footer(
         baseline_payload=_well_shaped({"a": [0.0] * n}),
         rewritten_payload=_well_shaped({"a": [1.0] * n}),
     )
-    result = compare_outputs("many", _tolerance("decimal_digits", 6))
+    result = compare_outputs("many", _tolerance("decimal_digits", 6), "kokkos")
     assert result["status"] == "error"
     # Stderr footer mentions the suppressed count.
     assert f"{n - 10} more mismatches suppressed" in result["stderr"]
@@ -2006,7 +2006,7 @@ def test_compare_outputs_writes_comparison_json_on_both_paths(
         baseline_payload=_well_shaped({"a": [1.0]}),
         rewritten_payload=_well_shaped({"a": [1.0]}),
     )
-    ok = compare_outputs("okpath", _tolerance("sig_figs", 3))
+    ok = compare_outputs("okpath", _tolerance("sig_figs", 3), "kokkos")
     assert ok["status"] == "ok"
     ok_path = tmp_path / "baselines" / "okpath" / "rewritten" / "comparison.json"
     assert ok_path.is_file()
@@ -2019,7 +2019,7 @@ def test_compare_outputs_writes_comparison_json_on_both_paths(
         baseline_payload=_well_shaped({"a": [1.0]}),
         rewritten_payload=_well_shaped({"a": [10.0]}),
     )
-    bad = compare_outputs("failpath", _tolerance("sig_figs", 3))
+    bad = compare_outputs("failpath", _tolerance("sig_figs", 3), "kokkos")
     assert bad["status"] == "error"
     bad_path = (
         tmp_path / "baselines" / "failpath" / "rewritten" / "comparison.json"
@@ -2034,11 +2034,11 @@ def test_compare_outputs_result_keys_are_stable(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
 
     # 1) malformed tolerance
-    r1 = compare_outputs("nope", "not json")
+    r1 = compare_outputs("nope", "not json", "kokkos")
     assert set(r1.keys()) == expected_keys
 
     # 2) both files missing
-    r2 = compare_outputs("nope", _tolerance("sig_figs", 3))
+    r2 = compare_outputs("nope", _tolerance("sig_figs", 3), "kokkos")
     assert set(r2.keys()) == expected_keys
 
     # 3) shape mismatch
@@ -2048,7 +2048,7 @@ def test_compare_outputs_result_keys_are_stable(monkeypatch, tmp_path):
         baseline_payload=_well_shaped({"a": [1.0]}),
         rewritten_payload=_well_shaped({"b": [1.0]}),
     )
-    r3 = compare_outputs("shp", _tolerance("sig_figs", 3))
+    r3 = compare_outputs("shp", _tolerance("sig_figs", 3), "kokkos")
     assert set(r3.keys()) == expected_keys
 
     # 4) ok
@@ -2058,7 +2058,7 @@ def test_compare_outputs_result_keys_are_stable(monkeypatch, tmp_path):
         baseline_payload=_well_shaped({"a": [1.0]}),
         rewritten_payload=_well_shaped({"a": [1.0]}),
     )
-    r4 = compare_outputs("go", _tolerance("sig_figs", 3))
+    r4 = compare_outputs("go", _tolerance("sig_figs", 3), "kokkos")
     assert set(r4.keys()) == expected_keys
 
     # 5) tolerance fail
@@ -2068,5 +2068,5 @@ def test_compare_outputs_result_keys_are_stable(monkeypatch, tmp_path):
         baseline_payload=_well_shaped({"a": [1.0]}),
         rewritten_payload=_well_shaped({"a": [10.0]}),
     )
-    r5 = compare_outputs("no", _tolerance("sig_figs", 3))
+    r5 = compare_outputs("no", _tolerance("sig_figs", 3), "kokkos")
     assert set(r5.keys()) == expected_keys

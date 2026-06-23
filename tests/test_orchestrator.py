@@ -9,6 +9,7 @@ import json
 import pytest
 
 from workflow import orchestrator
+from workflow.languages import KOKKOS_PROFILE
 from workflow.orchestrator import (
     DEFAULT_TOLERANCE_ON_ADVISOR_UNKNOWN,
     ORCHESTRATOR_SYSTEM_PROMPT,
@@ -64,7 +65,7 @@ def test_hitl_accepts_uppercase(monkeypatch):
 def test_execute_tool_unknown_raises(monkeypatch):
     """_execute_tool raises ValueError on an unknown tool name."""
     with pytest.raises(ValueError, match="Unknown tool"):
-        _execute_tool("not_a_tool", {})
+        _execute_tool("not_a_tool", {}, KOKKOS_PROFILE)
 
 
 def test_execute_tool_dispatches_spawn_analyst(monkeypatch):
@@ -77,7 +78,7 @@ def test_execute_tool_dispatches_spawn_analyst(monkeypatch):
 
     monkeypatch.setattr(orchestrator, "run_agent", stub_run_agent)
 
-    result = _execute_tool("spawn_analyst", {"kernel_source": "SOURCE"})
+    result = _execute_tool("spawn_analyst", {"kernel_source": "SOURCE"}, KOKKOS_PROFILE)
 
     assert result == {
         "status": "ok",
@@ -101,7 +102,7 @@ def test_execute_tool_spawn_analyst_default_k_uses_single_shot(monkeypatch):
     monkeypatch.setattr(orchestrator, "run_agent", stub_run_agent)
     monkeypatch.setattr(orchestrator, "run_agent_ensemble", fail_ensemble)
 
-    result = _execute_tool("spawn_analyst", {"kernel_source": "SRC"})
+    result = _execute_tool("spawn_analyst", {"kernel_source": "SRC"}, KOKKOS_PROFILE)
     assert result == {
         "status": "ok",
         "result": {"variables": [], "overall_notes": "single"},
@@ -168,7 +169,7 @@ def test_execute_tool_spawn_analyst_k_gt_one_runs_ensemble_and_aggregates(
     monkeypatch.setattr(orchestrator, "run_agent_ensemble", stub_ensemble)
     monkeypatch.setattr(orchestrator, "run_agent", fail_single)
 
-    result = _execute_tool("spawn_analyst", {"kernel_source": "SRC"})
+    result = _execute_tool("spawn_analyst", {"kernel_source": "SRC"}, KOKKOS_PROFILE)
 
     assert captured == {
         "type": "analyst",
@@ -217,7 +218,7 @@ def test_execute_tool_spawn_analyst_k_gt_one_default_temperature(monkeypatch):
 
     monkeypatch.setattr(orchestrator, "run_agent_ensemble", stub_ensemble)
 
-    _execute_tool("spawn_analyst", {"kernel_source": "SRC"})
+    _execute_tool("spawn_analyst", {"kernel_source": "SRC"}, KOKKOS_PROFILE)
     assert captured["temperature"] == 0.7
 
 
@@ -231,7 +232,7 @@ def test_execute_tool_dispatches_spawn_rewriter(monkeypatch):
 
     monkeypatch.setattr(orchestrator, "run_agent", stub_run_agent)
 
-    result = _execute_tool("spawn_rewriter", {"task_prompt": "PROMPT"})
+    result = _execute_tool("spawn_rewriter", {"task_prompt": "PROMPT"}, KOKKOS_PROFILE)
 
     assert result["status"] == "ok"
     assert result["result"]["rewritten_code"] == "code"
@@ -523,7 +524,7 @@ def test_execute_tool_dispatches_spawn_precision_advisor(monkeypatch):
     monkeypatch.setattr(orchestrator, "run_agent", stub_run_agent)
 
     result = _execute_tool(
-        "spawn_precision_advisor", {"kernel_source": "SOURCE"}
+        "spawn_precision_advisor", {"kernel_source": "SOURCE"}, KOKKOS_PROFILE
     )
 
     assert result["status"] == "ok"
@@ -549,7 +550,7 @@ def test_execute_tool_spawn_verifier_includes_tolerance_in_task(monkeypatch):
             "rewritten_source": "REW",
             "analyst_verdict_json": '{"variables": []}',
             "tolerance_json": '{"kind":"sig_figs","value":6,"source":"user_cli"}',
-        },
+        }, KOKKOS_PROFILE
     )
 
     assert result["status"] == "ok"
@@ -591,7 +592,7 @@ def test_execute_tool_spawn_verifier_default_k_uses_single_shot(monkeypatch):
     monkeypatch.setattr(orchestrator, "run_agent", stub_run_agent)
     monkeypatch.setattr(orchestrator, "run_verifier_panel", fail_panel)
 
-    result = _execute_tool("spawn_verifier", _verifier_task_args())
+    result = _execute_tool("spawn_verifier", _verifier_task_args(), KOKKOS_PROFILE)
     assert result == {
         "status": "ok",
         "result": {"verdict": "accept", "per_variable": [], "concerns": []},
@@ -652,7 +653,7 @@ def test_execute_tool_spawn_verifier_k_gt_one_runs_panel_and_aggregates(
     monkeypatch.setattr(orchestrator, "run_verifier_panel", stub_panel)
     monkeypatch.setattr(orchestrator, "run_agent", fail_single)
 
-    result = _execute_tool("spawn_verifier", _verifier_task_args())
+    result = _execute_tool("spawn_verifier", _verifier_task_args(), KOKKOS_PROFILE)
 
     # The task threaded through verifier_panel is the same fully-formed
     # verifier prompt — same original/rewritten/verdict/tolerance shape.
@@ -699,7 +700,7 @@ def test_execute_tool_spawn_verifier_k_gt_one_default_temperature(monkeypatch):
 
     monkeypatch.setattr(orchestrator, "run_verifier_panel", stub_panel)
 
-    _execute_tool("spawn_verifier", _verifier_task_args())
+    _execute_tool("spawn_verifier", _verifier_task_args(), KOKKOS_PROFILE)
     assert captured["temperature"] == 0.7
 
 
@@ -718,7 +719,7 @@ def test_execute_tool_spawn_verifier_k_exceeds_lenses_raises(monkeypatch):
     monkeypatch.setattr(orchestrator, "run_verifier_panel", fail_panel)
 
     with pytest.raises(ValueError, match="VERIFIER_LENSES"):
-        _execute_tool("spawn_verifier", _verifier_task_args())
+        _execute_tool("spawn_verifier", _verifier_task_args(), KOKKOS_PROFILE)
 
 
 # ---------- run_orchestrator: tolerance plumbing in the initial user message ----------
@@ -829,7 +830,7 @@ def test_execute_tool_dispatches_spawn_baseline_harness(monkeypatch, tmp_path):
 
     result = _execute_tool(
         "spawn_baseline_harness",
-        {"kernel_source": "KSRC", "kernel_stem": "vector_add"},
+        {"kernel_source": "KSRC", "kernel_stem": "vector_add"}, KOKKOS_PROFILE
     )
 
     assert result["status"] == "ok"
@@ -867,7 +868,7 @@ def test_execute_tool_spawn_baseline_harness_overwrites_existing(
 
     _execute_tool(
         "spawn_baseline_harness",
-        {"kernel_source": "KSRC", "kernel_stem": "vector_add"},
+        {"kernel_source": "KSRC", "kernel_stem": "vector_add"}, KOKKOS_PROFILE
     )
 
     assert (tmp_path / "baselines" / "vector_add" / "driver.cpp").read_text() \
@@ -879,7 +880,7 @@ def test_execute_tool_spawn_baseline_harness_overwrites_existing(
 
 def test_format_baseline_block_cpp_no_kernel_name_invites_call():
     """For a .cpp kernel without an explicit kernel_name, the block invites spawn_baseline_harness, surfaces the file stem as KERNEL STEM, and emits no 'TARGET KERNEL: <name>' value line (the agent infers the function)."""
-    block = _format_baseline_block("test-kernels/kokkos/mixed/nbody_force.cpp", None)
+    block = _format_baseline_block("test-kernels/kokkos/mixed/nbody_force.cpp", None, KOKKOS_PROFILE)
     assert "BASELINE STEP" in block
     assert "spawn_baseline_harness" in block
     assert "KERNEL STEM: nbody_force" in block
@@ -893,7 +894,7 @@ def test_format_baseline_block_cpp_no_kernel_name_invites_call():
 def test_format_baseline_block_cpp_with_kernel_name_includes_target_line():
     """When kernel_name is given, the block adds a TARGET KERNEL: <name> line so the orchestrator can prepend it to the harness's kernel_source argument."""
     block = _format_baseline_block(
-        "test-kernels/kokkos/lowerable/vector_add.cpp", "vector_add"
+        "test-kernels/kokkos/lowerable/vector_add.cpp", "vector_add", KOKKOS_PROFILE
     )
     assert "KERNEL STEM: vector_add" in block
     assert "TARGET KERNEL: vector_add" in block
@@ -902,7 +903,7 @@ def test_format_baseline_block_cpp_with_kernel_name_includes_target_line():
 def test_format_baseline_block_cu_tells_orchestrator_to_skip():
     """For a CUDA .cu kernel, the block explicitly tells the orchestrator NOT to call spawn_baseline_harness (v0 is Kokkos-only)."""
     block = _format_baseline_block(
-        "test-kernels/cuda/lowerable/vector_add.cu", None
+        "test-kernels/cuda/lowerable/vector_add.cu", None, KOKKOS_PROFILE
     )
     assert "skipped" in block.lower()
     assert "Do NOT call spawn_baseline_harness" in block
@@ -1006,7 +1007,7 @@ def test_orchestrator_prompt_mentions_compile_baseline_driver_and_env_var():
 def test_format_baseline_block_cpp_mentions_compile_step():
     """For a .cpp kernel, the BASELINE STEP block tells the orchestrator to follow a successful spawn_baseline_harness with a single compile_baseline_driver call using the same KERNEL STEM."""
     block = _format_baseline_block(
-        "test-kernels/kokkos/mixed/nbody_force.cpp", None
+        "test-kernels/kokkos/mixed/nbody_force.cpp", None, KOKKOS_PROFILE
     )
     assert "compile_baseline_driver" in block
     # Must couple it to the harness call, not be a standalone instruction.
@@ -1016,7 +1017,7 @@ def test_format_baseline_block_cpp_mentions_compile_step():
 def test_format_baseline_block_cu_does_not_mention_compile_step():
     """For a CUDA .cu kernel, the (skipped) BASELINE STEP block must NOT mention compile_baseline_driver — the compile depends on the harness, which is forbidden for .cu inputs."""
     block = _format_baseline_block(
-        "test-kernels/cuda/lowerable/vector_add.cu", None
+        "test-kernels/cuda/lowerable/vector_add.cu", None, KOKKOS_PROFILE
     )
     assert "compile_baseline_driver" not in block
 
@@ -1025,8 +1026,9 @@ def test_execute_tool_dispatches_compile_baseline_driver(monkeypatch):
     """_execute_tool routes compile_baseline_driver to workflow.tools.compile_baseline_driver and returns its {status, stdout, stderr, artifacts} dict verbatim (no extra wrapping)."""
     captured = {}
 
-    def stub_compile(kernel_stem):
+    def stub_compile(kernel_stem, language_id):
         captured["kernel_stem"] = kernel_stem
+        captured["language_id"] = language_id
         return {
             "status": "ok",
             "stdout": "compiled fine",
@@ -1037,10 +1039,12 @@ def test_execute_tool_dispatches_compile_baseline_driver(monkeypatch):
     monkeypatch.setattr(orchestrator, "compile_baseline_driver", stub_compile)
 
     result = _execute_tool(
-        "compile_baseline_driver", {"kernel_stem": "nbody_force"}
+        "compile_baseline_driver", {"kernel_stem": "nbody_force"}, KOKKOS_PROFILE
     )
 
-    assert captured == {"kernel_stem": "nbody_force"}
+    # _execute_tool injects profile.id as language_id; the LLM never
+    # passes it (Phase A.5 Option B).
+    assert captured == {"kernel_stem": "nbody_force", "language_id": "kokkos"}
     # Verbatim pass-through — same shape future remote-batch tools share.
     assert result == {
         "status": "ok",
@@ -1055,7 +1059,7 @@ def test_execute_tool_compile_baseline_driver_error_passes_through(monkeypatch):
     monkeypatch.setattr(
         orchestrator,
         "compile_baseline_driver",
-        lambda stem: {
+        lambda stem, language_id: {
             "status": "error",
             "stdout": "",
             "stderr": "AGENT_PRECISION_KOKKOS_ROOT is not set.",
@@ -1063,7 +1067,7 @@ def test_execute_tool_compile_baseline_driver_error_passes_through(monkeypatch):
         },
     )
     result = _execute_tool(
-        "compile_baseline_driver", {"kernel_stem": "x"}
+        "compile_baseline_driver", {"kernel_stem": "x"}, KOKKOS_PROFILE
     )
     assert result["status"] == "error"
     assert "AGENT_PRECISION_KOKKOS_ROOT" in result["stderr"]
@@ -1096,7 +1100,7 @@ def test_orchestrator_prompt_mentions_run_baseline_driver_and_env_var():
 def test_format_baseline_block_cpp_mentions_run_step():
     """For a .cpp kernel, the BASELINE STEP block tells the orchestrator to follow a successful compile_baseline_driver with a single run_baseline_driver call using the same KERNEL STEM."""
     block = _format_baseline_block(
-        "test-kernels/kokkos/mixed/nbody_force.cpp", None
+        "test-kernels/kokkos/mixed/nbody_force.cpp", None, KOKKOS_PROFILE
     )
     assert "run_baseline_driver" in block
     # Must be coupled to the compile call, not a standalone instruction.
@@ -1106,7 +1110,7 @@ def test_format_baseline_block_cpp_mentions_run_step():
 def test_format_baseline_block_cu_does_not_mention_run_step():
     """For a CUDA .cu kernel, the (skipped) BASELINE STEP block must NOT mention run_baseline_driver — the run depends on a compile, which depends on the harness, which is forbidden for .cu inputs."""
     block = _format_baseline_block(
-        "test-kernels/cuda/lowerable/vector_add.cu", None
+        "test-kernels/cuda/lowerable/vector_add.cu", None, KOKKOS_PROFILE
     )
     assert "run_baseline_driver" not in block
 
@@ -1115,8 +1119,9 @@ def test_execute_tool_dispatches_run_baseline_driver(monkeypatch):
     """_execute_tool routes run_baseline_driver to workflow.tools.run_baseline_driver and returns its {status, stdout, stderr, artifacts} dict verbatim (no extra wrapping)."""
     captured = {}
 
-    def stub_run(kernel_stem):
+    def stub_run(kernel_stem, language_id):
         captured["kernel_stem"] = kernel_stem
+        captured["language_id"] = language_id
         return {
             "status": "ok",
             "stdout": "driver ran cleanly",
@@ -1127,10 +1132,12 @@ def test_execute_tool_dispatches_run_baseline_driver(monkeypatch):
     monkeypatch.setattr(orchestrator, "run_baseline_driver", stub_run)
 
     result = _execute_tool(
-        "run_baseline_driver", {"kernel_stem": "nbody_force"}
+        "run_baseline_driver", {"kernel_stem": "nbody_force"}, KOKKOS_PROFILE
     )
 
-    assert captured == {"kernel_stem": "nbody_force"}
+    # _execute_tool injects profile.id as language_id; the LLM never
+    # passes it (Phase A.5 Option B).
+    assert captured == {"kernel_stem": "nbody_force", "language_id": "kokkos"}
     # Verbatim pass-through — same shape future remote-batch tools share.
     assert result == {
         "status": "ok",
@@ -1145,7 +1152,7 @@ def test_execute_tool_run_baseline_driver_error_passes_through(monkeypatch):
     monkeypatch.setattr(
         orchestrator,
         "run_baseline_driver",
-        lambda stem: {
+        lambda stem, language_id: {
             "status": "error",
             "stdout": "",
             "stderr": "Driver exited with code 7.",
@@ -1153,7 +1160,7 @@ def test_execute_tool_run_baseline_driver_error_passes_through(monkeypatch):
         },
     )
     result = _execute_tool(
-        "run_baseline_driver", {"kernel_stem": "x"}
+        "run_baseline_driver", {"kernel_stem": "x"}, KOKKOS_PROFILE
     )
     assert result["status"] == "error"
     assert "code 7" in result["stderr"]
@@ -1193,7 +1200,7 @@ def test_orchestrator_prompt_mentions_splice_rewritten_kernel():
 def test_format_baseline_block_cpp_mentions_splice_step():
     """For a .cpp kernel, the BASELINE STEP block tells the orchestrator to call splice_rewritten_kernel after a verifier accept following a successful run_baseline_driver."""
     block = _format_baseline_block(
-        "test-kernels/kokkos/mixed/nbody_force.cpp", None
+        "test-kernels/kokkos/mixed/nbody_force.cpp", None, KOKKOS_PROFILE
     )
     assert "splice_rewritten_kernel" in block
     # Must be coupled to both the verifier accept and run_baseline_driver,
@@ -1205,7 +1212,7 @@ def test_format_baseline_block_cpp_mentions_splice_step():
 def test_format_baseline_block_cu_does_not_mention_splice_step():
     """For a CUDA .cu kernel, the (skipped) BASELINE STEP block must NOT mention splice_rewritten_kernel — the splice depends on a baseline driver, which depends on the harness, which is forbidden for .cu inputs."""
     block = _format_baseline_block(
-        "test-kernels/cuda/lowerable/vector_add.cu", None
+        "test-kernels/cuda/lowerable/vector_add.cu", None, KOKKOS_PROFILE
     )
     assert "splice_rewritten_kernel" not in block
 
@@ -1214,9 +1221,10 @@ def test_execute_tool_dispatches_splice_rewritten_kernel(monkeypatch):
     """_execute_tool routes splice_rewritten_kernel to workflow.tools.splice_rewritten_kernel, forwards both kernel_stem and rewritten_kernel_source, and returns its {status, stdout, stderr, artifacts} dict verbatim (no extra wrapping)."""
     captured = {}
 
-    def stub_splice(kernel_stem, rewritten_kernel_source):
+    def stub_splice(kernel_stem, rewritten_kernel_source, language_id):
         captured["kernel_stem"] = kernel_stem
         captured["rewritten_kernel_source"] = rewritten_kernel_source
+        captured["language_id"] = language_id
         return {
             "status": "ok",
             "stdout": "",
@@ -1231,12 +1239,15 @@ def test_execute_tool_dispatches_splice_rewritten_kernel(monkeypatch):
         {
             "kernel_stem": "nbody_force",
             "rewritten_kernel_source": "void k() { /* rewritten */ }\n",
-        },
+        }, KOKKOS_PROFILE
     )
 
+    # _execute_tool injects profile.id as language_id; the LLM never
+    # passes it (Phase A.5 Option B).
     assert captured == {
         "kernel_stem": "nbody_force",
         "rewritten_kernel_source": "void k() { /* rewritten */ }\n",
+        "language_id": "kokkos",
     }
     # Verbatim pass-through — same shape future remote-batch tools share.
     assert result == {
@@ -1252,7 +1263,7 @@ def test_execute_tool_splice_rewritten_kernel_error_passes_through(monkeypatch):
     monkeypatch.setattr(
         orchestrator,
         "splice_rewritten_kernel",
-        lambda stem, src: {
+        lambda stem, src, language_id: {
             "status": "error",
             "stdout": "",
             "stderr": (
@@ -1264,7 +1275,7 @@ def test_execute_tool_splice_rewritten_kernel_error_passes_through(monkeypatch):
     )
     result = _execute_tool(
         "splice_rewritten_kernel",
-        {"kernel_stem": "x", "rewritten_kernel_source": "void k(){}"},
+        {"kernel_stem": "x", "rewritten_kernel_source": "void k(){}"}, KOKKOS_PROFILE
     )
     assert result["status"] == "error"
     assert "Baseline driver source not found" in result["stderr"]
@@ -1302,7 +1313,7 @@ def test_orchestrator_prompt_mentions_compile_rewritten_driver():
 def test_format_baseline_block_cpp_mentions_compile_rewritten_step():
     """For a .cpp kernel, the BASELINE STEP block tells the orchestrator to call compile_rewritten_driver immediately after a successful splice_rewritten_kernel."""
     block = _format_baseline_block(
-        "test-kernels/kokkos/mixed/nbody_force.cpp", None
+        "test-kernels/kokkos/mixed/nbody_force.cpp", None, KOKKOS_PROFILE
     )
     assert "compile_rewritten_driver" in block
     # Must be coupled to splice success — never a standalone instruction.
@@ -1312,7 +1323,7 @@ def test_format_baseline_block_cpp_mentions_compile_rewritten_step():
 def test_format_baseline_block_cu_does_not_mention_compile_rewritten_step():
     """For a CUDA .cu kernel, the (skipped) BASELINE STEP block must NOT mention compile_rewritten_driver — it depends on splice, which depends on the baseline chain, which is forbidden for .cu inputs."""
     block = _format_baseline_block(
-        "test-kernels/cuda/lowerable/vector_add.cu", None
+        "test-kernels/cuda/lowerable/vector_add.cu", None, KOKKOS_PROFILE
     )
     assert "compile_rewritten_driver" not in block
 
@@ -1321,8 +1332,9 @@ def test_execute_tool_dispatches_compile_rewritten_driver(monkeypatch):
     """_execute_tool routes compile_rewritten_driver to workflow.tools.compile_rewritten_driver, forwards the kernel_stem argument, and returns its {status, stdout, stderr, artifacts} dict verbatim (no extra wrapping)."""
     captured = {}
 
-    def stub_compile(kernel_stem):
+    def stub_compile(kernel_stem, language_id):
         captured["kernel_stem"] = kernel_stem
+        captured["language_id"] = language_id
         return {
             "status": "ok",
             "stdout": "",
@@ -1335,10 +1347,12 @@ def test_execute_tool_dispatches_compile_rewritten_driver(monkeypatch):
     )
 
     result = _execute_tool(
-        "compile_rewritten_driver", {"kernel_stem": "nbody_force"}
+        "compile_rewritten_driver", {"kernel_stem": "nbody_force"}, KOKKOS_PROFILE
     )
 
-    assert captured == {"kernel_stem": "nbody_force"}
+    # _execute_tool injects profile.id as language_id; the LLM never
+    # passes it (Phase A.5 Option B).
+    assert captured == {"kernel_stem": "nbody_force", "language_id": "kokkos"}
     # Verbatim pass-through — same shape future remote-batch tools share.
     assert result == {
         "status": "ok",
@@ -1353,7 +1367,7 @@ def test_execute_tool_compile_rewritten_driver_error_passes_through(monkeypatch)
     monkeypatch.setattr(
         orchestrator,
         "compile_rewritten_driver",
-        lambda stem: {
+        lambda stem, language_id: {
             "status": "error",
             "stdout": "",
             "stderr": (
@@ -1366,7 +1380,7 @@ def test_execute_tool_compile_rewritten_driver_error_passes_through(monkeypatch)
         },
     )
     result = _execute_tool(
-        "compile_rewritten_driver", {"kernel_stem": "x"}
+        "compile_rewritten_driver", {"kernel_stem": "x"}, KOKKOS_PROFILE
     )
     assert result["status"] == "error"
     assert "rewritten/driver.cpp" in result["stderr"]
@@ -1407,7 +1421,7 @@ def test_orchestrator_prompt_mentions_run_rewritten_driver():
 def test_format_baseline_block_cpp_mentions_run_rewritten_step():
     """For a .cpp kernel, the BASELINE STEP block tells the orchestrator to call run_rewritten_driver immediately after a successful compile_rewritten_driver — and still mentions the upstream splice/compile_rewritten steps."""
     block = _format_baseline_block(
-        "test-kernels/kokkos/mixed/nbody_force.cpp", None
+        "test-kernels/kokkos/mixed/nbody_force.cpp", None, KOKKOS_PROFILE
     )
     assert "run_rewritten_driver" in block
     # Must be coupled to compile_rewritten success — never standalone.
@@ -1420,7 +1434,7 @@ def test_format_baseline_block_cpp_mentions_run_rewritten_step():
 def test_format_baseline_block_cu_does_not_mention_run_rewritten_step():
     """For a CUDA .cu kernel, the (skipped) BASELINE STEP block must NOT mention run_rewritten_driver — it depends on compile_rewritten, which depends on splice, which depends on the baseline chain, which is forbidden for .cu inputs."""
     block = _format_baseline_block(
-        "test-kernels/cuda/lowerable/vector_add.cu", None
+        "test-kernels/cuda/lowerable/vector_add.cu", None, KOKKOS_PROFILE
     )
     assert "run_rewritten_driver" not in block
 
@@ -1429,8 +1443,9 @@ def test_execute_tool_dispatches_run_rewritten_driver(monkeypatch):
     """_execute_tool routes run_rewritten_driver to workflow.tools.run_rewritten_driver, forwards the kernel_stem argument, and returns its {status, stdout, stderr, artifacts} dict verbatim (no extra wrapping)."""
     captured = {}
 
-    def stub_run(kernel_stem):
+    def stub_run(kernel_stem, language_id):
         captured["kernel_stem"] = kernel_stem
+        captured["language_id"] = language_id
         return {
             "status": "ok",
             "stdout": "rewritten driver ran",
@@ -1443,10 +1458,12 @@ def test_execute_tool_dispatches_run_rewritten_driver(monkeypatch):
     monkeypatch.setattr(orchestrator, "run_rewritten_driver", stub_run)
 
     result = _execute_tool(
-        "run_rewritten_driver", {"kernel_stem": "nbody_force"}
+        "run_rewritten_driver", {"kernel_stem": "nbody_force"}, KOKKOS_PROFILE
     )
 
-    assert captured == {"kernel_stem": "nbody_force"}
+    # _execute_tool injects profile.id as language_id; the LLM never
+    # passes it (Phase A.5 Option B).
+    assert captured == {"kernel_stem": "nbody_force", "language_id": "kokkos"}
     # Verbatim pass-through — same shape future remote-batch tools share.
     assert result == {
         "status": "ok",
@@ -1463,7 +1480,7 @@ def test_execute_tool_run_rewritten_driver_error_passes_through(monkeypatch):
     monkeypatch.setattr(
         orchestrator,
         "run_rewritten_driver",
-        lambda stem: {
+        lambda stem, language_id: {
             "status": "error",
             "stdout": "",
             "stderr": (
@@ -1476,7 +1493,7 @@ def test_execute_tool_run_rewritten_driver_error_passes_through(monkeypatch):
         },
     )
     result = _execute_tool(
-        "run_rewritten_driver", {"kernel_stem": "x"}
+        "run_rewritten_driver", {"kernel_stem": "x"}, KOKKOS_PROFILE
     )
     assert result["status"] == "error"
     assert "rewritten/driver" in result["stderr"]
@@ -1522,7 +1539,7 @@ def test_orchestrator_prompt_mentions_compare_outputs_and_finish_gate():
 def test_format_baseline_block_cpp_mentions_compare_outputs_step():
     """For a .cpp kernel, the BASELINE STEP block tells the orchestrator to call compare_outputs immediately after a successful run_rewritten_driver, reusing the same tolerance_json passed to spawn_verifier, AND states the comparator IS a precondition for finish."""
     block = _format_baseline_block(
-        "test-kernels/kokkos/mixed/nbody_force.cpp", None
+        "test-kernels/kokkos/mixed/nbody_force.cpp", None, KOKKOS_PROFILE
     )
     assert "compare_outputs" in block
     # Must be coupled to the upstream rewritten-run step.
@@ -1537,7 +1554,7 @@ def test_format_baseline_block_cpp_mentions_compare_outputs_step():
 def test_format_baseline_block_cu_does_not_mention_compare_outputs():
     """For a CUDA .cu kernel, the (skipped) BASELINE STEP block must NOT mention compare_outputs — the whole rewritten chain is skipped for .cu inputs in v0, and the finish-gate falls back to verifier-only."""
     block = _format_baseline_block(
-        "test-kernels/cuda/lowerable/vector_add.cu", None
+        "test-kernels/cuda/lowerable/vector_add.cu", None, KOKKOS_PROFILE
     )
     assert "compare_outputs" not in block
 
@@ -1546,9 +1563,10 @@ def test_execute_tool_dispatches_compare_outputs(monkeypatch):
     """_execute_tool routes compare_outputs to workflow.tools.compare_outputs, forwards BOTH kernel_stem and tolerance_json, and returns its {status, stdout, stderr, artifacts} dict verbatim (no extra wrapping)."""
     captured = {}
 
-    def stub_compare(kernel_stem, tolerance_json):
+    def stub_compare(kernel_stem, tolerance_json, language_id):
         captured["kernel_stem"] = kernel_stem
         captured["tolerance_json"] = tolerance_json
+        captured["language_id"] = language_id
         return {
             "status": "ok",
             "stdout": "all 8 values agree",
@@ -1565,10 +1583,16 @@ def test_execute_tool_dispatches_compare_outputs(monkeypatch):
     )
     result = _execute_tool(
         "compare_outputs",
-        {"kernel_stem": "nbody_force", "tolerance_json": tol},
+        {"kernel_stem": "nbody_force", "tolerance_json": tol}, KOKKOS_PROFILE
     )
 
-    assert captured == {"kernel_stem": "nbody_force", "tolerance_json": tol}
+    # _execute_tool injects profile.id as language_id; the LLM never
+    # passes it (Phase A.5 Option B).
+    assert captured == {
+        "kernel_stem": "nbody_force",
+        "tolerance_json": tol,
+        "language_id": "kokkos",
+    }
     assert result == {
         "status": "ok",
         "stdout": "all 8 values agree",
@@ -1584,7 +1608,7 @@ def test_execute_tool_compare_outputs_error_passes_through(monkeypatch):
     monkeypatch.setattr(
         orchestrator,
         "compare_outputs",
-        lambda stem, tol: {
+        lambda stem, tol, language_id: {
             "status": "error",
             "stdout": "",
             "stderr": (
@@ -1598,7 +1622,7 @@ def test_execute_tool_compare_outputs_error_passes_through(monkeypatch):
         {"kind": "sig_figs", "value": 3, "source": "user_cli"}
     )
     result = _execute_tool(
-        "compare_outputs", {"kernel_stem": "x", "tolerance_json": tol}
+        "compare_outputs", {"kernel_stem": "x", "tolerance_json": tol}, KOKKOS_PROFILE
     )
     assert result["status"] == "error"
     assert "Tolerance mismatch" in result["stderr"]
@@ -1681,7 +1705,7 @@ def test_finish_gate_cpp_verifier_accept_and_compare_ok_allows_finish(
     monkeypatch.setattr(
         orchestrator,
         "compare_outputs",
-        lambda stem, tol: {
+        lambda stem, tol, language_id: {
             "status": "ok",
             "stdout": "match",
             "stderr": "",
@@ -1724,7 +1748,7 @@ def test_finish_gate_cpp_verifier_accept_but_compare_error_blocks_finish(
     monkeypatch.setattr(
         orchestrator,
         "compare_outputs",
-        lambda stem, tol: {
+        lambda stem, tol, language_id: {
             "status": "error",
             "stdout": "",
             "stderr": "Tolerance mismatch under sig_figs=3.",

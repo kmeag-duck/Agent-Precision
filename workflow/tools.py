@@ -13,47 +13,52 @@ when "run g++ locally" becomes "submit a compile job and poll".
 
 Per-language behavior (driver-file extension, compile command, splice
 sentinels, env-var contract) is owned by the language-profile objects
-in workflow.languages. Phase A of the multi-language refactor keeps the
-public tool signatures unchanged — each wrapper resolves the Kokkos
-profile internally — so existing callers and tests stay green. Phase
-A.5 grows each tool a required `language_id` argument and lets the
-orchestrator pick the profile per run.
+in workflow.languages. Phase A.5 makes `language_id` a REQUIRED
+argument on every tool wrapper: the orchestrator resolves a profile
+once per run via workflow.languages.detect_language and threads the
+resulting profile.id through every tool call. Calling a tool without
+a `language_id` is a contract bug and raises TypeError at the
+_resolve_profile helper; an unknown id raises KeyError. Tests that
+call these tools directly must pass `language_id='kokkos'` explicitly.
 
 Currently exposes:
 
-  - compile_baseline_driver(kernel_stem): compile
+  - compile_baseline_driver(kernel_stem, language_id): compile
     baselines/<kernel_stem>/<profile.driver_filename> produced by the
     baseline_harness agent into a native executable at
     baselines/<kernel_stem>/driver, using `profile.build_compile_command`.
 
-  - run_baseline_driver(kernel_stem): execute the compiled driver at
-    baselines/<kernel_stem>/driver and verify that it produces a
-    parseable baselines/<kernel_stem>/reference.json. Subject to a
-    per-run wall-clock timeout configured via the
+  - run_baseline_driver(kernel_stem, language_id): execute the compiled
+    driver at baselines/<kernel_stem>/driver and verify that it
+    produces a parseable baselines/<kernel_stem>/reference.json.
+    Subject to a per-run wall-clock timeout configured via the
     AGENT_PRECISION_RUN_TIMEOUT_SEC environment variable (default 60s).
 
-  - splice_rewritten_kernel(kernel_stem, rewritten_kernel_source): read
-    the baseline driver at baselines/<kernel_stem>/<profile.driver_filename>,
-    replace the region strictly between the profile's KERNEL BEGIN /
-    KERNEL END sentinels with the supplied rewritten kernel source, and
-    write the result to baselines/<kernel_stem>/rewritten/
-    <profile.driver_filename>. Pure text I/O; never invokes a subprocess
-    and never modifies the baseline file in place.
+  - splice_rewritten_kernel(kernel_stem, rewritten_kernel_source,
+    language_id): read the baseline driver at
+    baselines/<kernel_stem>/<profile.driver_filename>, replace the
+    region strictly between the profile's KERNEL BEGIN / KERNEL END
+    sentinels with the supplied rewritten kernel source, and write
+    the result to baselines/<kernel_stem>/rewritten/
+    <profile.driver_filename>. Pure text I/O; never invokes a
+    subprocess and never modifies the baseline file in place.
 
-  - compile_rewritten_driver(kernel_stem): compile
-    baselines/<kernel_stem>/rewritten/<profile.driver_filename> (produced by
-    splice_rewritten_kernel) into baselines/<kernel_stem>/rewritten/
-    driver. Shares the env-var contract, compile flags, and result
-    schema of compile_baseline_driver; only the directory differs.
+  - compile_rewritten_driver(kernel_stem, language_id): compile
+    baselines/<kernel_stem>/rewritten/<profile.driver_filename>
+    (produced by splice_rewritten_kernel) into
+    baselines/<kernel_stem>/rewritten/driver. Shares the env-var
+    contract, compile flags, and result schema of
+    compile_baseline_driver; only the directory differs.
 
-  - run_rewritten_driver(kernel_stem): execute the compiled rewritten
-    driver at baselines/<kernel_stem>/rewritten/driver and verify it
-    produces a parseable baselines/<kernel_stem>/rewritten/reference.json.
+  - run_rewritten_driver(kernel_stem, language_id): execute the
+    compiled rewritten driver at
+    baselines/<kernel_stem>/rewritten/driver and verify it produces a
+    parseable baselines/<kernel_stem>/rewritten/reference.json.
     Shares the env-var contract (AGENT_PRECISION_RUN_TIMEOUT_SEC),
     subprocess shape, and result schema of run_baseline_driver; only
     the directory differs. The baseline tree is never touched.
 
-  - compare_outputs(kernel_stem, tolerance_json): numerically compare
+  - compare_outputs(kernel_stem, tolerance_json, language_id): numerically compare
     baselines/<kernel_stem>/reference.json (baseline) and
     baselines/<kernel_stem>/rewritten/reference.json (rewritten) under
     the operator-agreed tolerance. Tolerance kinds are 'sig_figs' (a
@@ -187,15 +192,16 @@ def _compile_driver(
 
 
 def compile_baseline_driver(
-    kernel_stem: str, language_id: str | None = None
+    kernel_stem: str, language_id: str
 ) -> dict:
     """Compile baselines/<kernel_stem>/<profile.driver_filename>.
 
     `language_id` selects which workflow.languages profile drives the
     compile (driver-file extension, compiler argv, env-var preflight).
-    Defaults to "kokkos" for back-compat with existing callers that
-    were written before the multi-language refactor. The orchestrator
-    threads an explicit `language_id` through the tool call.
+    Required (Phase A.5): the orchestrator resolves a profile once per
+    run and threads its id through every tool call. An unknown id
+    surfaces as a KeyError from _resolve_profile; a missing id surfaces
+    as a TypeError (both indicate a contract bug in the caller).
 
     Returns a `{status, stdout, stderr, artifacts}` dict, where
     `status` is 'ok' on a successful compile and 'error' otherwise.
@@ -219,7 +225,7 @@ def compile_baseline_driver(
 
 
 def compile_rewritten_driver(
-    kernel_stem: str, language_id: str | None = None
+    kernel_stem: str, language_id: str
 ) -> dict:
     """Compile baselines/<kernel_stem>/rewritten/<profile.driver_filename>.
 
@@ -377,15 +383,15 @@ def _run_driver(driver_dir: Path, missing_binary_hint: str) -> dict:
 
 
 def run_baseline_driver(
-    kernel_stem: str, language_id: str | None = None
+    kernel_stem: str, language_id: str
 ) -> dict:
     """Execute baselines/<kernel_stem>/driver and validate reference.json.
 
     `language_id` is accepted for call-shape symmetry with the rest of
     the dynamic-verification chain; the run subprocess is the same
     `./driver` invocation regardless of language because the compiled
-    binary always lives at the same path. Defaults to "kokkos" for
-    back-compat.
+    binary always lives at the same path. Required (Phase A.5): see
+    compile_baseline_driver for the rationale.
 
     The driver is invoked with cwd=baselines/<kernel_stem>/ so the
     `./reference.json` path the baseline_harness prompt mandates lands
@@ -415,7 +421,7 @@ def run_baseline_driver(
 
 
 def run_rewritten_driver(
-    kernel_stem: str, language_id: str | None = None
+    kernel_stem: str, language_id: str
 ) -> dict:
     """Execute baselines/<kernel_stem>/rewritten/driver and validate JSON.
 
@@ -461,7 +467,7 @@ def _find_unique_sentinel_line(lines: list[str], sentinel: str) -> int | None:
 def splice_rewritten_kernel(
     kernel_stem: str,
     rewritten_kernel_source: str,
-    language_id: str | None = None,
+    language_id: str,
 ) -> dict:
     """Splice `rewritten_kernel_source` into the baseline driver template.
 
@@ -573,16 +579,35 @@ def splice_rewritten_kernel(
     }
 
 
-def _resolve_profile(language_id: str | None) -> LanguageProfile:
-    """Look up a LanguageProfile by id, defaulting to Kokkos.
+def _resolve_profile(language_id: str) -> LanguageProfile:
+    """Look up a LanguageProfile by required `language_id`.
+
+    Phase A.5: `language_id` is mandatory. The orchestrator resolves
+    the profile once per run via workflow.languages.detect_language and
+    threads the resulting profile.id through every tool call, so a tool
+    being called without one indicates a contract bug somewhere in the
+    dispatch path. We raise TypeError with a clear message rather than
+    silently defaulting to Kokkos, because a silent default in the
+    multi-language world masks exactly the kind of mistake (forgotten
+    plumbing for a new language) that this required-arg contract
+    exists to catch.
+
+    Unknown ids surface through workflow.languages.get_profile_by_id,
+    which raises KeyError with the list of known ids.
 
     Kept as a thin private helper so the public tool wrappers do not
     import workflow.languages.get_profile_by_id directly; this keeps
-    the "language_id is optional in Phase A" contract in one place and
-    makes the Phase A.5 transition (require language_id) a single-site
-    edit when we tighten the schema.
+    the resolution policy (required, no fallback) in one place.
     """
-    if language_id is None or language_id == KOKKOS_PROFILE.id:
+    if language_id is None:
+        raise TypeError(
+            "language_id is required (Phase A.5). The orchestrator "
+            "must resolve a profile via workflow.languages."
+            "detect_language and pass its id to every tool call. If "
+            "you are calling a tool directly (tests, REPL), pass "
+            "language_id='kokkos' explicitly."
+        )
+    if language_id == KOKKOS_PROFILE.id:
         return KOKKOS_PROFILE
     # Deferred import to avoid a circular dependency at module load
     # (workflow.languages imports workflow.languages.kokkos, which we
@@ -778,7 +803,7 @@ def _iter_leaf_pairs(
 def compare_outputs(
     kernel_stem: str,
     tolerance_json: str,
-    language_id: str | None = None,
+    language_id: str,
 ) -> dict:
     """Numerically compare baseline vs rewritten reference.json.
 
@@ -786,7 +811,8 @@ def compare_outputs(
     the dynamic-verification chain. The comparator itself is fully
     language-agnostic — it walks two reference.json files that obey
     the harness contract regardless of which language produced them —
-    but accepting the arg keeps every tool's schema uniform.
+    but accepting the arg keeps every tool's schema uniform. Required
+    (Phase A.5): see compile_baseline_driver for the rationale.
 
     Reads baselines/<kernel_stem>/reference.json and
     baselines/<kernel_stem>/rewritten/reference.json, walks every

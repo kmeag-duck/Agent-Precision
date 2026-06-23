@@ -21,6 +21,7 @@ from pathlib import Path
 import anthropic
 
 from .aggregator import aggregate_analyst_verdicts
+from .languages import LanguageProfile, detect_language
 from .run_agent import run_agent, run_agent_ensemble
 from .tools import (
     compare_outputs,
@@ -753,8 +754,20 @@ def _hitl_pause(tool_name: str, tool_input: dict) -> str:
         print("Please answer y, n, or q.")
 
 
-def _execute_tool(tool_name: str, tool_input: dict) -> dict:
-    """Actually run the requested tool. Returns the result to feed back."""
+def _execute_tool(
+    tool_name: str, tool_input: dict, profile: LanguageProfile
+) -> dict:
+    """Actually run the requested tool. Returns the result to feed back.
+
+    `profile` is the LanguageProfile resolved once per run by
+    run_orchestrator (via workflow.languages.detect_language). The
+    deterministic-tool branches inject `profile.id` as the `language_id`
+    arg into the tool wrappers, and the spawn_baseline_harness branch
+    uses `profile.driver_filename` when persisting the harness output.
+    The LLM never sees or chooses `language_id` — that would be a
+    constant per run with no real choice — so this is the single
+    chokepoint where the per-run profile meets the per-tool call.
+    """
     if tool_name == "spawn_precision_advisor":
         result = run_agent("precision_advisor", tool_input["kernel_source"])
         return {"status": "ok", "result": result}
@@ -848,7 +861,10 @@ def _execute_tool(tool_name: str, tool_input: dict) -> dict:
         kernel_stem = tool_input["kernel_stem"]
         driver_dir = Path("baselines") / kernel_stem
         driver_dir.mkdir(parents=True, exist_ok=True)
-        driver_path = driver_dir / "driver.cpp"
+        # Per-language driver filename (driver.cpp for Kokkos,
+        # driver.cu once a CUDA profile lands). Owned by the
+        # LanguageProfile so the orchestrator stays language-agnostic.
+        driver_path = driver_dir / profile.driver_filename
         driver_path.write_text(result["driver_source"])
         return {
             "status": "ok",
@@ -856,36 +872,46 @@ def _execute_tool(tool_name: str, tool_input: dict) -> dict:
             "driver_path": str(driver_path),
         }
     if tool_name == "compile_baseline_driver":
-        # Deterministic tool (no LLM call): shells out to g++ against
-        # the Kokkos install named by AGENT_PRECISION_KOKKOS_ROOT and
-        # returns a {status, stdout, stderr, artifacts} dict verbatim
-        # (no extra wrapping), so the orchestrator sees the same shape
-        # future remote-batch verifier tools will return.
-        return compile_baseline_driver(tool_input["kernel_stem"])
+        # Deterministic tool (no LLM call): shells out to the
+        # profile-selected compiler (g++ for Kokkos, eventually nvcc
+        # for CUDA) against the install named by the profile's
+        # env_required vars, and returns a {status, stdout, stderr,
+        # artifacts} dict verbatim (no extra wrapping). The same shape
+        # future remote-batch verifier tools will return. `profile.id`
+        # is injected here so the LLM never has to pass it; the
+        # per-run profile is a constant for the entire orchestrator
+        # loop.
+        return compile_baseline_driver(
+            tool_input["kernel_stem"], profile.id
+        )
     if tool_name == "run_baseline_driver":
         # Deterministic tool (no LLM call): executes the previously-
         # compiled baselines/<stem>/driver with cwd set to that
         # directory so ./reference.json lands beside it. Subject to
         # AGENT_PRECISION_RUN_TIMEOUT_SEC. Returns the same
         # {status, stdout, stderr, artifacts} shape verbatim.
-        return run_baseline_driver(tool_input["kernel_stem"])
+        return run_baseline_driver(tool_input["kernel_stem"], profile.id)
     if tool_name == "splice_rewritten_kernel":
         # Deterministic tool (no LLM call): pure text I/O. Splices the
         # rewriter's kernel source into a copy of the baseline driver
-        # between the KERNEL BEGIN / KERNEL END sentinels and writes
-        # baselines/<stem>/rewritten/driver.cpp. Returns the same
-        # {status, stdout, stderr, artifacts} shape verbatim.
+        # between the profile's KERNEL BEGIN / KERNEL END sentinels and
+        # writes baselines/<stem>/rewritten/<profile.driver_filename>.
+        # Returns the same {status, stdout, stderr, artifacts} shape
+        # verbatim.
         return splice_rewritten_kernel(
             tool_input["kernel_stem"],
             tool_input["rewritten_kernel_source"],
+            profile.id,
         )
     if tool_name == "compile_rewritten_driver":
-        # Deterministic tool (no LLM call): same g++ invocation as
+        # Deterministic tool (no LLM call): same compile invocation as
         # compile_baseline_driver but targeting the spliced source at
-        # baselines/<stem>/rewritten/driver.cpp -> .../rewritten/driver.
-        # Returns the same {status, stdout, stderr, artifacts} shape
-        # verbatim.
-        return compile_rewritten_driver(tool_input["kernel_stem"])
+        # baselines/<stem>/rewritten/<profile.driver_filename> ->
+        # .../rewritten/driver. Returns the same {status, stdout,
+        # stderr, artifacts} shape verbatim.
+        return compile_rewritten_driver(
+            tool_input["kernel_stem"], profile.id
+        )
     if tool_name == "run_rewritten_driver":
         # Deterministic tool (no LLM call): same subprocess shape as
         # run_baseline_driver but cwd=baselines/<stem>/rewritten/, so
@@ -893,7 +919,9 @@ def _execute_tool(tool_name: str, tool_input: dict) -> dict:
         # rewritten subtree and the baseline tree is never touched.
         # Returns the same {status, stdout, stderr, artifacts} shape
         # verbatim.
-        return run_rewritten_driver(tool_input["kernel_stem"])
+        return run_rewritten_driver(
+            tool_input["kernel_stem"], profile.id
+        )
     if tool_name == "compare_outputs":
         # Deterministic tool (no LLM call): pure file + arithmetic I/O,
         # no subprocess. Reads the two reference.json files, walks
@@ -906,6 +934,7 @@ def _execute_tool(tool_name: str, tool_input: dict) -> dict:
         return compare_outputs(
             tool_input["kernel_stem"],
             tool_input["tolerance_json"],
+            profile.id,
         )
     raise ValueError(f"Unknown tool: {tool_name}")
 
@@ -942,16 +971,27 @@ def _format_tolerance_block(tolerance: dict | None) -> str:
     )
 
 
-def _format_baseline_block(kernel_path: str, kernel_name: str | None) -> str:
+def _format_baseline_block(
+    kernel_path: str, kernel_name: str | None, profile: LanguageProfile
+) -> str:
     """Render the BASELINE STEP block embedded in the initial user message.
 
     The baseline_harness agent v0 is Kokkos-only: the orchestrator is
     invited to call spawn_baseline_harness only when the kernel file is
     a .cpp. For .cu (CUDA) inputs, the block tells the orchestrator
-    explicitly not to call it. The block also surfaces the kernel_stem
-    the orchestrator must pass to the tool (so the driver lands at
-    baselines/<stem>/driver.cpp), and, if the caller provided one, the
-    target kernel function name.
+    explicitly not to call it. (This extension check is intentionally
+    NOT delegated to the profile in v0 — detect_language currently
+    returns the Kokkos profile for both .cpp and .cu, and the baseline
+    harness agent itself is Kokkos-only. Phase B replaces this with a
+    profile capability flag once a CUDA harness lands.) The block also
+    surfaces the kernel_stem the orchestrator must pass to the tool (so
+    the driver lands at baselines/<stem>/<profile.driver_filename>),
+    and, if the caller provided one, the target kernel function name.
+
+    `profile.display_name` and `profile.driver_filename` populate the
+    prose so the block stays in sync with the resolved language profile
+    when new languages land (eg. "CUDA" / "driver.cu" instead of
+    "Kokkos C++" / "driver.cpp").
     """
     stem = Path(kernel_path).stem
     suffix = Path(kernel_path).suffix.lower()
@@ -964,12 +1004,12 @@ def _format_baseline_block(kernel_path: str, kernel_name: str | None) -> str:
         f"TARGET KERNEL: {kernel_name}\n" if kernel_name else ""
     )
     return (
-        "BASELINE STEP: this is a Kokkos C++ kernel, so you MAY call "
-        "spawn_baseline_harness exactly once to generate a reference "
-        "driver. This is a side artifact for a future mechanical "
-        "comparator; it is NOT consumed by the analyst, rewriter, or "
-        "verifier in this run, and it is NOT a precondition for finish. "
-        "Skip it if it seems unhelpful.\n"
+        f"BASELINE STEP: this is a {profile.display_name} kernel, so "
+        "you MAY call spawn_baseline_harness exactly once to generate "
+        "a reference driver. This is a side artifact for a future "
+        "mechanical comparator; it is NOT consumed by the analyst, "
+        "rewriter, or verifier in this run, and it is NOT a "
+        "precondition for finish. Skip it if it seems unhelpful.\n"
         f"KERNEL STEM: {stem}\n"
         f"{target_line}"
         "When you call spawn_baseline_harness, pass the original kernel "
@@ -1040,8 +1080,16 @@ class _FinishGateState:
     self-correct from, instead of silently letting finish through.
     """
 
-    def __init__(self, kernel_path: str) -> None:
+    def __init__(self, kernel_path: str, profile: LanguageProfile) -> None:
         self.kernel_path = kernel_path
+        self.profile = profile
+        # v0 limitation: the dynamic-verification chain runs only for
+        # .cpp inputs (the baseline harness agent is Kokkos-only). The
+        # extension check stays here in code rather than on the
+        # profile, because detect_language currently returns the
+        # Kokkos profile for both .cpp and .cu and the harness itself
+        # is what's language-restricted, not the profile. Phase B
+        # replaces this with a profile capability flag.
         self.requires_comparator = kernel_path.endswith(".cpp")
         self.last_verifier_verdict: str | None = None
         self.last_compare_status: str | None = None
@@ -1092,7 +1140,8 @@ class _FinishGateState:
             )
         if self.requires_comparator and self.last_compare_status != "ok":
             return (
-                "finish is not allowed: on a .cpp (Kokkos) input, "
+                "finish is not allowed: on a "
+                f"{self.profile.display_name} input, "
                 "finish requires the dynamic-verification chain to "
                 "have ended with compare_outputs returning "
                 "status='ok' for the current rewrite cycle "
@@ -1145,8 +1194,19 @@ def run_orchestrator(
     Returns the final finish() arguments dict, or None if the user quit,
     the orchestrator stopped without finishing, or max_turns was exhausted.
     """
+    # Resolve the language profile once per run. The profile is a
+    # constant for the entire orchestrator loop — it determines the
+    # driver filename, the compiler invocation, and (in Phase B) which
+    # baseline_harness_<lang> agent ships. Threading it explicitly to
+    # _format_baseline_block, _FinishGateState, and _execute_tool keeps
+    # the orchestrator itself language-agnostic and means the LLM
+    # never has to pass language_id as a tool argument (Phase A.5
+    # Option B: language is per-run, not per-call).
+    profile = detect_language(kernel_path, kernel_source)
     tolerance_block = _format_tolerance_block(tolerance)
-    baseline_block = _format_baseline_block(kernel_path, kernel_name)
+    baseline_block = _format_baseline_block(
+        kernel_path, kernel_name, profile
+    )
     user_message = (
         f"Kernel file: {kernel_path}\n\n"
         f"Kernel source:\n```\n{kernel_source}\n```\n\n"
@@ -1160,7 +1220,7 @@ def run_orchestrator(
     messages: list[dict] = [{"role": "user", "content": user_message}]
 
     client = anthropic.Anthropic()
-    gate = _FinishGateState(kernel_path)
+    gate = _FinishGateState(kernel_path, profile)
 
     trace_path: Path | None = None
     if auto:
@@ -1272,7 +1332,7 @@ def run_orchestrator(
                     "is_error": True,
                 })
                 continue
-            exec_result = _execute_tool(tu.name, dict(tu.input))
+            exec_result = _execute_tool(tu.name, dict(tu.input), profile)
             gate.observe(tu.name, exec_result)
             _append_trace(
                 trace_path, turns, tu.name, dict(tu.input), exec_result
