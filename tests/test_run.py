@@ -30,7 +30,9 @@ def test_main_orchestrator_quit_returns_1(monkeypatch, tmp_path):
     kernel.write_text("// fake kernel\n")
     monkeypatch.setattr("sys.argv", ["workflow.run", str(kernel)])
     monkeypatch.setattr(
-        run_module, "run_orchestrator", lambda p, s, tolerance=None: None
+        run_module,
+        "run_orchestrator",
+        lambda p, s, tolerance=None, **kwargs: None,
     )
 
     assert run_module.main() == 1
@@ -45,7 +47,7 @@ def test_main_happy_path_passes_none_tolerance_when_no_flags(
 
     captured = {}
 
-    def fake_orchestrator(path, source, tolerance=None):
+    def fake_orchestrator(path, source, tolerance=None, auto=False, **kwargs):
         captured["path"] = path
         captured["source"] = source
         captured["tolerance"] = tolerance
@@ -72,7 +74,7 @@ def test_main_sig_figs_flag_normalizes_to_user_cli_tolerance(
 
     captured = {}
 
-    def fake_orchestrator(path, source, tolerance=None):
+    def fake_orchestrator(path, source, tolerance=None, auto=False, **kwargs):
         captured["tolerance"] = tolerance
         return {"rewritten_code": "X", "notes": "Y"}
 
@@ -98,7 +100,7 @@ def test_main_decimal_digits_flag_normalizes_to_user_cli_tolerance(
 
     captured = {}
 
-    def fake_orchestrator(path, source, tolerance=None):
+    def fake_orchestrator(path, source, tolerance=None, auto=False, **kwargs):
         captured["tolerance"] = tolerance
         return {"rewritten_code": "X", "notes": "Y"}
 
@@ -135,6 +137,28 @@ def test_main_mutually_exclusive_tolerance_flags(monkeypatch, tmp_path, capsys):
     assert excinfo.value.code == 2
     err = capsys.readouterr().err
     assert "not allowed" in err.lower() or "mutually exclusive" in err.lower()
+
+
+def test_main_auto_flag_passes_auto_true_to_orchestrator(monkeypatch, tmp_path):
+    """--auto causes the CLI to invoke run_orchestrator with auto=True; default invocation passes auto=False."""
+    kernel = tmp_path / "k.cpp"
+    kernel.write_text("// k\n")
+
+    captured = {}
+
+    def fake_orchestrator(path, source, tolerance=None, auto=False, **kwargs):
+        captured["auto"] = auto
+        return {"rewritten_code": "X", "notes": "Y"}
+
+    monkeypatch.setattr(run_module, "run_orchestrator", fake_orchestrator)
+
+    monkeypatch.setattr("sys.argv", ["workflow.run", str(kernel), "--auto"])
+    assert run_module.main() == 0
+    assert captured["auto"] is True
+
+    monkeypatch.setattr("sys.argv", ["workflow.run", str(kernel)])
+    assert run_module.main() == 0
+    assert captured["auto"] is False
 
 
 def test_main_rejects_nonpositive_sig_figs(monkeypatch, tmp_path):

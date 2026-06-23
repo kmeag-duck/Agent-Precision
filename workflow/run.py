@@ -30,6 +30,18 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         type=Path,
         help="Path to the kernel source file to rewrite.",
     )
+    parser.add_argument(
+        "--auto",
+        action="store_true",
+        help=(
+            "Skip the interactive y/n/q pause before every tool call and "
+            "approve every tool automatically. Writes a JSONL trace of "
+            "all executed tools to baselines/<kernel_stem>/"
+            "orchestrator_trace.jsonl for post-hoc inspection. Use this "
+            "for batch runs (e.g. consistency measurements); not "
+            "recommended for first-time debugging of a kernel."
+        ),
+    )
     tol_group = parser.add_mutually_exclusive_group()
     tol_group.add_argument(
         "--sig-figs",
@@ -83,7 +95,10 @@ def main(argv: list[str] | None = None) -> int:
     tolerance = _normalize_tolerance(args)
 
     result = run_orchestrator(
-        str(args.kernel_file), kernel_source, tolerance=tolerance
+        str(args.kernel_file),
+        kernel_source,
+        tolerance=tolerance,
+        auto=args.auto,
     )
 
     if result is None:

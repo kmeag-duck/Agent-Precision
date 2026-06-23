@@ -697,6 +697,34 @@ ORCHESTRATOR_TOOLS = [
 ]
 
 
+def _append_trace(
+    trace_path: Path | None,
+    turn: int,
+    tool_name: str,
+    tool_input: dict,
+    exec_result: dict,
+) -> None:
+    """Append one JSONL record per executed tool when auto-mode is on.
+
+    No-op when trace_path is None (interactive mode). The record schema is
+    {turn, tool_name, tool_input, exec_result} — flat enough for jq filters
+    and small enough that a 40-turn run produces a few hundred KiB max.
+    Trace writes happen for every executed tool, for synthesized finish-gate
+    errors, and for the honored finish call; user rejections cannot occur
+    in auto mode, so they are not represented.
+    """
+    if trace_path is None:
+        return
+    record = {
+        "turn": turn,
+        "tool_name": tool_name,
+        "tool_input": tool_input,
+        "exec_result": exec_result,
+    }
+    with trace_path.open("a") as f:
+        f.write(json.dumps(record) + "\n")
+
+
 def _hitl_pause(tool_name: str, tool_input: dict) -> str:
     """Show the proposed tool call and ask y/n/q. Returns the choice."""
     print()
@@ -1022,6 +1050,7 @@ def run_orchestrator(
     tolerance: dict | None = None,
     kernel_name: str | None = None,
     max_turns: int = MAX_TURNS,
+    auto: bool = False,
 ) -> dict | None:
     """Run the orchestrator loop.
 
@@ -1036,6 +1065,15 @@ def run_orchestrator(
     When None (the common case in v0), the orchestrator tells the
     harness agent to infer the function from the source. CLI does not
     expose this yet.
+
+    `auto` toggles the human-in-the-loop pause. Default False preserves
+    the interactive y/n/q gate before every tool call. When True, every
+    tool call is approved automatically and the loop writes a JSONL
+    trace of {turn, tool_name, tool_input, exec_result} to
+    baselines/<kernel_stem>/orchestrator_trace.jsonl so the operator can
+    inspect post-hoc what each agent saw and returned. The trace file
+    is truncated at the start of every auto run; MAX_TURNS remains the
+    only backstop against runaway loops in this mode.
 
     Returns the final finish() arguments dict, or None if the user quit,
     the orchestrator stopped without finishing, or max_turns was exhausted.
@@ -1056,6 +1094,14 @@ def run_orchestrator(
 
     client = anthropic.Anthropic()
     gate = _FinishGateState(kernel_path)
+
+    trace_path: Path | None = None
+    if auto:
+        stem = Path(kernel_path).stem
+        trace_dir = Path("baselines") / stem
+        trace_dir.mkdir(parents=True, exist_ok=True)
+        trace_path = trace_dir / "orchestrator_trace.jsonl"
+        trace_path.write_text("")
 
     turns = 0
     while True:
@@ -1094,7 +1140,7 @@ def run_orchestrator(
         user_quit = False
 
         for tu in tool_use_blocks:
-            choice = _hitl_pause(tu.name, dict(tu.input))
+            choice = "y" if auto else _hitl_pause(tu.name, dict(tu.input))
             if choice == "q":
                 user_quit = True
                 break
@@ -1109,6 +1155,13 @@ def run_orchestrator(
             if tu.name == "finish":
                 gate_error = gate.check_finish()
                 if gate_error is None:
+                    _append_trace(
+                        trace_path,
+                        turns,
+                        tu.name,
+                        dict(tu.input),
+                        {"status": "ok", "honored": True},
+                    )
                     finish_args = dict(tu.input)
                     break
                 # Gate violation: synthesize a tool_result the
@@ -1117,20 +1170,27 @@ def run_orchestrator(
                 # source-of-truth enforcement for the rule the system
                 # prompt describes; if the two ever disagree, this
                 # code wins.
+                gate_payload = {
+                    "status": "error",
+                    "stdout": "",
+                    "stderr": gate_error,
+                    "artifacts": [],
+                }
+                _append_trace(
+                    trace_path, turns, tu.name, dict(tu.input), gate_payload
+                )
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": tu.id,
-                    "content": json.dumps({
-                        "status": "error",
-                        "stdout": "",
-                        "stderr": gate_error,
-                        "artifacts": [],
-                    }),
+                    "content": json.dumps(gate_payload),
                     "is_error": True,
                 })
                 continue
             exec_result = _execute_tool(tu.name, dict(tu.input))
             gate.observe(tu.name, exec_result)
+            _append_trace(
+                trace_path, turns, tu.name, dict(tu.input), exec_result
+            )
             tool_results.append({
                 "type": "tool_result",
                 "tool_use_id": tu.id,
