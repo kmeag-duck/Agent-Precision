@@ -789,258 +789,91 @@ per_variable, and concerns."""
 # Baseline harness
 # ---------------------------------------------------------------------------
 #
-# First component of the planned dynamic verifier. Given a Kokkos C++
-# kernel, this agent writes a self-contained driver program that, when
-# later compiled and run, exercises the kernel on a fixed set of inputs
-# and emits a reproducible reference output as JSON. The reference output
-# will eventually be the baseline against which a mechanical comparator
-# checks the rewritten kernel.
+# The baseline-harness agent writes a self-contained driver program that,
+# when later compiled and run, exercises the kernel on a fixed set of
+# inputs and emits a reproducible reference output as JSON. The reference
+# output is the baseline against which the dynamic-verification chain
+# compares the rewritten kernel.
 #
-# v0 scope:
-#   - Kokkos only (the orchestrator skips this step for .cu kernels at
-#     the prompt level).
-#   - Driver source only; the agent never invents numerical values.
-#   - Driver runs on Kokkos::Serial with a fixed RNG seed so the
-#     reference is reproducible across runs.
-#   - Driver writes JSON to ./reference.json (relative to its CWD); the
-#     operator is expected to `cd` into baselines/<file_stem>/ before
-#     running.
-#
-# The agent's submit_result payload also carries kernel_function_name and
-# output_arrays so a future mechanical comparator knows what to call and
-# what to read out of reference.json.
+# Per-language driver templates, output schemas, and system prompts live
+# in workflow.languages.<language>.BASELINE_HARNESS_SYSTEM_PROMPT etc.;
+# this module just collects them into the AGENTS registry under
+# `baseline_harness_<id>` keys (plus the legacy unsuffixed
+# `baseline_harness` alias pointing at the Kokkos entry). The Kokkos
+# prompt and schema are re-exported under their pre-refactor module-level
+# names at the bottom of this file for back-compat with external imports.
 
-BASELINE_HARNESS_OUTPUT_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "driver_source": {
-            "type": "string",
-            "description": (
-                "The full driver source as a single self-contained .cpp "
-                "translation unit. Must inline the kernel source verbatim, "
-                "compile against a standard Kokkos toolchain, and on "
-                "execution write reference outputs to ./reference.json."
-            ),
-        },
-        "kernel_function_name": {
-            "type": "string",
-            "description": (
-                "Name of the kernel function the driver calls. Must match a "
-                "function defined in the inlined kernel source."
-            ),
-        },
-        "inputs_summary": {
-            "type": "string",
-            "description": (
-                "One-line human-readable summary of the chosen inputs, "
-                "e.g. 'N=16384, seed=42, x,y ~ U(-1,1)'. Mirrors the "
-                "'inputs' block the driver writes into reference.json."
-            ),
-        },
-        "output_arrays": {
-            "type": "array",
-            "description": (
-                "Names of the arrays the driver writes under the 'outputs' "
-                "key of reference.json. A future mechanical comparator "
-                "uses this list to know which arrays to read back."
-            ),
-            "items": {"type": "string"},
-        },
-    },
-    "required": [
-        "driver_source",
-        "kernel_function_name",
-        "inputs_summary",
-        "output_arrays",
-    ],
-}
 
-BASELINE_HARNESS_SYSTEM_PROMPT = """You are the baseline-harness agent
-for a mixed-precision rewriting workflow.
+_BASELINE_HARNESS_MODEL = "claude-opus-4-7"
 
-You will be given a Kokkos C++ kernel source. Your job is to write a
-self-contained C++ driver program that, when compiled and run later,
-exercises the kernel on a fixed set of inputs and writes a reproducible
-reference output to ./reference.json. That JSON file will eventually be
-the baseline against which a rewritten (lower-precision) version of the
-same kernel is compared.
+# Per-language baseline-harness entries. The orchestrator's
+# spawn_baseline_harness tool dispatches to `baseline_harness_<id>`
+# where <id> matches the resolved LanguageProfile.id; the orchestrator
+# never sees the per-language entry names directly. The plain
+# `baseline_harness` alias is kept for back-compat with any caller that
+# might still target the legacy single-language name; it points at the
+# Kokkos entry because that was the only language the original prompt
+# covered.
 
-You do NOT compile, run, or simulate the kernel. You do NOT invent
-numerical output values. Your only output is the driver source.
+# Imported here (not at module top) so workflow.languages can in turn
+# import workflow.registry helpers in the future without circling.
+from .languages import PROFILES as _PROFILES  # noqa: E402
 
-Hard requirements on the driver:
-
-1. Single translation unit. Inline the kernel source verbatim into the
-   driver (above main()). Do not introduce a build system or external
-   headers beyond <Kokkos_Core.hpp>, the C and C++ standard library, and
-   anything the kernel itself already includes.
-
-   The inlined kernel MUST be bracketed by these two sentinel comment
-   lines, verbatim, each on its own line and with no surrounding
-   indentation:
-
-       // ---- KERNEL BEGIN ----
-       <the kernel source, unmodified>
-       // ---- KERNEL END ----
-
-   These exact strings are a hard contract: a later mechanical-
-   verification step will string-replace the text between them to splice
-   a rewritten kernel into this same driver template (so the rewritten
-   kernel runs against bit-identical inputs, RNG, and JSON output
-   layout). Do not paraphrase the sentinels, do not add extra dashes,
-   do not move them inside a function body, and do not place any other
-   code between them other than the kernel itself.
-
-2. Use Kokkos::initialize / Kokkos::finalize. Run on the serial host
-   execution space (Kokkos::Serial / Kokkos::HostSpace). This is a v0
-   reproducibility constraint: parallel reductions are order-dependent
-   and would make the baseline non-deterministic.
-
-3. Seed any RNG with a fixed integer (use 42 unless the kernel's
-   apparent domain demands otherwise). The driver must produce the same
-   numbers on every run.
-
-4. Choose modest input sizes and distributions appropriate to the
-   kernel from its signature and apparent scientific domain. Aim for a
-   driver that runs in a few seconds, not hours. Typical N is in the
-   1e4 to 1e6 range depending on per-element cost. Document the inputs
-   you chose in inputs_summary.
-
-5. If the task message names a TARGET KERNEL, call exactly that
-   function. Otherwise, infer the kernel function from the source —
-   there should be exactly one obvious candidate.
-
-6. Do not modify the kernel function. Do not change any variable's
-   precision. Do not invent or rename kernel arguments. The whole point
-   is to capture the *original* kernel's output as the reference.
-
-    EXCEPTION — precision-alias contract. Immediately inside the
-   '// ---- KERNEL BEGIN ----' sentinel and above the kernel function
-   definition, emit one `using` alias per kernel parameter whose type
-   involves a floating-point scalar or a Kokkos::View of a floating-
-   point scalar. Naming convention: `<ParamName>Type` (CamelCase of the
-   parameter name + 'Type' suffix). The kernel function's parameter
-   list MUST then refer to those aliases, not to the underlying types.
-   The kernel body is otherwise unchanged. For example, a kernel
-   originally declared as
-
-       void kernel(
-           Kokkos::View<double*> a,
-           Kokkos::View<const double*> b,
-           double alpha, double beta) { ... }
-
-   becomes, inside the sentinels:
-
-       using aType = Kokkos::View<double*>;
-       using bType = Kokkos::View<const double*>;
-       using alphaType = double;
-       using betaType = double;
-
-       void kernel(aType a, bType b, alphaType alpha, betaType beta) { ... }
-
-   Integer parameters (sizes, counts, indices) do NOT get aliases —
-   only floating-point scalars and floating-point Views. The kernel
-   body itself stays byte-for-byte identical to the original; only the
-   parameter type tokens in the function header are replaced with the
-   alias names.
-
-    `main()`, outside the sentinels, MUST use those aliases anywhere it
-   constructs values that flow into the kernel call. Use the matching
-   alias (e.g. `aType` for the `a` argument, `alphaType` for the
-   `alpha` argument) to declare the values that flow into the kernel
-   call. The aliases are the single point of truth for kernel I/O
-   precision: a later rewriter redefines the aliases inside the
-   sentinels to change kernel precision end-to-end, and `main()`
-   inherits the change for free.
-
-   Staging-view rule for `View<const T*>` kernel arguments. When a
-   kernel parameter's alias is a const View (e.g.
-   `using aType = Kokkos::View<const double*>;`), you cannot write into
-   a view of that type directly to populate it. Use a writable staging
-   view whose element type is DERIVED FROM THE ALIAS, then assign it
-   into the const-aliased view that you pass to the kernel:
-
-       // correct: staging view's element type tracks the alias
-       Kokkos::View<typename aType::non_const_value_type*> a_nc("a", N);
-       // ... fill a_nc through its host mirror ...
-       aType a = a_nc;  // const-binds; precision is whatever aType says
-       kernel(a, ...);
-
-   Do NOT hardcode the staging view's element type as `double`. A
-   hardcoded `Kokkos::View<double*> a_nc(...)` breaks the contract: when
-   the rewriter redefines `aType` to `Kokkos::View<const float*>`, the
-   `aType a = a_nc;` assignment no longer compiles because
-   `View<double*>` does not convert to `View<const float*>`. The
-   `typename <ParamName>Type::non_const_value_type` form is the only
-   one that survives a precision change to the alias.
-
-   For local host scratch (std::vector buffers, RNG distributions) that
-   do not directly become kernel arguments, plain `double` is fine —
-   only the values that cross the kernel boundary need to flow through
-   the aliases.
-
-7. Kokkos::deep_copy any device Views you read from back to host Views
-   before iterating them for JSON emission.
-
-8. Write the reference output to './reference.json' (relative to the
-   driver's working directory) using std::ofstream and "%.17g"
-   formatting for floating-point values. Do NOT pull in a third-party
-   JSON library — hand-roll the writer; output arrays are flat arrays
-   of doubles, so a few loops with manual braces, commas, and newlines
-   are sufficient.
-
-9. The JSON document must have exactly this shape:
-
-       {
-         "kernel": "<kernel_function_name>",
-         "seed": <integer seed>,
-         "inputs": { "N": <int>, ... },
-         "outputs": { "<name>": [ <double>, ... ], ... }
-       }
-
-   "inputs" carries enough metadata for a human reader to understand
-   what the driver did (sizes, distributions if represented as
-   strings). "outputs" carries one named flat array per output the
-   comparator will check. The names under "outputs" must match
-   output_arrays in your submit_result payload.
-
-10. Begin the driver with a top-of-file comment that tells the operator
-    to `cd` into the baseline directory (baselines/<file_stem>/) before
-    running, so ./reference.json lands next to the driver source. Also
-    mention the compile command in a comment (a typical Kokkos build
-    line is fine; the operator will adapt it).
-
-Set kernel_function_name and output_arrays in your submit_result
-payload so they exactly match what the driver actually does. If your
-driver writes an array under "outputs" by some name, that same name
-must appear in output_arrays.
-
-Return your result by calling the submit_result tool."""
-
+# Per-entry `supports_temperature` declares whether the model behind
+# this agent will accept a `temperature` kwarg on messages.create.
+# Argo's `claude-opus-4-7` snapshot rejects temperature outright
+# (HTTP 400 `temperature is deprecated for this model`), so the
+# default is False and `run_agent` drops the kwarg unless this flag
+# is explicitly True. Flip to True per-entry when (and only when)
+# you've verified the model accepts it; the ensemble path will still
+# request K calls but they'll all run at the model's internal
+# sampling, with a warning so the operator knows diversity is
+# reduced. See AGENTS.md for the rationale and `run_agent` for the
+# enforcement point.
 AGENTS = {
     "precision_advisor": {
         "system_prompt": PRECISION_ADVISOR_SYSTEM_PROMPT,
         "output_schema": PRECISION_ADVISOR_OUTPUT_SCHEMA,
         "model": "claude-opus-4-7",
+        "supports_temperature": False,
     },
     "analyst": {
         "system_prompt": ANALYST_SYSTEM_PROMPT,
         "output_schema": ANALYST_OUTPUT_SCHEMA,
         "model": "claude-opus-4-7",
+        "supports_temperature": False,
     },
     "rewriter": {
         "system_prompt": REWRITER_SYSTEM_PROMPT,
         "output_schema": REWRITER_OUTPUT_SCHEMA,
         "model": "claude-opus-4-7",
+        "supports_temperature": False,
     },
     "verifier": {
         "system_prompt": VERIFIER_SYSTEM_PROMPT,
         "output_schema": VERIFIER_OUTPUT_SCHEMA,
         "model": "claude-opus-4-7",
-    },
-    "baseline_harness": {
-        "system_prompt": BASELINE_HARNESS_SYSTEM_PROMPT,
-        "output_schema": BASELINE_HARNESS_OUTPUT_SCHEMA,
-        "model": "claude-opus-4-7",
+        "supports_temperature": False,
     },
 }
+
+for _profile in _PROFILES.values():
+    AGENTS[f"baseline_harness_{_profile.id}"] = {
+        "system_prompt": _profile.baseline_harness_system_prompt,
+        "output_schema": _profile.baseline_harness_output_schema,
+        "model": _BASELINE_HARNESS_MODEL,
+        "supports_temperature": False,
+    }
+
+# Back-compat alias for callers that still target the unsuffixed name.
+# Points at the Kokkos entry because that was the only language the
+# pre-refactor `baseline_harness` covered.
+AGENTS["baseline_harness"] = AGENTS["baseline_harness_kokkos"]
+
+# Module-level back-compat: the module previously exported
+# BASELINE_HARNESS_SYSTEM_PROMPT and BASELINE_HARNESS_OUTPUT_SCHEMA as
+# the Kokkos prompt and schema. The canonical values now live on
+# KOKKOS_PROFILE; expose them under the legacy names so external imports
+# (and the test suite) keep working unchanged.
+BASELINE_HARNESS_SYSTEM_PROMPT = _PROFILES["kokkos"].baseline_harness_system_prompt
+BASELINE_HARNESS_OUTPUT_SCHEMA = _PROFILES["kokkos"].baseline_harness_output_schema

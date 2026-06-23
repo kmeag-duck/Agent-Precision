@@ -11,13 +11,20 @@ remote-batch verifier tools will return (see AGENTS.md "JLSE / async
 toolchain migration"), so the orchestrator loop does not need to change
 when "run g++ locally" becomes "submit a compile job and poll".
 
+Per-language behavior (driver-file extension, compile command, splice
+sentinels, env-var contract) is owned by the language-profile objects
+in workflow.languages. Phase A of the multi-language refactor keeps the
+public tool signatures unchanged — each wrapper resolves the Kokkos
+profile internally — so existing callers and tests stay green. Phase
+A.5 grows each tool a required `language_id` argument and lets the
+orchestrator pick the profile per run.
+
 Currently exposes:
 
   - compile_baseline_driver(kernel_stem): compile
-    baselines/<kernel_stem>/driver.cpp produced by the baseline_harness
-    agent into a native executable at baselines/<kernel_stem>/driver,
-    linking against the Kokkos install named by the
-    AGENT_PRECISION_KOKKOS_ROOT environment variable.
+    baselines/<kernel_stem>/<profile.driver_filename> produced by the
+    baseline_harness agent into a native executable at
+    baselines/<kernel_stem>/driver, using `profile.build_compile_command`.
 
   - run_baseline_driver(kernel_stem): execute the compiled driver at
     baselines/<kernel_stem>/driver and verify that it produces a
@@ -26,14 +33,15 @@ Currently exposes:
     AGENT_PRECISION_RUN_TIMEOUT_SEC environment variable (default 60s).
 
   - splice_rewritten_kernel(kernel_stem, rewritten_kernel_source): read
-    the baseline driver at baselines/<kernel_stem>/driver.cpp, replace
-    the region strictly between the KERNEL BEGIN / KERNEL END sentinels
-    with the supplied rewritten kernel source, and write the result to
-    baselines/<kernel_stem>/rewritten/driver.cpp. Pure text I/O; never
-    invokes a subprocess and never modifies the baseline file in place.
+    the baseline driver at baselines/<kernel_stem>/<profile.driver_filename>,
+    replace the region strictly between the profile's KERNEL BEGIN /
+    KERNEL END sentinels with the supplied rewritten kernel source, and
+    write the result to baselines/<kernel_stem>/rewritten/
+    <profile.driver_filename>. Pure text I/O; never invokes a subprocess
+    and never modifies the baseline file in place.
 
   - compile_rewritten_driver(kernel_stem): compile
-    baselines/<kernel_stem>/rewritten/driver.cpp (produced by
+    baselines/<kernel_stem>/rewritten/<profile.driver_filename> (produced by
     splice_rewritten_kernel) into baselines/<kernel_stem>/rewritten/
     driver. Shares the env-var contract, compile flags, and result
     schema of compile_baseline_driver; only the directory differs.
@@ -71,11 +79,18 @@ import subprocess
 from pathlib import Path
 from typing import Iterator
 
-# Environment variable that names the Kokkos install prefix (i.e. the
-# directory containing include/ and lib/). Intentionally namespaced so
-# it does not collide with Kokkos's own CMake convention (Kokkos_ROOT)
-# or with a system-wide install.
-KOKKOS_ROOT_ENV = "AGENT_PRECISION_KOKKOS_ROOT"
+from .languages import KOKKOS_PROFILE, LanguageProfile
+from .languages.base import make_error_result
+
+# Backward-compat re-export. Tests historically imported KOKKOS_ROOT_ENV
+# from workflow.tools directly; the Kokkos profile now owns the canonical
+# value as workflow.languages.kokkos.ROOT_ENV, but we re-bind it here so
+# the Phase A refactor does not force a sweep through the test suite. The
+# compile-flag constants (CXX, CXX_STD, OPT_FLAGS, KOKKOS_LIBS, EXTRA_LIBS)
+# are now Kokkos-private and live in workflow.languages.kokkos.
+from .languages import kokkos as _kokkos
+
+KOKKOS_ROOT_ENV = _kokkos.ROOT_ENV
 
 # Environment variable that caps the wall-clock seconds run_baseline_driver
 # will wait for the compiled driver to finish. Namespaced for the same
@@ -85,51 +100,41 @@ KOKKOS_ROOT_ENV = "AGENT_PRECISION_KOKKOS_ROOT"
 RUN_TIMEOUT_ENV = "AGENT_PRECISION_RUN_TIMEOUT_SEC"
 DEFAULT_RUN_TIMEOUT_SEC = 60
 
-# Compile flags. C++20 is required by the baseline driver template; the
-# OpenMP host backend is what the Kokkos install in this repo was built
-# with, so -fopenmp is mandatory at link time. Kokkos here is shipped as
-# static archives (libkokkoscore.a, libkokkoscontainers.a), so no rpath
-# is needed and the resulting binary has no libkokkos* in its dynamic
-# NEEDED list.
-CXX = "g++"
-CXX_STD = "-std=c++20"
-OPT_FLAGS = ["-O2", "-fopenmp"]
-KOKKOS_LIBS = ["-lkokkoscore", "-lkokkoscontainers"]
-EXTRA_LIBS = ["-lpthread", "-ldl"]
-
-# Splice sentinels. These exact byte strings are mandated by the
-# baseline_harness agent's system prompt (see BASELINE_HARNESS_SYSTEM_PROMPT
-# in workflow/registry.py): the inlined kernel in baselines/<stem>/driver.cpp
-# is bracketed by these two lines, each on its own line with no
-# surrounding indentation. splice_rewritten_kernel relies on that exact
-# contract to identify the region to replace. If you ever change either
-# string here, you MUST also update the literal sentinel lines spelled
-# out in the harness prompt; LLM prompts cannot reference Python
-# identifiers, so the prompt deliberately re-states the bytes.
-KERNEL_BEGIN_SENTINEL = "// ---- KERNEL BEGIN ----"
-KERNEL_END_SENTINEL = "// ---- KERNEL END ----"
+# Splice sentinels. Historically these were the only sentinels in the
+# repo and lived as module-level constants; tests and the
+# baseline_harness prompt both pin them. They are now owned by
+# LanguageProfile (so a future Fortran profile can override), but the
+# v1 profiles all default to the C-style versions, and the Kokkos
+# profile's values are what we re-export here for back-compat.
+KERNEL_BEGIN_SENTINEL = KOKKOS_PROFILE.sentinel_begin
+KERNEL_END_SENTINEL = KOKKOS_PROFILE.sentinel_end
 
 
 def _error(stderr: str) -> dict:
     """Build a uniform error result with empty stdout and no artifacts."""
-    return {
-        "status": "error",
-        "stdout": "",
-        "stderr": stderr,
-        "artifacts": [],
-    }
+    return make_error_result(stderr)
 
 
-def _compile_driver(driver_dir: Path, missing_source_hint: str) -> dict:
-    """Compile <driver_dir>/driver.cpp into <driver_dir>/driver.
+def _compile_driver(
+    driver_dir: Path,
+    profile: LanguageProfile,
+    missing_source_hint: str,
+) -> dict:
+    """Compile <driver_dir>/<profile.driver_filename> into <driver_dir>/driver.
 
     Shared implementation behind compile_baseline_driver and
     compile_rewritten_driver. The two public wrappers differ only in
-    which directory they target — the env-var checks, command shape,
+    which directory they target — the preflight, command shape,
     subprocess invocation, error wrapping, and result schema are
     identical. Pulling the body here keeps the dynamic-verification
     chain (splice -> compile_rewritten -> run_rewritten -> compare)
     from drifting from the baseline chain it parallels.
+
+    `profile` carries the language-specific bits: the driver filename
+    to look for, the preflight check (env vars set, toolchain on PATH),
+    and the build_compile_command callable that produces the subprocess
+    argv. The driver-binary path is always `<driver_dir>/driver`
+    regardless of language; only the source file extension varies.
 
     `missing_source_hint` is the human-readable hint appended to the
     "driver source not found" error so the operator knows which
@@ -138,40 +143,19 @@ def _compile_driver(driver_dir: Path, missing_source_hint: str) -> dict:
     for the rewritten variant). Everything else about the error result
     is identical across the two wrappers.
     """
-    kokkos_root = os.environ.get(KOKKOS_ROOT_ENV)
-    if not kokkos_root:
-        return _error(
-            f"{KOKKOS_ROOT_ENV} is not set. Point it at a Kokkos install "
-            f"prefix (the directory containing include/ and lib/)."
-        )
-    root = Path(kokkos_root)
-    include_dir = root / "include"
-    lib_dir = root / "lib"
-    if not include_dir.is_dir() or not lib_dir.is_dir():
-        return _error(
-            f"{KOKKOS_ROOT_ENV}={kokkos_root!r} does not look like a "
-            f"Kokkos install prefix (missing include/ or lib/)."
-        )
+    preflight_error = profile.preflight()
+    if preflight_error is not None:
+        return preflight_error
 
-    driver_src = driver_dir / "driver.cpp"
+    driver_src = driver_dir / profile.driver_filename
     driver_bin = driver_dir / "driver"
     if not driver_src.is_file():
         return _error(
             f"Driver source not found at {driver_src}. {missing_source_hint}"
         )
 
-    cmd = [
-        CXX,
-        CXX_STD,
-        *OPT_FLAGS,
-        f"-I{include_dir}",
-        f"-L{lib_dir}",
-        str(driver_src),
-        *KOKKOS_LIBS,
-        *EXTRA_LIBS,
-        "-o",
-        str(driver_bin),
-    ]
+    cmd = profile.build_compile_command(driver_src, driver_bin)
+    compiler_name = cmd[0] if cmd else "<empty command>"
 
     try:
         proc = subprocess.run(
@@ -181,15 +165,14 @@ def _compile_driver(driver_dir: Path, missing_source_hint: str) -> dict:
             check=False,
         )
     except FileNotFoundError as exc:
-        # g++ not on PATH.
-        return _error(f"Failed to invoke {CXX!r}: {exc}")
+        return _error(f"Failed to invoke {compiler_name!r}: {exc}")
 
     if proc.returncode != 0:
         return {
             "status": "error",
             "stdout": proc.stdout,
             "stderr": (
-                f"{CXX} exited with code {proc.returncode}.\n"
+                f"{compiler_name} exited with code {proc.returncode}.\n"
                 f"Command: {' '.join(cmd)}\n\n{proc.stderr}"
             ),
             "artifacts": [],
@@ -203,22 +186,31 @@ def _compile_driver(driver_dir: Path, missing_source_hint: str) -> dict:
     }
 
 
-def compile_baseline_driver(kernel_stem: str) -> dict:
-    """Compile baselines/<kernel_stem>/driver.cpp against the local Kokkos.
+def compile_baseline_driver(
+    kernel_stem: str, language_id: str | None = None
+) -> dict:
+    """Compile baselines/<kernel_stem>/<profile.driver_filename>.
 
-    Reads the Kokkos install prefix from the AGENT_PRECISION_KOKKOS_ROOT
-    environment variable. Returns a `{status, stdout, stderr, artifacts}`
-    dict, where `status` is 'ok' on a successful compile and 'error'
-    otherwise. `artifacts` is a list of created/expected output paths
-    (the driver binary) — empty on error.
+    `language_id` selects which workflow.languages profile drives the
+    compile (driver-file extension, compiler argv, env-var preflight).
+    Defaults to "kokkos" for back-compat with existing callers that
+    were written before the multi-language refactor. The orchestrator
+    threads an explicit `language_id` through the tool call.
+
+    Returns a `{status, stdout, stderr, artifacts}` dict, where
+    `status` is 'ok' on a successful compile and 'error' otherwise.
+    `artifacts` is a list of created/expected output paths (the driver
+    binary) — empty on error.
 
     The driver source is expected to already exist at
-    baselines/<kernel_stem>/driver.cpp (written by the baseline_harness
-    agent on HITL approval). This helper does not run the compiled
-    binary; that is a separate step.
+    baselines/<kernel_stem>/<profile.driver_filename> (written by the
+    baseline_harness agent on HITL approval). This helper does not run
+    the compiled binary; that is a separate step.
     """
+    profile = _resolve_profile(language_id)
     return _compile_driver(
         Path("baselines") / kernel_stem,
+        profile,
         missing_source_hint=(
             "Did spawn_baseline_harness run and get approved for this "
             "kernel_stem?"
@@ -226,12 +218,14 @@ def compile_baseline_driver(kernel_stem: str) -> dict:
     )
 
 
-def compile_rewritten_driver(kernel_stem: str) -> dict:
-    """Compile baselines/<kernel_stem>/rewritten/driver.cpp.
+def compile_rewritten_driver(
+    kernel_stem: str, language_id: str | None = None
+) -> dict:
+    """Compile baselines/<kernel_stem>/rewritten/<profile.driver_filename>.
 
     Companion to compile_baseline_driver, targeting the rewritten
     driver produced by splice_rewritten_kernel. Same env-var contract
-    (AGENT_PRECISION_KOKKOS_ROOT), same compile flags, same result
+    (per the profile's `env_required`), same compile flags, same result
     schema. The compiled binary lands at
     baselines/<kernel_stem>/rewritten/driver, alongside the source.
 
@@ -240,8 +234,10 @@ def compile_rewritten_driver(kernel_stem: str) -> dict:
     analyst -> rewriter -> verifier loop still runs, and finish remains
     reachable on verifier accept).
     """
+    profile = _resolve_profile(language_id)
     return _compile_driver(
         Path("baselines") / kernel_stem / "rewritten",
+        profile,
         missing_source_hint=(
             "Did splice_rewritten_kernel run and get approved for this "
             "kernel_stem?"
@@ -380,8 +376,16 @@ def _run_driver(driver_dir: Path, missing_binary_hint: str) -> dict:
     }
 
 
-def run_baseline_driver(kernel_stem: str) -> dict:
+def run_baseline_driver(
+    kernel_stem: str, language_id: str | None = None
+) -> dict:
     """Execute baselines/<kernel_stem>/driver and validate reference.json.
+
+    `language_id` is accepted for call-shape symmetry with the rest of
+    the dynamic-verification chain; the run subprocess is the same
+    `./driver` invocation regardless of language because the compiled
+    binary always lives at the same path. Defaults to "kokkos" for
+    back-compat.
 
     The driver is invoked with cwd=baselines/<kernel_stem>/ so the
     `./reference.json` path the baseline_harness prompt mandates lands
@@ -398,6 +402,9 @@ def run_baseline_driver(kernel_stem: str) -> dict:
     are non-fatal to the surrounding pipeline; the orchestrator treats
     this whole side artifact as optional.
     """
+    # language_id retained for call-shape symmetry; resolved for early
+    # validation (an unknown id should error here, not silently no-op).
+    _resolve_profile(language_id)
     return _run_driver(
         Path("baselines") / kernel_stem,
         missing_binary_hint=(
@@ -407,7 +414,9 @@ def run_baseline_driver(kernel_stem: str) -> dict:
     )
 
 
-def run_rewritten_driver(kernel_stem: str) -> dict:
+def run_rewritten_driver(
+    kernel_stem: str, language_id: str | None = None
+) -> dict:
     """Execute baselines/<kernel_stem>/rewritten/driver and validate JSON.
 
     Companion to run_baseline_driver, targeting the rewritten driver
@@ -416,8 +425,8 @@ def run_rewritten_driver(kernel_stem: str) -> dict:
     result schema. The rewritten driver runs with cwd set to
     baselines/<kernel_stem>/rewritten/, so its `./reference.json`
     lands inside the rewritten subtree and the baseline tree
-    (baselines/<kernel_stem>/{driver.cpp, driver, reference.json}) is
-    never touched by this call.
+    (baselines/<kernel_stem>/{<driver_filename>, driver, reference.json})
+    is never touched by this call.
 
     Like the baseline run, this is a side artifact: a non-zero run
     result is non-fatal to the surrounding pipeline (the analyst ->
@@ -425,6 +434,7 @@ def run_rewritten_driver(kernel_stem: str) -> dict:
     on verifier accept). On success, `artifacts` is the single-element
     list `["baselines/<kernel_stem>/rewritten/reference.json"]`.
     """
+    _resolve_profile(language_id)
     return _run_driver(
         Path("baselines") / kernel_stem / "rewritten",
         missing_binary_hint=(
@@ -449,34 +459,41 @@ def _find_unique_sentinel_line(lines: list[str], sentinel: str) -> int | None:
 
 
 def splice_rewritten_kernel(
-    kernel_stem: str, rewritten_kernel_source: str
+    kernel_stem: str,
+    rewritten_kernel_source: str,
+    language_id: str | None = None,
 ) -> dict:
     """Splice `rewritten_kernel_source` into the baseline driver template.
 
-    Reads baselines/<kernel_stem>/driver.cpp, locates the unique
-    KERNEL BEGIN / KERNEL END sentinel lines (byte-exact, each on its
-    own line with no surrounding indentation), replaces the text
-    strictly BETWEEN them (sentinels themselves preserved) with
-    `rewritten_kernel_source`, and writes the result to
-    baselines/<kernel_stem>/rewritten/driver.cpp. The directory is
-    created if needed. The baseline driver.cpp is never modified.
+    Reads baselines/<kernel_stem>/<profile.driver_filename>, locates
+    the unique profile.sentinel_begin / sentinel_end lines (byte-exact,
+    each on its own line with no surrounding indentation), replaces
+    the text strictly BETWEEN them (sentinels themselves preserved)
+    with `rewritten_kernel_source`, and writes the result to
+    baselines/<kernel_stem>/rewritten/<profile.driver_filename>. The
+    directory is created if needed. The baseline driver is never
+    modified.
 
     The result has the uniform `{status, stdout, stderr, artifacts}`
     shape shared with compile_baseline_driver and run_baseline_driver:
 
       - On success: status='ok', stdout='', stderr='',
-        artifacts=['baselines/<stem>/rewritten/driver.cpp'].
+        artifacts=['baselines/<stem>/rewritten/<driver_filename>'].
       - On any error: status='error', stdout='', a descriptive stderr,
         and artifacts=[].
 
     This is pure text I/O. It never invokes a subprocess.
     """
+    profile = _resolve_profile(language_id)
+
     if not rewritten_kernel_source:
         return _error(
             "rewritten_kernel_source is empty; nothing to splice."
         )
 
-    baseline_path = Path("baselines") / kernel_stem / "driver.cpp"
+    baseline_path = (
+        Path("baselines") / kernel_stem / profile.driver_filename
+    )
     if not baseline_path.is_file():
         return _error(
             f"Baseline driver source not found at {baseline_path}. Did "
@@ -494,27 +511,27 @@ def splice_rewritten_kernel(
     # right-hand side. We rejoin with "\n" below.
     lines = baseline_text.splitlines()
 
-    begin_idx = _find_unique_sentinel_line(lines, KERNEL_BEGIN_SENTINEL)
+    begin_idx = _find_unique_sentinel_line(lines, profile.sentinel_begin)
     if begin_idx is None:
         return _error(
             f"Baseline driver at {baseline_path} does not contain "
-            f"exactly one {KERNEL_BEGIN_SENTINEL!r} line on its own "
+            f"exactly one {profile.sentinel_begin!r} line on its own "
             f"(no surrounding indentation or whitespace)."
         )
 
-    end_idx = _find_unique_sentinel_line(lines, KERNEL_END_SENTINEL)
+    end_idx = _find_unique_sentinel_line(lines, profile.sentinel_end)
     if end_idx is None:
         return _error(
             f"Baseline driver at {baseline_path} does not contain "
-            f"exactly one {KERNEL_END_SENTINEL!r} line on its own "
+            f"exactly one {profile.sentinel_end!r} line on its own "
             f"(no surrounding indentation or whitespace)."
         )
 
     if begin_idx >= end_idx:
         return _error(
             f"Baseline driver at {baseline_path} has "
-            f"{KERNEL_END_SENTINEL!r} at or before "
-            f"{KERNEL_BEGIN_SENTINEL!r} (line {end_idx + 1} vs line "
+            f"{profile.sentinel_end!r} at or before "
+            f"{profile.sentinel_begin!r} (line {end_idx + 1} vs line "
             f"{begin_idx + 1}); cannot splice."
         )
 
@@ -541,7 +558,7 @@ def splice_rewritten_kernel(
     new_text = "\n".join(new_lines) + trailing_newline
 
     out_dir = Path("baselines") / kernel_stem / "rewritten"
-    out_path = out_dir / "driver.cpp"
+    out_path = out_dir / profile.driver_filename
     try:
         out_dir.mkdir(parents=True, exist_ok=True)
         out_path.write_text(new_text)
@@ -554,6 +571,26 @@ def splice_rewritten_kernel(
         "stderr": "",
         "artifacts": [str(out_path)],
     }
+
+
+def _resolve_profile(language_id: str | None) -> LanguageProfile:
+    """Look up a LanguageProfile by id, defaulting to Kokkos.
+
+    Kept as a thin private helper so the public tool wrappers do not
+    import workflow.languages.get_profile_by_id directly; this keeps
+    the "language_id is optional in Phase A" contract in one place and
+    makes the Phase A.5 transition (require language_id) a single-site
+    edit when we tighten the schema.
+    """
+    if language_id is None or language_id == KOKKOS_PROFILE.id:
+        return KOKKOS_PROFILE
+    # Deferred import to avoid a circular dependency at module load
+    # (workflow.languages imports workflow.languages.kokkos, which we
+    # already have via the top-level import; this guards against a
+    # future profile module that imports tools).
+    from .languages import get_profile_by_id
+
+    return get_profile_by_id(language_id)
 
 
 # ---------- compare_outputs: baseline-vs-rewritten numerical comparator ----------
@@ -738,8 +775,18 @@ def _iter_leaf_pairs(
             yield (name, i, va, vb)
 
 
-def compare_outputs(kernel_stem: str, tolerance_json: str) -> dict:
+def compare_outputs(
+    kernel_stem: str,
+    tolerance_json: str,
+    language_id: str | None = None,
+) -> dict:
     """Numerically compare baseline vs rewritten reference.json.
+
+    `language_id` is accepted for call-shape symmetry with the rest of
+    the dynamic-verification chain. The comparator itself is fully
+    language-agnostic — it walks two reference.json files that obey
+    the harness contract regardless of which language produced them —
+    but accepting the arg keeps every tool's schema uniform.
 
     Reads baselines/<kernel_stem>/reference.json and
     baselines/<kernel_stem>/rewritten/reference.json, walks every
@@ -768,6 +815,7 @@ def compare_outputs(kernel_stem: str, tolerance_json: str) -> dict:
     the same truncation so an LLM-driven retry never sees an
     unbounded payload.
     """
+    _resolve_profile(language_id)
     try:
         tolerance = json.loads(tolerance_json)
     except json.JSONDecodeError as exc:

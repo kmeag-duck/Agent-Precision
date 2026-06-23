@@ -10,22 +10,42 @@ from workflow.registry import (
 
 
 def test_known_agent_types():
-    """AGENTS exposes exactly the precision_advisor, analyst, rewriter, verifier, and baseline_harness types."""
-    assert set(AGENTS) == {
+    """AGENTS exposes the core agent types plus one baseline_harness_<lang> per registered language profile, with `baseline_harness` aliased to the Kokkos entry."""
+    core_types = {
         "precision_advisor",
         "analyst",
         "rewriter",
         "verifier",
         "baseline_harness",
     }
+    assert core_types.issubset(set(AGENTS))
+    # The Phase A language-profile refactor adds one entry per profile
+    # under the `baseline_harness_<id>` key. At minimum, the Kokkos
+    # entry must exist and the unsuffixed alias must point at it.
+    assert "baseline_harness_kokkos" in AGENTS
+    assert AGENTS["baseline_harness"] is AGENTS["baseline_harness_kokkos"]
+    # Defend against unrelated stray entries: every non-core key must
+    # be a baseline_harness_<id> entry.
+    extras = set(AGENTS) - core_types
+    for name in extras:
+        assert name.startswith("baseline_harness_"), (
+            f"Unexpected AGENTS entry: {name!r}"
+        )
 
 
 def test_each_entry_has_required_keys():
-    """Every registry entry declares system_prompt, output_schema, model."""
+    """Every registry entry declares system_prompt, output_schema, model, and supports_temperature (the last gates whether run_agent forwards the kwarg — Argo's claude-opus-4-7 rejects it, so the flag is mandatory and not just a default-False sentinel)."""
     for name, spec in AGENTS.items():
         assert "system_prompt" in spec, f"{name} missing system_prompt"
         assert "output_schema" in spec, f"{name} missing output_schema"
         assert "model" in spec, f"{name} missing model"
+        assert "supports_temperature" in spec, (
+            f"{name} missing supports_temperature flag"
+        )
+        assert isinstance(spec["supports_temperature"], bool), (
+            f"{name}.supports_temperature must be a bool, got "
+            f"{type(spec['supports_temperature']).__name__}"
+        )
 
 
 def test_system_prompts_are_nonempty_strings():
