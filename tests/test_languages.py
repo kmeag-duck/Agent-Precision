@@ -1,10 +1,11 @@
 """Tests for workflow.languages — language-profile registry + detection.
 
-Phase B added CUDA as the second language profile. The registry must
-expose both KOKKOS_PROFILE and CUDA_PROFILE, detection by source suffix
-must route `.cu` to CUDA and `.cpp` to Kokkos, and `get_profile_by_id`
-must raise on an unknown id (no silent Kokkos fallback — a typo'd
-`language_id` from the orchestrator must surface as an error).
+Phase B added CUDA as the second language profile. Phase C-1 added HIP
+as the third. The registry must expose all three profiles, detection by
+source suffix must route `.cu` to CUDA, `.hip` to HIP, and `.cpp` to
+Kokkos, and `get_profile_by_id` must raise on an unknown id (no silent
+Kokkos fallback — a typo'd `language_id` from the orchestrator must
+surface as an error).
 
 These tests are pure data assertions on the in-memory PROFILES dict and
 on detect_language() / get_profile_by_id() — no subprocess, no network,
@@ -15,6 +16,7 @@ import pytest
 
 from workflow.languages import (
     CUDA_PROFILE,
+    HIP_PROFILE,
     KOKKOS_PROFILE,
     PROFILES,
     detect_language,
@@ -32,6 +34,12 @@ def test_profiles_contains_kokkos_and_cuda():
     assert "cuda" in PROFILES
     assert PROFILES["kokkos"] is KOKKOS_PROFILE
     assert PROFILES["cuda"] is CUDA_PROFILE
+
+
+def test_profiles_contains_hip():
+    """The PROFILES registry exposes the Phase C-1 HIP profile under its canonical id `hip`, keyed by its own `.id` field — same invariant the kokkos/cuda check applies."""
+    assert "hip" in PROFILES
+    assert PROFILES["hip"] is HIP_PROFILE
 
 
 def test_every_profile_is_a_language_profile_dataclass():
@@ -76,6 +84,24 @@ def test_detect_language_cu_returns_cuda():
     # is what drives the decision, not the body.
     kokkos_shaped = "#include <Kokkos_Core.hpp>\nvoid kernel() {}\n"
     assert detect_language("path/to/kernel.cu", kokkos_shaped) is CUDA_PROFILE
+
+
+def test_detect_language_hip_returns_hip():
+    """A `.hip` source path resolves to HIP_PROFILE via unambiguous suffix match — kernel_source content is not consulted (HIP owns `.hip` exclusively in v0)."""
+    # Source content is deliberately Kokkos-shaped to prove the suffix
+    # is what drives the decision, not the body.
+    kokkos_shaped = "#include <Kokkos_Core.hpp>\nvoid kernel() {}\n"
+    assert detect_language("path/to/kernel.hip", kokkos_shaped) is HIP_PROFILE
+
+
+def test_detect_language_hip_suffix_is_case_insensitive():
+    """`.HIP` (uppercase) resolves to HIP — detect_language normalizes the suffix to lowercase before lookup, so a kernel path's case does not change the routing. Same invariant as the `.CU` case."""
+    assert detect_language("PATH/KERNEL.HIP", "") is HIP_PROFILE
+
+
+def test_detect_language_hip_does_not_inspect_source_for_dot_hip():
+    """For `.hip` inputs HIP's `_detect_from_source` probe is NEVER consulted (the suffix is unambiguous). Empty source still routes to HIP — proves the probe is not on the `.hip` path."""
+    assert detect_language("kernel.hip", "") is HIP_PROFILE
 
 
 def test_detect_language_cpp_returns_kokkos():
@@ -123,6 +149,36 @@ def test_cuda_profile_dynamic_verification_is_true():
     assert KOKKOS_PROFILE.dynamic_verification is True
 
 
+def test_hip_profile_claims_dot_hip_exclusively():
+    """HIP_PROFILE.source_suffixes contains exactly `.hip`; no other registered profile claims that suffix. Mirrors the `.cu`-exclusivity check for CUDA — both are language-owned extensions that bypass the content-probe pass."""
+    assert ".hip" in HIP_PROFILE.source_suffixes
+    hip_claimants = [
+        name for name, p in PROFILES.items() if ".hip" in p.source_suffixes
+    ]
+    assert hip_claimants == ["hip"]
+
+
+def test_hip_profile_does_not_claim_cpp():
+    """HIP_PROFILE deliberately does NOT claim `.cpp` in v0 — real ROCm codebases often use `.cpp` with `#include <hip/hip_runtime.h>`, but supporting that would force a content-probe disambiguation against Kokkos / SYCL / OpenMP-offload, which is deferred until a HIP toolchain is available for smoke testing."""
+    assert ".cpp" not in HIP_PROFILE.source_suffixes
+
+
+def test_hip_profile_driver_filename_is_dot_hip():
+    """HIP_PROFILE.driver_filename is `driver.hip` so the compile and splice tools target the right extension; the Kokkos analogue is `driver.cpp`, CUDA's is `driver.cu`."""
+    assert HIP_PROFILE.driver_filename == "driver.hip"
+
+
+def test_hip_profile_dynamic_verification_is_true():
+    """HIP_PROFILE enables the dynamic-verification chain — same finish-gate behavior as CUDA and Kokkos. The chain is language-agnostic; the profile only chooses the compile command and harness prompt."""
+    assert HIP_PROFILE.dynamic_verification is True
+
+
+def test_hip_profile_id_and_display_name():
+    """HIP_PROFILE.id is the lowercase `hip` token used in PROFILES keys and the orchestrator's `baseline_harness_<id>` tool-name suffix; display_name is the human-readable `HIP C++` shown in logs."""
+    assert HIP_PROFILE.id == "hip"
+    assert HIP_PROFILE.display_name == "HIP C++"
+
+
 # ---------- get_profile_by_id ----------
 
 
@@ -130,6 +186,7 @@ def test_get_profile_by_id_returns_registered_profile():
     """get_profile_by_id resolves each registered id to the corresponding LanguageProfile object."""
     assert get_profile_by_id("kokkos") is KOKKOS_PROFILE
     assert get_profile_by_id("cuda") is CUDA_PROFILE
+    assert get_profile_by_id("hip") is HIP_PROFILE
 
 
 def test_get_profile_by_id_raises_on_unknown_id():
@@ -143,3 +200,4 @@ def test_get_profile_by_id_raises_on_unknown_id():
     assert "rust" in msg
     assert "kokkos" in msg
     assert "cuda" in msg
+    assert "hip" in msg

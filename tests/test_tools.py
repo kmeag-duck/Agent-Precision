@@ -31,10 +31,16 @@ import subprocess
 
 from workflow import tools
 from workflow.languages import cuda as cuda_profile
+from workflow.languages import hip as hip_profile
 from workflow.languages.cuda import (
     ARCH_ENV as CUDA_ARCH_ENV,
     DEFAULT_ARCH as CUDA_DEFAULT_ARCH,
     NVCC,
+)
+from workflow.languages.hip import (
+    ARCH_ENV as HIP_ARCH_ENV,
+    DEFAULT_ARCH as HIP_DEFAULT_ARCH,
+    HIPCC,
 )
 from workflow.tools import (
     DEFAULT_RUN_TIMEOUT_SEC,
@@ -2287,6 +2293,236 @@ def test_splice_rewritten_kernel_cuda_reads_and_writes_dot_cu(
     # The .cpp filename must not appear in either tree.
     assert not (tmp_path / "baselines" / "k" / "rewritten" / "driver.cpp").exists()
     assert not (tmp_path / "baselines" / "k" / "driver.cpp").exists()
+
+    text = out_path.read_text()
+    out_lines = text.split("\n")
+    assert out_lines.count(KERNEL_BEGIN_SENTINEL) == 1
+    assert out_lines.count(KERNEL_END_SENTINEL) == 1
+    begin = out_lines.index(KERNEL_BEGIN_SENTINEL)
+    end = out_lines.index(KERNEL_END_SENTINEL)
+    spliced = "\n".join(out_lines[begin + 1 : end])
+    assert spliced == new_kernel.rstrip("\n")
+
+
+# ---------- HIP profile: compile + splice ----------
+#
+# These tests exercise the HIP language profile (workflow.languages.hip)
+# through the same public tool wrappers as the Kokkos and CUDA tests
+# above. Phase C-1 added HIP as the third profile, so the wrappers must
+# dispatch on `language_id="hip"` to the hipcc command shape, the
+# hipcc-on-PATH preflight, and the `driver.hip` filename.
+#
+# UNIT-TESTED, NOT SMOKE-VALIDATED. There is no HIP toolchain on the
+# development host, so the subprocess.run calls are monkeypatched the
+# same way the CUDA tests monkeypatch nvcc. End-to-end smoke against a
+# real `hipcc` is deferred until a ROCm host is available.
+
+
+def _stage_hip_driver(tmp_path, stem, body="int main(){return 0;}\n"):
+    """Write a placeholder baselines/<stem>/driver.hip under tmp_path."""
+    driver_dir = tmp_path / "baselines" / stem
+    driver_dir.mkdir(parents=True)
+    (driver_dir / "driver.hip").write_text(body)
+    return driver_dir
+
+
+def _stage_hip_baseline_driver(tmp_path, stem, body=_BASELINE_DRIVER_TEMPLATE):
+    """Write a baseline driver.hip at baselines/<stem>/ under tmp_path.
+
+    The body content is the same Kokkos-flavored template the splice
+    tests use; splice_rewritten_kernel only cares about the sentinel
+    lines, not the surrounding C++. What matters here is that the file
+    lives at driver.hip (not driver.cpp or driver.cu), so the HIP
+    profile finds it.
+    """
+    d = tmp_path / "baselines" / stem
+    d.mkdir(parents=True)
+    (d / "driver.hip").write_text(body)
+    return d
+
+
+def test_compile_baseline_driver_hip_invokes_hipcc_with_default_arch(
+    monkeypatch, tmp_path
+):
+    """For language_id='hip', compile_baseline_driver shells out to hipcc with -std=c++17, -O2, --offload-arch=gfx90a by default, and the driver.hip source path."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv(HIP_ARCH_ENV, raising=False)
+    _stage_hip_driver(tmp_path, "vector_add")
+    monkeypatch.setattr(hip_profile.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    captured = {}
+
+    class FakeProc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(cmd, capture_output, text, check):
+        captured["cmd"] = cmd
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = compile_baseline_driver("vector_add", "hip")
+
+    assert result["status"] == "ok"
+    assert result["artifacts"] == ["baselines/vector_add/driver"]
+    cmd = captured["cmd"]
+    assert cmd[0] == HIPCC
+    assert "-std=c++17" in cmd
+    assert "-O2" in cmd
+    assert f"--offload-arch={HIP_DEFAULT_ARCH}" in cmd
+    assert HIP_DEFAULT_ARCH == "gfx90a"  # invariant the docs promise
+    # Driver source is the .hip input, output is baselines/<stem>/driver.
+    assert "baselines/vector_add/driver.hip" in cmd
+    assert "-o" in cmd
+    assert cmd[cmd.index("-o") + 1] == "baselines/vector_add/driver"
+    # The HIP profile must NOT inherit any Kokkos- or CUDA-specific flags.
+    assert "-fopenmp" not in cmd
+    assert "-lkokkoscore" not in cmd
+    assert "-lkokkoscontainers" not in cmd
+    # CUDA's nvcc flag is `-arch=`, NOT `--offload-arch=`. Make sure the
+    # HIP command doesn't accidentally inherit nvcc syntax.
+    assert not any(a.startswith("-arch=") for a in cmd)
+
+
+def test_compile_baseline_driver_hip_honors_arch_env_override(
+    monkeypatch, tmp_path
+):
+    """AGENT_PRECISION_HIP_ARCH=gfx942 replaces the default in the hipcc --offload-arch= flag (gfx942 is MI300; the default is gfx90a for MI200/MI250X)."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv(HIP_ARCH_ENV, "gfx942")
+    _stage_hip_driver(tmp_path, "vector_add")
+    monkeypatch.setattr(hip_profile.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    captured = {}
+
+    class FakeProc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(cmd, capture_output, text, check):
+        captured["cmd"] = cmd
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = compile_baseline_driver("vector_add", "hip")
+
+    assert result["status"] == "ok"
+    cmd = captured["cmd"]
+    assert "--offload-arch=gfx942" in cmd
+    assert f"--offload-arch={HIP_DEFAULT_ARCH}" not in cmd
+
+
+def test_compile_baseline_driver_hip_errors_when_hipcc_missing(
+    monkeypatch, tmp_path
+):
+    """When shutil.which('hipcc') returns None, compile_baseline_driver returns status='error' WITHOUT invoking subprocess.run and the stderr names hipcc. Mirrors the nvcc-missing test for CUDA."""
+    monkeypatch.chdir(tmp_path)
+    # No need to stage a source file — preflight runs before the
+    # source-exists check, so the error must surface from the missing
+    # toolchain alone.
+    monkeypatch.setattr(hip_profile.shutil, "which", lambda name: None)
+
+    def fail_run(*a, **kw):
+        raise AssertionError(
+            "subprocess.run must not be called when hipcc is missing"
+        )
+
+    monkeypatch.setattr(subprocess, "run", fail_run)
+
+    result = compile_baseline_driver("vector_add", "hip")
+
+    assert result["status"] == "error"
+    assert HIPCC in result["stderr"]
+    assert result["artifacts"] == []
+
+
+def test_compile_baseline_driver_hip_errors_when_driver_source_missing(
+    monkeypatch, tmp_path
+):
+    """When the HIP driver source is absent, compile_baseline_driver returns status='error' (no subprocess) and the error names driver.hip (not driver.cpp or driver.cu)."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(hip_profile.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    def fail_run(*a, **kw):
+        raise AssertionError(
+            "subprocess.run must not be called when driver source missing"
+        )
+
+    monkeypatch.setattr(subprocess, "run", fail_run)
+
+    result = compile_baseline_driver("vector_add", "hip")
+
+    assert result["status"] == "error"
+    assert "driver.hip" in result["stderr"]
+    assert "driver.cpp" not in result["stderr"]
+    assert "driver.cu" not in result["stderr"]
+    assert result["artifacts"] == []
+
+
+def test_compile_baseline_driver_hip_result_keys_are_stable(
+    monkeypatch, tmp_path
+):
+    """Every HIP code path returns a dict with exactly {status, stdout, stderr, artifacts} — the uniform schema shared with the Kokkos and CUDA paths."""
+    expected_keys = {"status", "stdout", "stderr", "artifacts"}
+    monkeypatch.chdir(tmp_path)
+
+    # 1) hipcc missing
+    monkeypatch.setattr(hip_profile.shutil, "which", lambda name: None)
+    assert set(compile_baseline_driver("x", "hip").keys()) == expected_keys
+
+    # 2) success
+    monkeypatch.setattr(hip_profile.shutil, "which", lambda name: f"/usr/bin/{name}")
+    _stage_hip_driver(tmp_path, "x")
+
+    class OkProc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: OkProc())
+    assert set(compile_baseline_driver("x", "hip").keys()) == expected_keys
+
+    # 3) compile failure
+    class FailProc:
+        returncode = 2
+        stdout = ""
+        stderr = "boom"
+
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: FailProc())
+    assert set(compile_baseline_driver("x", "hip").keys()) == expected_keys
+
+
+def test_splice_rewritten_kernel_hip_reads_and_writes_dot_hip(
+    monkeypatch, tmp_path
+):
+    """For language_id='hip', splice_rewritten_kernel reads baselines/<stem>/driver.hip and writes baselines/<stem>/rewritten/driver.hip — NOT driver.cpp or driver.cu at either path."""
+    monkeypatch.chdir(tmp_path)
+    _stage_hip_baseline_driver(tmp_path, "k")
+    _ban_subprocess(monkeypatch)
+
+    new_kernel = (
+        "__global__ void kernel(float* x, int n) {\n"
+        "  int i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+        "  if (i < n) x[i] = x[i] * 2.0f;\n"
+        "}\n"
+    )
+
+    result = splice_rewritten_kernel("k", new_kernel, "hip")
+
+    assert result["status"] == "ok"
+    assert result["artifacts"] == ["baselines/k/rewritten/driver.hip"]
+
+    out_path = tmp_path / "baselines" / "k" / "rewritten" / "driver.hip"
+    assert out_path.is_file()
+    # Neither the .cpp nor the .cu filename must appear in either tree.
+    assert not (tmp_path / "baselines" / "k" / "rewritten" / "driver.cpp").exists()
+    assert not (tmp_path / "baselines" / "k" / "rewritten" / "driver.cu").exists()
+    assert not (tmp_path / "baselines" / "k" / "driver.cpp").exists()
+    assert not (tmp_path / "baselines" / "k" / "driver.cu").exists()
 
     text = out_path.read_text()
     out_lines = text.split("\n")

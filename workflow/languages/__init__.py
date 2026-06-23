@@ -22,6 +22,7 @@ from pathlib import Path
 
 from .base import LanguageProfile
 from .cuda import CUDA_PROFILE
+from .hip import HIP_PROFILE
 from .kokkos import KOKKOS_PROFILE
 
 # Ordered registry. Insertion order is the tie-break order in
@@ -34,6 +35,7 @@ from .kokkos import KOKKOS_PROFILE
 PROFILES: dict[str, LanguageProfile] = {
     KOKKOS_PROFILE.id: KOKKOS_PROFILE,
     CUDA_PROFILE.id: CUDA_PROFILE,
+    HIP_PROFILE.id: HIP_PROFILE,
 }
 
 
@@ -93,6 +95,7 @@ __all__ = [
     "PROFILES",
     "KOKKOS_PROFILE",
     "CUDA_PROFILE",
+    "HIP_PROFILE",
     "get_profile_by_id",
     "detect_language",
 ]

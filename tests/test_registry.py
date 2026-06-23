@@ -516,3 +516,157 @@ def test_baseline_harness_kokkos_prompt_does_not_mention_cuda():
     assert "cudaMemcpy" not in prompt
     assert "__global__" not in prompt
     assert "<cuda_runtime.h>" not in prompt
+
+
+# ---------- Baseline harness: HIP profile ----------
+#
+# Phase C-1 added HIP as the third language profile. Its baseline_harness
+# entry is registered under AGENTS["baseline_harness_hip"] by the PROFILES
+# loop in registry.py. These tests mirror the CUDA baseline harness tests
+# above but assert HIP-specific tokens (hipcc, hipMalloc, hipMemcpy,
+# <hip/hip_runtime.h>, hipError_t, hipGetErrorString). The kernel-launch
+# syntax (`kernel<<<...>>>(...)`), the `__global__` qualifier, the splice
+# sentinels, the precision-alias contract, and the staging-buffer rule
+# (`std::remove_const_t<std::remove_pointer_t<...>>`) are shared with the
+# CUDA prompt — HIP mirrors CUDA's C++ extensions.
+#
+# UNIT-TESTED, NOT SMOKE-VALIDATED. There is no HIP toolchain on the
+# development host, so these tests assert prompt content only — no
+# end-to-end driver compilation or execution.
+
+
+def test_baseline_harness_hip_entry_exists():
+    """AGENTS["baseline_harness_hip"] is registered with the same required keys as every other agent entry; the PROFILES loop in registry.py populates it from HIP_PROFILE."""
+    spec = AGENTS["baseline_harness_hip"]
+    assert isinstance(spec["system_prompt"], str)
+    assert spec["system_prompt"].strip()
+    assert spec["output_schema"]["type"] == "object"
+    assert spec["model"]
+    assert spec["supports_temperature"] is False
+
+
+def test_baseline_harness_hip_schema_required_fields():
+    """The HIP baseline_harness schema has the same required fields as the Kokkos and CUDA ones — the downstream comparator and splice tools are language-agnostic, so the submit_result payload shape is shared across profiles."""
+    schema = AGENTS["baseline_harness_hip"]["output_schema"]
+    assert set(schema["required"]) == {
+        "driver_source",
+        "kernel_function_name",
+        "inputs_summary",
+        "output_arrays",
+    }
+    assert schema["properties"]["output_arrays"]["type"] == "array"
+    assert schema["properties"]["output_arrays"]["items"]["type"] == "string"
+
+
+def test_baseline_harness_hip_prompt_mentions_hip_runtime_and_global():
+    """The HIP baseline_harness prompt names <hip/hip_runtime.h> (the canonical include) and __global__ (the kernel qualifier the driver launches) so the model is anchored on the right toolchain — HIP shares CUDA's kernel-language syntax."""
+    prompt = AGENTS["baseline_harness_hip"]["system_prompt"]
+    assert "<hip/hip_runtime.h>" in prompt
+    assert "__global__" in prompt
+
+
+def test_baseline_harness_hip_prompt_mentions_hip_memory_api():
+    """The HIP baseline_harness prompt names hipMalloc and hipMemcpy so the model knows the device-allocation and host<->device transfer API it must use. The cuda* equivalents would silently compile under hipcc on some toolchains via the HIP_PLATFORM_NVIDIA path, so the prompt must steer the model toward the hip* spelling."""
+    prompt = AGENTS["baseline_harness_hip"]["system_prompt"]
+    assert "hipMalloc" in prompt
+    assert "hipMemcpy" in prompt
+
+
+def test_baseline_harness_hip_prompt_mentions_hip_error_handling():
+    """The HIP baseline_harness prompt names hipError_t, hipGetErrorString, hipDeviceSynchronize, and hipGetLastError — the four runtime entry points needed to surface a misconfigured runtime (missing driver, wrong arch) as a clear diagnostic instead of a silent wrong-answer."""
+    prompt = AGENTS["baseline_harness_hip"]["system_prompt"]
+    assert "hipError_t" in prompt
+    assert "hipGetErrorString" in prompt
+    assert "hipDeviceSynchronize" in prompt
+    assert "hipGetLastError" in prompt
+
+
+def test_baseline_harness_hip_prompt_mandates_determinism():
+    """The HIP baseline_harness prompt forbids host-side atomic floating-point ops (non-deterministic), mandates a fixed grid/block launch shape, and requires a fixed RNG seed — the three things needed for the reference to be bit-identical across runs. Same determinism contract as Kokkos and CUDA."""
+    prompt = AGENTS["baseline_harness_hip"]["system_prompt"]
+    # Atomics ban — atomicAdd is the canonical offender on GPU.
+    assert "atomicAdd" in prompt
+    lower = prompt.lower()
+    assert "fixed" in lower
+    assert "seed" in lower
+    assert "fixed" in lower or "reproducible" in lower
+
+
+def test_baseline_harness_hip_prompt_mentions_reference_json_and_format():
+    """The HIP baseline_harness prompt names reference.json (the output file) and requires %.17g formatting so the reference preserves full double precision — same contract as the Kokkos and CUDA prompts."""
+    prompt = AGENTS["baseline_harness_hip"]["system_prompt"]
+    assert "reference.json" in prompt
+    assert "%.17g" in prompt
+
+
+def test_baseline_harness_hip_prompt_mentions_target_kernel_and_no_invented_values():
+    """The HIP baseline_harness prompt names TARGET KERNEL (the disambiguator the orchestrator may prepend) and forbids inventing numerical output values — same contract as the Kokkos and CUDA prompts."""
+    prompt = AGENTS["baseline_harness_hip"]["system_prompt"]
+    assert "TARGET KERNEL" in prompt
+    lower = prompt.lower()
+    assert "do not invent" in lower or "not invent" in lower or "never invent" in lower
+
+
+def test_baseline_harness_hip_prompt_mandates_kernel_splice_sentinels():
+    """The HIP baseline_harness prompt mandates the exact splice sentinels (language-independent contract — splice_rewritten_kernel is shared across profiles)."""
+    prompt = AGENTS["baseline_harness_hip"]["system_prompt"]
+    assert "// ---- KERNEL BEGIN ----" in prompt
+    assert "// ---- KERNEL END ----" in prompt
+
+
+def test_baseline_harness_hip_prompt_mandates_precision_alias_contract():
+    """The HIP baseline_harness prompt mandates the same per-parameter `using <ParamName>Type` alias contract as the Kokkos and CUDA prompts — splice scope is language-independent, so the alias contract is too. Integer parameters are excluded for the same reason."""
+    prompt = AGENTS["baseline_harness_hip"]["system_prompt"]
+    assert "<ParamName>Type" in prompt
+    assert "using" in prompt
+    assert "main()" in prompt
+    lower = prompt.lower()
+    assert "integer parameters" in lower or "integer parameter" in lower
+
+
+def test_baseline_harness_hip_prompt_requires_alias_derived_staging_buffer():
+    """HIP's staging-buffer rule is identical to CUDA's: `std::remove_const_t<std::remove_pointer_t<aType>>` derives the writable pointee type from a `const T*` alias. The prompt must teach this exact idiom; a hardcoded `double* a_nc; hipMalloc(&a_nc, N*sizeof(double))` would break when the rewriter changes the alias to `const float*`. The rule is NOT shared with Kokkos, which uses `typename ...::non_const_value_type` (a View member, not a pointer construct)."""
+    prompt = AGENTS["baseline_harness_hip"]["system_prompt"]
+    assert "remove_const_t" in prompt
+    assert "remove_pointer_t" in prompt
+    normalized = " ".join(prompt.lower().split())
+    assert "do not hardcode" in normalized or "do not" in normalized
+    assert "const" in normalized
+
+
+def test_baseline_harness_hip_prompt_does_not_mention_kokkos():
+    """The HIP baseline_harness prompt must not mention Kokkos-specific tokens — those would mislead the model into emitting a hybrid driver. Cross-prompt isolation is the whole point of having one profile per language."""
+    prompt = AGENTS["baseline_harness_hip"]["system_prompt"]
+    assert "Kokkos::initialize" not in prompt
+    assert "Kokkos::Serial" not in prompt
+    assert "Kokkos::View" not in prompt
+    assert "non_const_value_type" not in prompt
+
+
+def test_baseline_harness_hip_prompt_does_not_mention_cuda_runtime_tokens():
+    """The HIP baseline_harness prompt must not mention CUDA-specific runtime tokens (cudaMalloc, cudaMemcpy, <cuda_runtime.h>, cudaError_t). HIP and CUDA share the kernel-launch syntax and the `__global__` qualifier — those are NOT forbidden — but the runtime API names diverge and mixing them would compile only under the CUDA-backend hipcc path, not under ROCm. Token-level isolation forces the prompt to commit to the HIP spelling."""
+    prompt = AGENTS["baseline_harness_hip"]["system_prompt"]
+    assert "cudaMalloc" not in prompt
+    assert "cudaMemcpy" not in prompt
+    assert "<cuda_runtime.h>" not in prompt
+    assert "cudaError_t" not in prompt
+    assert "cudaGetErrorString" not in prompt
+    assert "cudaDeviceSynchronize" not in prompt
+
+
+def test_baseline_harness_kokkos_prompt_does_not_mention_hip():
+    """Mirror of the HIP isolation test: the Kokkos baseline_harness prompt must not mention HIP-specific runtime tokens. Together with the CUDA-isolation analogue, defends against accidental cross-contamination across all three profiles."""
+    prompt = AGENTS["baseline_harness_kokkos"]["system_prompt"]
+    assert "hipMalloc" not in prompt
+    assert "hipMemcpy" not in prompt
+    assert "<hip/hip_runtime.h>" not in prompt
+    assert "hipError_t" not in prompt
+
+
+def test_baseline_harness_cuda_prompt_does_not_mention_hip():
+    """Mirror of the HIP isolation test for the CUDA prompt — CUDA-side defence against accidentally inheriting HIP runtime tokens. The CUDA prompt was written first and HIP cloned its structure, so this guards against future drift in either direction."""
+    prompt = AGENTS["baseline_harness_cuda"]["system_prompt"]
+    assert "hipMalloc" not in prompt
+    assert "hipMemcpy" not in prompt
+    assert "<hip/hip_runtime.h>" not in prompt
+    assert "hipError_t" not in prompt
