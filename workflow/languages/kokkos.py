@@ -170,6 +170,36 @@ same kernel is compared.
 You do NOT compile, run, or simulate the kernel. You do NOT invent
 numerical output values. Your only output is the driver source.
 
+BASELINE PRECISION directive. The task message may include a line of
+the form `BASELINE PRECISION: <token>` where `<token>` is one of
+`double`, `float`, or `quad`. If absent, default to `double`. The
+directive selects the storage precision of every floating-point
+quantity the driver constructs that flows into the kernel (RHS of
+every per-parameter `using <ParamName>Type = ...;` alias defined
+below) AND the precision of the values written to reference.json.
+
+  - `double`: aliases resolve to `double` / `Kokkos::View<double*>`;
+    JSON values written with `"%.17g"` (the historical default).
+  - `float`: aliases resolve to `float` / `Kokkos::View<float*>`;
+    JSON values written with `"%.9g"`.
+  - `quad`: aliases resolve to `__float128` /
+    `Kokkos::View<__float128*>`; the driver `#include <quadmath.h>`
+    and writes JSON values via `quadmath_snprintf(buf, sizeof(buf),
+    "%.34Qg", value)` (NOT via `snprintf` / `<<`, which do not
+    understand `__float128`). The compile step that follows expects
+    `-lquadmath` on the link line; you do not emit the compile
+    command, but the host-scratch helpers you write (RNG fill,
+    deep_copy targets) must therefore use `__float128` end-to-end
+    rather than down-converting through `double` mid-driver. Local
+    `std::uniform_real_distribution<...>` returns `double` — convert
+    explicitly with `static_cast<__float128>(...)` when storing into
+    the alias-typed view.
+
+The directive does NOT change the kernel function body. It changes
+the alias RHSes (item 6 below), the JSON output formatting (item 8),
+and any host-side scratch values that ultimately become kernel
+arguments.
+
 Hard requirements on the driver:
 
 1. Single translation unit. Inline the kernel source verbatim into the
@@ -198,9 +228,25 @@ Hard requirements on the driver:
    reproducibility constraint: parallel reductions are order-dependent
    and would make the baseline non-deterministic.
 
-3. Seed any RNG with a fixed integer (use 42 unless the kernel's
-   apparent domain demands otherwise). The driver must produce the same
-   numbers on every run.
+3. Seed any RNG with a fixed integer. The driver must produce the
+   same numbers on every run.
+
+   The seed MUST be exposed as a single named C++ constant, written
+   verbatim on its own line near the top of the driver (above the
+   '// ---- KERNEL BEGIN ----' sentinel, so the seed declaration is
+   NOT inside the splice region):
+
+       static constexpr int RNG_SEED = 42;
+
+   Use `42` unless the kernel's apparent domain demands otherwise. The
+   declaration line must match this shape exactly (the tokens
+   `static`, `constexpr`, `int`, `RNG_SEED`, `=`, the integer literal,
+   `;`, in that order, separated by single spaces, no trailing
+   comment) so a later probe-pipeline tool can deterministically find
+   and replace the integer literal to re-run the driver at a different
+   seed without touching the kernel body. Every other reference to the
+   seed in the driver (RNG construction, the JSON 'seed' field) MUST
+   read `RNG_SEED` rather than re-typing the integer.
 
 4. Choose modest input sizes and distributions appropriate to the
    kernel from its signature and apparent scientific domain. Aim for a
@@ -285,19 +331,21 @@ Hard requirements on the driver:
    before iterating them for JSON emission.
 
 8. Write the reference output to './reference.json' (relative to the
-   driver's working directory) using std::ofstream and "%.17g"
-   formatting for floating-point values. Do NOT pull in a third-party
-   JSON library — hand-roll the writer; output arrays are flat arrays
-   of doubles, so a few loops with manual braces, commas, and newlines
-   are sufficient.
+   driver's working directory) using std::ofstream. Floating-point
+   formatting depends on the BASELINE PRECISION directive: `%.17g`
+   for `double`, `%.9g` for `float`, `quadmath_snprintf("%.34Qg", ...)`
+   for `quad`. Do NOT pull in a third-party JSON library — hand-roll
+   the writer; output arrays are flat arrays of one floating-point
+   type, so a few loops with manual braces, commas, and newlines are
+   sufficient.
 
 9. The JSON document must have exactly this shape:
 
        {
          "kernel": "<kernel_function_name>",
-         "seed": <integer seed>,
+         "seed": <integer seed, value of RNG_SEED>,
          "inputs": { "N": <int>, ... },
-         "outputs": { "<name>": [ <double>, ... ], ... }
+         "outputs": { "<name>": [ <floating-point>, ... ], ... }
        }
 
    "inputs" carries enough metadata for a human reader to understand
@@ -332,6 +380,19 @@ KOKKOS_PROFILE = LanguageProfile(
     build_compile_command=_build_compile_command,
     preflight=_preflight,
     detect_from_source=_detect_from_source,
+    # v1 probe pipeline. The baseline is quad (highest available
+    # precision via libquadmath) so the probe measures float / double
+    # drift against true ground truth rather than against a same-or-
+    # lower-precision reference. probe_precisions enumerates the
+    # additional configurations the probe runs before invoking the
+    # analyst; `mixed_io` keeps outputs at baseline precision but
+    # downcasts intermediates to float, giving the analyst a coarse
+    # signal on output-vs-intermediate sensitivity without per-variable
+    # instrumentation. Kokkos is the only v1 profile with a populated
+    # probe set; CUDA/HIP/SYCL/OMP-offload remain `probe_precisions=()`
+    # until the deferred Commit 6 lands.
+    baseline_precision="quad",
+    probe_precisions=("quad", "double", "float", "mixed_io"),
 )
 
 

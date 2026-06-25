@@ -78,6 +78,8 @@ def test_every_profile_is_a_language_profile_dataclass():
         "build_compile_command",
         "preflight",
         "detect_from_source",
+        "probe_precisions",
+        "baseline_precision",
     )
     for name, profile in PROFILES.items():
         assert isinstance(profile, LanguageProfile), (
@@ -95,6 +97,57 @@ def test_profiles_keys_match_their_id_field():
         assert key == profile.id, (
             f"PROFILES key {key!r} does not match profile.id {profile.id!r}"
         )
+
+
+# ---------- Probe-pipeline fields (v1) ----------
+#
+# v1 added two new LanguageProfile fields driving the pre-analyst
+# probe pipeline (commits 1-5 of the v1 series). Kokkos is the only
+# profile populated in v1 — quad is available via libquadmath under
+# Kokkos::Serial, but no equivalent shipped library exists on
+# CUDA/HIP/SYCL/OMP-offload, so those profiles keep the defaults
+# (`probe_precisions=()`, `baseline_precision="double"`) until the
+# deferred Commit 6 lands. The defaults make non-Kokkos profiles
+# behave exactly as they did in v0: empty probe_precisions means the
+# orchestrator skips the probe step entirely, and `double` matches
+# the historical baseline behavior.
+
+
+def test_kokkos_profile_baseline_precision_is_quad():
+    """KOKKOS_PROFILE.baseline_precision == 'quad' so the probe measures float/double drift against true ground truth rather than against a same-precision reference; without this the float-vs-double signal collapses to zero on kernels whose true output IS the double answer."""
+    assert KOKKOS_PROFILE.baseline_precision == "quad"
+
+
+def test_kokkos_profile_probe_precisions_v1_set():
+    """KOKKOS_PROFILE.probe_precisions == ('quad', 'double', 'float', 'mixed_io'); these are the four probe configurations the orchestrator runs (per seed) before invoking the analyst. The `quad` entry runs the baseline configuration as a self-consistency check; `double` and `float` measure drift; `mixed_io` (outputs at baseline precision, intermediates at float) gives the analyst a coarse signal on output-vs-intermediate sensitivity without per-variable instrumentation."""
+    assert KOKKOS_PROFILE.probe_precisions == (
+        "quad",
+        "double",
+        "float",
+        "mixed_io",
+    )
+
+
+def test_non_kokkos_profiles_have_default_probe_fields():
+    """CUDA / HIP / SYCL / OMP-offload all keep the v0-compatible defaults: empty `probe_precisions` (orchestrator skips the probe entirely) and `baseline_precision='double'` (matches the historical baseline). Deferred Commit 6 will lift these to populated probe sets, but v1 ships Kokkos-only probe support."""
+    for profile in (CUDA_PROFILE, HIP_PROFILE, SYCL_PROFILE, OMP_OFFLOAD_PROFILE):
+        assert profile.probe_precisions == (), (
+            f"{profile.id} has non-empty probe_precisions={profile.probe_precisions!r}; "
+            f"v1 only populates Kokkos"
+        )
+        assert profile.baseline_precision == "double", (
+            f"{profile.id} has baseline_precision={profile.baseline_precision!r}; "
+            f"v1 only changes Kokkos's baseline"
+        )
+
+
+def test_language_profile_probe_field_defaults():
+    """The LanguageProfile dataclass itself provides safe defaults (`probe_precisions=()`, `baseline_precision='double'`) so a future profile that does not opt into the probe pipeline can omit both fields entirely; without this default a new profile would have to know about probe machinery just to be defined."""
+    import dataclasses
+
+    fields = {f.name: f for f in dataclasses.fields(LanguageProfile)}
+    assert fields["probe_precisions"].default == ()
+    assert fields["baseline_precision"].default == "double"
 
 
 # ---------- Source-suffix detection ----------

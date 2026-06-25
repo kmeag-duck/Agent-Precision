@@ -134,6 +134,35 @@ class LanguageProfile:
                           usage) rather than bare substrings, to avoid
                           comment false positives. Return True iff the
                           file is unambiguously this language.
+
+      probe_precisions    Tuple of precision tokens this profile's probe
+                          pipeline (v1) will run before invoking the
+                          analyst. Each token names a storage precision
+                          for the kernel's parameters / intermediates
+                          (`"quad"`, `"double"`, `"float"`, and the
+                          special `"mixed_io"` which keeps outputs at
+                          `baseline_precision` and downcasts
+                          intermediates to float). An empty tuple (the
+                          default for v1) means "no probe for this
+                          profile" — the orchestrator skips the probe
+                          step entirely. Only Kokkos populates this in
+                          v1; CUDA/HIP/SYCL/OMP-offload remain
+                          probe-less until the deferred Commit 6 lands.
+
+      baseline_precision  Precision token for the baseline driver
+                          itself, i.e. the one the
+                          baseline_harness agent emits and that
+                          compare_outputs measures everything else
+                          against. `"double"` for v1 profiles other
+                          than Kokkos (which uses `"quad"` to give the
+                          probe a true ground truth, since float-vs-
+                          double drift is invisible when the baseline
+                          is itself double). Threaded into the
+                          BASELINE PRECISION line of the harness's
+                          user message so the harness writes a driver
+                          of the requested precision; profiles that
+                          want a precision other than `"double"` must
+                          carry prompt text that honors the directive.
     """
 
     id: str
@@ -149,6 +178,8 @@ class LanguageProfile:
     detect_from_source: Callable[[str], bool]
     sentinel_begin: str = DEFAULT_SENTINEL_BEGIN
     sentinel_end: str = DEFAULT_SENTINEL_END
+    probe_precisions: tuple[str, ...] = ()
+    baseline_precision: str = "double"
 
 
 __all__ = [

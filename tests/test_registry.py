@@ -309,6 +309,69 @@ def test_baseline_harness_prompt_mandates_kernel_splice_sentinels():
     assert "// ---- KERNEL END ----" in prompt
 
 
+# ---------- v1 probe-pipeline contracts (BASELINE PRECISION + RNG_SEED) ----------
+#
+# v1 added two new contracts to the Kokkos baseline harness so the
+# probe pipeline (a later commit) can drive the same harness output at
+# different precisions and seeds without re-asking the LLM.
+#
+# (1) BASELINE PRECISION directive: an optional user-message line
+#     `BASELINE PRECISION: <token>` (token in {double, float, quad})
+#     that selects the storage type for all kernel-bound floating-
+#     point values and the JSON output format. Absent -> double
+#     (historical default). `quad` requires __float128 +
+#     <quadmath.h> + quadmath_snprintf "%.34Qg" and changes the
+#     compile link line (the compile step adds -lquadmath when the
+#     emitted source contains __float128).
+#
+# (2) Named RNG_SEED constant: the harness must declare the seed as
+#     `static constexpr int RNG_SEED = <N>;` on its own line above
+#     the KERNEL BEGIN sentinel (so the splice tool does not touch
+#     it) and reference RNG_SEED everywhere the integer was
+#     previously inlined. This shape lets a later probe tool
+#     deterministically find and rewrite the integer literal to
+#     re-run the driver at a different seed.
+
+
+def test_baseline_harness_prompt_honors_baseline_precision_directive():
+    """The Kokkos baseline harness prompt explains the optional `BASELINE PRECISION: <token>` user-message directive (token in {double, float, quad}) and defines what each token means for alias RHSes, JSON output format, and the `quad` case's __float128 / quadmath_snprintf machinery. Without this contract the probe pipeline cannot drive the same harness at different precisions; without the explicit `quad` instructions the harness would silently fall back to `double` (the historical default) and the probe's true-ground-truth signal would collapse."""
+    prompt = AGENTS["baseline_harness"]["system_prompt"]
+    # The directive name and the three legal tokens are spelled out.
+    assert "BASELINE PRECISION" in prompt
+    assert "double" in prompt and "float" in prompt and "quad" in prompt
+    # The quad branch's load-bearing tokens — without these the harness
+    # cannot actually emit a quad driver that compiles or formats JSON.
+    assert "__float128" in prompt
+    assert "quadmath.h" in prompt
+    assert "quadmath_snprintf" in prompt
+    assert "%.34Qg" in prompt
+    # The float branch's JSON format token (so the JSON file isn't
+    # over-precise for the precision actually computed).
+    assert "%.9g" in prompt
+
+
+def test_baseline_harness_prompt_mandates_named_rng_seed_constant():
+    """The Kokkos baseline harness prompt mandates a single `static constexpr int RNG_SEED = <N>;` declaration on its own line above the KERNEL BEGIN sentinel (so it sits OUTSIDE the splice region and survives a kernel-body rewrite) and requires every other seed reference (RNG construction, JSON 'seed' field) to read RNG_SEED rather than re-typing the integer. Without the exact declaration shape and out-of-sentinel placement the probe pipeline cannot deterministically rewrite the seed line to re-run the driver at a different seed."""
+    prompt = AGENTS["baseline_harness"]["system_prompt"]
+    # The exact declaration shape — the probe-pipeline splicer matches
+    # this prefix verbatim. If you change the spelling here, change it
+    # in the probe tool together with this assertion.
+    assert "static constexpr int RNG_SEED = 42;" in prompt
+    # Placement: above the KERNEL BEGIN sentinel (so the kernel-body
+    # splicer does not touch it).
+    normalized = " ".join(prompt.lower().split())
+    assert (
+        "above the '// ---- kernel begin ----' sentinel" in normalized
+        or "above the kernel begin sentinel" in normalized
+        or "not inside the splice region" in normalized
+    )
+    # The "every other reference reads RNG_SEED" half — without this
+    # the driver could declare RNG_SEED and still hardcode 42 in the
+    # RNG constructor or JSON, defeating the probe's seed swap.
+    assert "RNG_SEED" in prompt
+    assert prompt.count("RNG_SEED") >= 3  # decl + RNG ref + JSON ref
+
+
 # ---------- Precision-alias contract (Option 4 splice-scope fix) ----------
 #
 # The splice tool replaces only the text between the kernel sentinels.
