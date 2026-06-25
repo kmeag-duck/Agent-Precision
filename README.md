@@ -45,6 +45,7 @@ What works today:
 
 - Core pipeline `(precision_advisor →)? analyst → rewriter → verifier`. `finish` is gated in **code** (not just in the system prompt) on the most recent `spawn_verifier` returning `verdict='accept'`; on a Kokkos `.cpp` input, `finish` additionally requires the most recent `compare_outputs` to have returned `status='ok'` for the current rewrite cycle. A premature `finish` is turned into a synthetic `{status:'error', is_error:true}` tool result naming what's missing, so the orchestrator can self-correct without exiting.
 - Dynamic verification chain (any profile whose `LanguageProfile.dynamic_verification` is `True` — currently all five): **harness → compile → run → splice → compile_rewritten → run_rewritten → compare_outputs**, ending in a tolerance check that gates `finish`. The five LLM agents are reused as-is; the six deterministic (non-LLM) tools in `workflow/tools.py` (`compile_baseline_driver`, `run_baseline_driver`, `splice_rewritten_kernel`, `compile_rewritten_driver`, `run_rewritten_driver`, `compare_outputs`) all return the uniform `{status, stdout, stderr, artifacts}` shape. `baseline_harness` writes `baselines/<kernel_stem>/<driver_filename>` (`.cpp` for Kokkos/SYCL/OpenMP-offload, `.cu` for CUDA, `.hip` for HIP); the baseline compile/run trio produces `baselines/<kernel_stem>/{driver, reference.json}`; the rewritten chain (splice → compile_rewritten → run_rewritten) produces `baselines/<kernel_stem>/rewritten/{driver.<ext>, driver, reference.json}` from the rewriter's output without ever touching the baseline tree; `compare_outputs` diffs the two `reference.json` files under the same `tolerance_json` that was passed to `spawn_verifier` and writes `baselines/<kernel_stem>/rewritten/comparison.json` on both pass and fail paths. Kokkos is smoke-validated end-to-end; CUDA is smoke-validated through the comparator step (on `vector_add.cu --sig-figs 6 --auto`); HIP, SYCL, and OpenMP-offload ship unit-tested only — no host with the respective toolchain (`hipcc`, `icpx`/`clang++ -fsycl`, `clang++ -fopenmp -fopenmp-targets=...`) was available at implementation time.
+- Probe pipeline (any profile whose `LanguageProfile.probe_precisions` is non-empty — currently Kokkos only): a pre-analyst empirical sweep that runs the kernel under 4 precisions (`quad`, `double`, `float`, `mixed_io`) × 2 RNG seeds (`{42, 43}`) and feeds the per-output statistics into the analyst's task as a descriptive evidence block (no verdict hints — see `_format_probe_evidence_for_analyst` in `orchestrator.py`). Two new deterministic tools in `workflow/tools.py` — `probe_step` (fused compile+run per cell; 8 calls per Kokkos kernel) and `probe_compare` (aggregates the 8 references against `quad_seed42` ground truth) — both return the same `{status, stdout, stderr, artifacts}` shape as the dynamic-verification tools and write under `baselines/<kernel_stem>/probe/`. Probe failures are non-fatal: only a missing `quad_seed42` cell hard-errors; every other per-cell error is reported by `probe_compare` and the analyst still runs. Opt out with `--no-probe`; CUDA / HIP / SYCL / OMP-offload silently skip the probe regardless. See `AGENTS.md` ("Probe pipeline") for the contract.
 - Tolerance from `--sig-figs` / `--decimal-digits`, else inferred by the advisor; advisor may return `kind='unknown'`, which triggers fallback `{sig_figs: 6, source: 'advisor_unknown_defaulted'}`.
 - Tolerance threaded verbatim to analyst, rewriter, and verifier; analyst returns a `precision_budget` block; verifier audits it.
 - Per-variable methods: `downcast` (narrower hardware type — the throughput win), `emulate` (software pair, currently inline float-float / Dekker — throughput-NEGATIVE; only when downcast violates tolerance), or `keep`. Analyst can additionally suggest a kernel-shape `rework` such as Kahan summation.
@@ -159,6 +160,15 @@ sequenceDiagram
   User->>Orch: y
   Orch->>Det: ./driver (cwd=baselines/<stem>)
   Det-->>Orch: {status:'ok', artifacts:[baselines/<stem>/reference.json]}
+  Note over Orch: Kokkos + no --no-probe: 8× probe_step then 1× probe_compare<br/>(skipped on non-Kokkos / --no-probe)
+  Orch->>User: HITL: probe_step(stem, precision, seed)? ×8
+  User->>Orch: y
+  Orch->>Det: compile+run probe/<precision>_seed<N>/driver
+  Det-->>Orch: {status:'ok', artifacts:[probe/<precision>_seed<N>/reference.json]}
+  Orch->>User: HITL: probe_compare(kernel_stem)?
+  User->>Orch: y
+  Orch->>Det: aggregate 8 references vs quad_seed42
+  Det-->>Orch: {status:'ok', artifacts:[baselines/<stem>/probe/evidence.json]}
   Orch->>User: HITL: spawn_analyst(kernel_source + tolerance)?
   User->>Orch: y
   Orch->>An: kernel_source + tolerance block
@@ -286,19 +296,26 @@ profile contracts (precision aliases, env vars, language probes).
 | `compile_rewritten_driver` | `g++` the spliced rewritten driver (deterministic, non-LLM) | `kernel_stem: string` (at most once per accepted verifier verdict; only after a successful `splice_rewritten_kernel` with same stem; needs `AGENT_PRECISION_KOKKOS_ROOT`) | `{status, stdout, stderr, artifacts}` (artifacts = `[baselines/<stem>/rewritten/driver]` on success, `[]` otherwise), or `{"status":"rejected_by_user"}` |
 | `run_rewritten_driver`     | exec the rewritten driver to capture its reference output (deterministic, non-LLM; never touches the baseline tree) | `kernel_stem: string` (at most once per accepted verifier verdict; only after a successful `compile_rewritten_driver` with same stem; bounded by `AGENT_PRECISION_RUN_TIMEOUT_SEC`) | `{status, stdout, stderr, artifacts}` (artifacts = `[baselines/<stem>/rewritten/reference.json]` on success, `[]` otherwise), or `{"status":"rejected_by_user"}` |
 | `compare_outputs`          | numerically diff baseline vs rewritten `reference.json` under tolerance; gates `finish` on `.cpp` (deterministic, non-LLM; no subprocess) | `kernel_stem: string`, `tolerance_json: string` (same `{kind,value,source}` string passed to `spawn_verifier`; at most once per accepted verifier verdict; only after a successful `run_rewritten_driver`) | `{status, stdout, stderr, artifacts}` (artifacts = `[baselines/<stem>/rewritten/comparison.json]` on both pass and fail; `status='ok'` iff every value agrees and no shape mismatch), or `{"status":"rejected_by_user"}` |
+| `probe_step`               | fused compile+run of one per-(precision, seed) probe driver (deterministic, non-LLM; Kokkos only in v0; not finish-gating) | `kernel_stem: string`, `precision: string` (one of `LanguageProfile.probe_precisions`), `seed: integer` (one of `_PROBE_SEEDS = (42, 43)`); 8 calls per Kokkos run; only after a successful `run_baseline_driver` with same stem; `language_id` is injected by `_execute_tool`, never passed by the LLM | `{status, stdout, stderr, artifacts}` (artifacts = `[baselines/<stem>/probe/<precision>_seed<N>/reference.json]` on success, `[]` otherwise), or `{"status":"rejected_by_user"}` |
+| `probe_compare`            | aggregate the 8 probe references into `evidence.json` for the next `spawn_analyst` (deterministic, non-LLM; no subprocess; Kokkos only in v0; not finish-gating) | `kernel_stem: string`; one call per Kokkos run; only after all 8 `probe_step` calls; `language_id` is injected by `_execute_tool`, never passed by the LLM | `{status, stdout, stderr, artifacts}` (artifacts = `[baselines/<stem>/probe/evidence.json]`; only a missing `quad_seed42` cell hard-errors — every other per-cell problem is reported per-entry in `evidence.json`), or `{"status":"rejected_by_user"}` |
 | `finish`                   | end the workflow              | `rewritten_code`, `notes`                                                                                                      | (terminates; nothing fed back) — but the orchestrator's `_FinishGateState` blocks the call (with a synthetic `is_error` tool result) until the gate is satisfied: verifier `verdict='accept'`, plus `compare_outputs status='ok'` for any profile with `dynamic_verification=True` (currently all five) |
 
 The orchestrator's system prompt enforces that `spawn_precision_advisor`
 is called at most once, only when the CLI passed no tolerance, and only
 before `spawn_analyst`; that exactly one `spawn_baseline_harness_<id>`
 tool exists per run (the one matching the resolved
-`LanguageProfile.id`) and is called at most once; and that the
+`LanguageProfile.id`) and is called at most once; that the
 seven-step deterministic chain — `compile_baseline_driver` →
 `run_baseline_driver` → `splice_rewritten_kernel` →
 `compile_rewritten_driver` → `run_rewritten_driver` → `compare_outputs`
 — each fires at most once per accepted verifier verdict, only as the
 deterministic follow-up to a successful preceding step, and always with
-the same `kernel_stem`. Those rules are trusted to the orchestrator
+the same `kernel_stem`; and that on profiles whose
+`LanguageProfile.probe_precisions` is non-empty (Kokkos in v0) the
+probe pipeline runs once between `run_baseline_driver` and
+`spawn_analyst` — 8× `probe_step` (one per (precision, seed) cell)
+followed by 1× `probe_compare` — unless `--no-probe` is passed. The
+probe is NOT finish-gating. Those rules are trusted to the orchestrator
 LLM. Three things are policed in Python instead: (1) the filesystem
 write for `spawn_baseline_harness_<id>` and the splice writes both
 compute their paths from the orchestrator-supplied `kernel_stem` (not
