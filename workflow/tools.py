@@ -73,6 +73,43 @@ Currently exposes:
     comparison.json artifact is written under the rewritten subtree on
     both pass and fail paths. Pure file + arithmetic I/O; no
     subprocess, no env-var contract.
+
+  - probe_step(kernel_stem, precision, seed, language_id): the
+    workhorse of the v1 probe pipeline. Reads the per-precision
+    driver template at baselines/<kernel_stem>/probe/<precision>/
+    driver.cpp (written by spawn_baseline_harness via the v1
+    4-driver schema), rewrites the named RNG_SEED constant to the
+    requested seed, writes the result into a per-(precision, seed)
+    sibling directory at baselines/<kernel_stem>/probe/
+    <precision>_seed<seed>/, then compiles and runs that copy by
+    reusing _compile_driver and _run_driver. The per-(precision,
+    seed) directory keeps the harness-written seed=42 template
+    untouched so subsequent probe_step calls always rewrite from a
+    clean baseline. On success, artifacts is the single-element
+    list ["baselines/<stem>/probe/<precision>_seed<seed>/
+    reference.json"]; on any failure (missing template, RNG_SEED
+    line not found or non-unique, compile/run error) the standard
+    error result is returned. Like the baseline run, a probe_step
+    failure is non-fatal to the surrounding pipeline -- the missing
+    cell is recorded by probe_compare and the analyst still runs.
+
+  - probe_compare(kernel_stem, language_id): aggregates the 8
+    per-(precision, seed) reference.json files written by probe_step
+    into a single evidence.json document at baselines/<kernel_stem>/
+    probe/evidence.json that the analyst prompt addendum consumes.
+    For each (precision, seed) cell it records a status (ok /
+    missing / load_error / shape_error) so the analyst sees which
+    signals are real, and for every cell that has an `ok` partner
+    quad-same-seed cell it computes per-output stats vs the quad
+    ground truth (max-absrel error, mean-absrel error, max-absolute
+    error, count of finite mismatches). It also computes per-output
+    cross-seed deltas (how much the per-precision max-absrel error
+    changes between seed 42 and seed 43) so the analyst can tell
+    seed-correlated precision pain from seed-independent precision
+    pain. The tool itself hard-errors only when the quad ground
+    truth for the canonical seed (42) is missing -- otherwise it
+    reports whatever cells are present. Pure file + arithmetic
+    I/O; no subprocess.
 """
 
 from __future__ import annotations
@@ -80,6 +117,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import subprocess
 from pathlib import Path
 from typing import Iterator
@@ -1004,4 +1042,507 @@ def compare_outputs(
         "stdout": "",
         "stderr": "\n".join(stderr_lines),
         "artifacts": [str(comparison_path)],
+    }
+
+
+# ---------- probe_step / probe_compare: v1 probe pipeline ----------
+
+# RNG_SEED contract regex. The baseline_harness prompt mandates the
+# seed appear EXACTLY as `static constexpr int RNG_SEED = <int>;` on
+# its own line above the KERNEL BEGIN sentinel (so the splice tool
+# never touches it). probe_step rewrites the integer to the requested
+# seed; we keep the regex tight (multiline-anchored ^...;$) so a stray
+# match inside a comment or string can't accidentally be rewritten,
+# and we require exactly one match per driver so a malformed harness
+# output (zero or multiple RNG_SEED lines) fails loudly rather than
+# silently driving the probe with the wrong seed.
+_RNG_SEED_LINE_RE = re.compile(
+    r"^static constexpr int RNG_SEED = \d+;$",
+    re.MULTILINE,
+)
+
+
+def _rewrite_rng_seed(source: str, seed: int) -> tuple[str | None, str | None]:
+    """Rewrite the unique RNG_SEED line in `source` to `seed`.
+
+    Returns `(new_source, None)` on success or `(None, error_msg)` on
+    any contract violation. Used by probe_step to retarget a
+    per-precision driver template (harness-written with seed=42) at a
+    different seed without re-asking the LLM. The new_source preserves
+    the rest of the file byte-for-byte: only the integer literal
+    inside the matched RNG_SEED line is changed, so the splice
+    sentinels, alias block, kernel body, and main() are all preserved
+    exactly.
+    """
+    matches = _RNG_SEED_LINE_RE.findall(source)
+    if len(matches) == 0:
+        return (None, (
+            "Driver source has no `static constexpr int RNG_SEED = "
+            "<int>;` line on its own (required by the baseline_harness "
+            "RNG_SEED contract)."
+        ))
+    if len(matches) > 1:
+        return (None, (
+            f"Driver source has {len(matches)} `static constexpr int "
+            f"RNG_SEED = <int>;` lines; the RNG_SEED contract requires "
+            f"exactly one so the seed-rewrite is unambiguous."
+        ))
+    new_source = _RNG_SEED_LINE_RE.sub(
+        f"static constexpr int RNG_SEED = {seed};",
+        source,
+        count=1,
+    )
+    return (new_source, None)
+
+
+def probe_step(
+    kernel_stem: str,
+    precision: str,
+    seed: int,
+    language_id: str,
+) -> dict:
+    """Seed-rewrite, compile, and run one per-(precision, seed) probe driver.
+
+    The probe pipeline runs the baseline_harness-emitted per-precision
+    drivers across a small set of seeds to give the analyst evidence
+    about how the kernel responds to precision changes -- the analyst
+    is otherwise reasoning from source only. probe_step is the
+    workhorse: one call per (precision, seed) cell, fused
+    seed-rewrite + compile + run so we do not multiply the HITL
+    approval count by 3.
+
+    Reads `baselines/<kernel_stem>/probe/<precision>/driver.cpp` (the
+    template the v1 baseline_harness wrote alongside the canonical
+    baseline; see workflow.orchestrator._execute_tool's
+    spawn_baseline_harness branch and the test that pins the layout).
+    Rewrites the unique `static constexpr int RNG_SEED = <int>;` line
+    to the requested `seed` and writes the result to
+    `baselines/<kernel_stem>/probe/<precision>_seed<seed>/driver.cpp`.
+    Then reuses _compile_driver and _run_driver against that sibling
+    directory so the compile artifact, the run subprocess, and the
+    `reference.json` all land inside it -- the template directory
+    stays untouched so re-invocations always start from a clean
+    seed=42 source.
+
+    `precision` is one of the keys the harness emitted (currently
+    quad / double / float / mixed_io for the Kokkos profile). `seed`
+    is an int; the v1 orchestrator drives {42, 43}. The result has
+    the uniform {status, stdout, stderr, artifacts} shape; on
+    success, `artifacts` is the single-element list
+    ["baselines/<kernel_stem>/probe/<precision>_seed<seed>/reference.json"].
+    A failure at any step (missing template, malformed RNG_SEED,
+    compile error, run timeout, missing or invalid reference.json)
+    returns status='error' with a descriptive stderr; probe_compare
+    records the failed cell as `missing` or `error` so the analyst
+    still gets whatever signal is available.
+
+    `language_id` is accepted for call-shape symmetry with the rest
+    of the dynamic-verification chain and is validated (an unknown
+    id errors here, not silently). v1 only emits probe templates for
+    profiles with non-empty `probe_precisions` (Kokkos in v1); the
+    deferred Commit 6 extends this to CUDA / HIP / SYCL / OMP-offload.
+    """
+    profile = _resolve_profile(language_id)
+
+    if not isinstance(seed, int) or isinstance(seed, bool):
+        return _error(
+            f"seed must be an int; got {type(seed).__name__} ({seed!r})."
+        )
+    if not precision or not isinstance(precision, str):
+        return _error(
+            f"precision must be a non-empty string; got {precision!r}."
+        )
+
+    template_dir = (
+        Path("baselines") / kernel_stem / "probe" / precision
+    )
+    template_src = template_dir / profile.driver_filename
+    if not template_src.is_file():
+        return _error(
+            f"Probe driver template not found at {template_src}. Did "
+            f"spawn_baseline_harness run and emit a `drivers.{precision}` "
+            f"key for this kernel_stem? (The v1 harness writes one "
+            f"template per precision under baselines/<stem>/probe/"
+            f"<precision>/.)"
+        )
+
+    try:
+        template_text = template_src.read_text()
+    except OSError as exc:
+        return _error(f"Failed to read {template_src}: {exc}")
+
+    rewritten, err = _rewrite_rng_seed(template_text, seed)
+    if err is not None:
+        return _error(f"In {template_src}: {err}")
+
+    target_dir = (
+        Path("baselines") / kernel_stem / "probe" / f"{precision}_seed{seed}"
+    )
+    target_src = target_dir / profile.driver_filename
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target_src.write_text(rewritten)
+    except OSError as exc:
+        return _error(f"Failed to write {target_src}: {exc}")
+
+    compile_result = _compile_driver(
+        target_dir,
+        profile,
+        missing_source_hint=(
+            "probe_step just wrote the driver source; this should not "
+            "happen. Check filesystem permissions on "
+            f"{target_dir}."
+        ),
+    )
+    if compile_result["status"] != "ok":
+        return compile_result
+
+    run_result = _run_driver(
+        target_dir,
+        missing_binary_hint=(
+            "probe_step just compiled the driver; this should not "
+            "happen. Check filesystem permissions on "
+            f"{target_dir}."
+        ),
+    )
+    return run_result
+
+
+def _probe_cell_dir(kernel_stem: str, precision: str, seed: int) -> Path:
+    """Return the on-disk directory probe_step writes for one cell.
+
+    Centralized so probe_compare and probe_step share the layout
+    convention; changing the directory naming scheme means changing
+    this helper.
+    """
+    return (
+        Path("baselines") / kernel_stem / "probe"
+        / f"{precision}_seed{seed}"
+    )
+
+
+# Probe matrix. Kept private to this module: the orchestrator drives
+# probe_step once per cell and probe_compare reads back whatever cells
+# happen to exist, so neither caller needs the matrix at hand. If a
+# future commit changes the set of precisions or seeds, change it here
+# and the probe loop in orchestrator.py together.
+_PROBE_SEEDS: tuple[int, ...] = (42, 43)
+
+
+def _load_probe_cell(
+    kernel_stem: str, precision: str, seed: int
+) -> tuple[dict | None, str, str | None]:
+    """Load one (precision, seed) reference.json and classify its status.
+
+    Returns `(payload, status, error)` where `status` is one of
+    'ok' / 'missing' / 'load_error' and `error` is a human-readable
+    message for the non-ok cases (None for 'ok'). Used by probe_compare
+    to fill in the per-cell `status` field in evidence.json; the
+    analyst then sees which cells have real data.
+
+    A 'missing' cell means probe_step never ran or its run failed
+    before reference.json was written (probe_step deletes any stale
+    reference.json before invoking the subprocess, so a missing file
+    here is unambiguous evidence of a failed cell, not a stale one).
+    """
+    cell_dir = _probe_cell_dir(kernel_stem, precision, seed)
+    ref_path = cell_dir / "reference.json"
+    if not ref_path.is_file():
+        return (None, "missing", f"reference.json not found at {ref_path}.")
+    try:
+        with ref_path.open("r") as fp:
+            payload = json.load(fp)
+    except json.JSONDecodeError as exc:
+        return (None, "load_error", f"{ref_path} is not valid JSON: {exc}.")
+    except OSError as exc:
+        return (None, "load_error", f"Failed to read {ref_path}: {exc}.")
+    return (payload, "ok", None)
+
+
+def _per_output_stats_vs_quad(
+    quad_payload: dict, other_payload: dict
+) -> tuple[dict | None, str | None]:
+    """Compute per-output error stats of `other_payload` vs `quad_payload`.
+
+    Returns `(stats, None)` on success or `(None, error_msg)` on a
+    shape mismatch (reuses `_shape_error` so the contract stays in
+    one place). `stats` maps each output array name to:
+
+      {n: int,              total elements compared
+       n_finite: int,       elements where both sides are finite
+       n_nonfinite: int,    elements where either side is NaN or inf
+       max_absrel: float,   max |a-q| / max(|a|, |q|, eps) over finite pairs
+       mean_absrel: float,  mean of the same over finite pairs
+       max_abserror: float} max |a-q| over finite pairs
+
+    The relative-error denominator uses a tiny epsilon floor (1e-300)
+    so quad-zero / other-zero pairs do not blow the stat up to inf;
+    in that exact-zero case both numerator and denominator are zero,
+    yielding 0.0 -- which is the analyst-friendly answer (the cell
+    agreed perfectly). NaN and inf pairs are excluded from the
+    finite-arithmetic stats but counted in `n_nonfinite` so the
+    analyst sees that something special happened.
+    """
+    shape_err = _shape_error(quad_payload, other_payload)
+    if shape_err is not None:
+        return (None, shape_err)
+
+    stats: dict[str, dict] = {}
+    eps = 1e-300
+    outputs_q = quad_payload["outputs"]
+    outputs_o = other_payload["outputs"]
+    for name in sorted(outputs_q.keys()):
+        arr_q = outputs_q[name]
+        arr_o = outputs_o[name]
+        n = len(arr_q)
+        n_finite = 0
+        n_nonfinite = 0
+        max_absrel = 0.0
+        sum_absrel = 0.0
+        max_abserror = 0.0
+        for vq, vo in zip(arr_q, arr_o):
+            try:
+                fq = float(vq)
+                fo = float(vo)
+            except (TypeError, ValueError):
+                n_nonfinite += 1
+                continue
+            if (
+                math.isnan(fq) or math.isnan(fo)
+                or math.isinf(fq) or math.isinf(fo)
+            ):
+                n_nonfinite += 1
+                continue
+            n_finite += 1
+            abs_err = abs(fo - fq)
+            denom = max(abs(fq), abs(fo), eps)
+            rel = abs_err / denom
+            if rel > max_absrel:
+                max_absrel = rel
+            sum_absrel += rel
+            if abs_err > max_abserror:
+                max_abserror = abs_err
+        mean_absrel = sum_absrel / n_finite if n_finite > 0 else 0.0
+        stats[name] = {
+            "n": n,
+            "n_finite": n_finite,
+            "n_nonfinite": n_nonfinite,
+            "max_absrel": max_absrel,
+            "mean_absrel": mean_absrel,
+            "max_abserror": max_abserror,
+        }
+    return (stats, None)
+
+
+def probe_compare(kernel_stem: str, language_id: str) -> dict:
+    """Aggregate the per-cell probe runs into evidence.json for the analyst.
+
+    Walks the probe matrix (every (precision, seed) cell the v1 probe
+    pipeline emits, currently 4 precisions x 2 seeds = 8 cells for
+    Kokkos), classifies each cell's reference.json (ok / missing /
+    load_error / shape_error), and for every non-quad cell that has
+    an `ok` partner `quad_seed<N>` cell computes per-output stats
+    against the quad reference at the same seed. Adds per-output
+    cross-seed deltas so the analyst can distinguish seed-correlated
+    precision pain from seed-independent precision pain.
+
+    Writes the aggregated document to
+    `baselines/<kernel_stem>/probe/evidence.json`. That path is also
+    what the orchestrator's spawn_analyst branch will read to attach
+    the PROBE EVIDENCE block to the analyst task prompt (Commit 4).
+
+    Hard-errors only when the quad ground truth for the canonical
+    seed (42) is missing -- without that cell there is no reference
+    to compare against and the per-cell stats would all be empty.
+    Any other missing or failed cell is recorded in `cells[<name>]`
+    with a non-ok status and skipped during the stats walk; the
+    analyst sees exactly which signals are real.
+
+    The probe quad reference values are written as `%.34Qg` tokens by
+    the harness's quadmath_snprintf call but parsed back through
+    Python's `json.load`, which truncates them to IEEE 754 double
+    (~15-17 decimal digits). For the purpose of comparing a
+    float-precision or mixed_io driver against the quad ground
+    truth, that double truncation is harmless -- the float driver's
+    error floor (~2^-23 ~= 1e-7) is many orders of magnitude above
+    the double round-off (~2^-52 ~= 2e-16) introduced by the parse.
+    A future commit that wants to compare double-precision drivers
+    against quad with quad-level resolution would need to either
+    parse the JSON as decimal strings or have the harness write a
+    parallel quad-as-string output array; v1 punts on this because
+    no current analyst question requires the extra resolution.
+
+    `language_id` is accepted for symmetry and validated; this tool
+    itself is language-agnostic (it reads JSON files that obey the
+    harness contract regardless of source language).
+    """
+    _resolve_profile(language_id)
+    probe_dir = Path("baselines") / kernel_stem / "probe"
+    evidence_path = probe_dir / "evidence.json"
+
+    # Probe the canonical-seed quad cell first so we can fail fast
+    # if the ground truth is missing.
+    canonical_seed = _PROBE_SEEDS[0]
+    quad_canonical_payload, quad_canonical_status, quad_canonical_err = (
+        _load_probe_cell(kernel_stem, "quad", canonical_seed)
+    )
+    if quad_canonical_status != "ok":
+        return _error(
+            f"Probe ground truth missing: the canonical quad cell at "
+            f"seed={canonical_seed} could not be loaded "
+            f"({quad_canonical_status}: {quad_canonical_err}). "
+            f"probe_compare cannot run without quad_seed{canonical_seed} "
+            f"as a comparison baseline; check that probe_step("
+            f"precision='quad', seed={canonical_seed}) ran and succeeded."
+        )
+
+    # Discover which precisions to walk by reading the harness-written
+    # template directories rather than hardcoding the precision list;
+    # this keeps probe_compare in sync with the profile's
+    # probe_precisions tuple without importing it directly.
+    template_root = Path("baselines") / kernel_stem / "probe"
+    precisions: list[str] = []
+    if template_root.is_dir():
+        for entry in sorted(template_root.iterdir()):
+            if not entry.is_dir():
+                continue
+            # Skip the per-(precision, seed) cell dirs; the template
+            # dirs have plain precision names like "quad", "float".
+            if "_seed" in entry.name:
+                continue
+            precisions.append(entry.name)
+    if not precisions:
+        return _error(
+            f"No probe driver templates found under {template_root}. "
+            f"Did spawn_baseline_harness run with the v1 4-driver "
+            f"schema for this kernel_stem?"
+        )
+
+    # cells[<precision>_seed<seed>] -> {status, error?, stats?, shape_error?}
+    cells: dict[str, dict] = {}
+    # per_seed_quad_payload[seed] caches the quad reference for that
+    # seed so the stats loop doesn't reload it once per non-quad cell.
+    per_seed_quad_payload: dict[int, dict] = {
+        canonical_seed: quad_canonical_payload
+    }
+
+    for seed in _PROBE_SEEDS:
+        for precision in precisions:
+            cell_name = f"{precision}_seed{seed}"
+            payload, status, err = _load_probe_cell(
+                kernel_stem, precision, seed
+            )
+            cell: dict = {"status": status}
+            if err is not None:
+                cell["error"] = err
+            cells[cell_name] = cell
+            if precision == "quad" and status == "ok":
+                per_seed_quad_payload[seed] = payload
+
+    # Stats walk: for each non-quad ok cell with an ok quad partner
+    # at the same seed, compute per-output stats vs quad.
+    for seed in _PROBE_SEEDS:
+        quad_partner = per_seed_quad_payload.get(seed)
+        for precision in precisions:
+            if precision == "quad":
+                continue
+            cell_name = f"{precision}_seed{seed}"
+            cell = cells[cell_name]
+            if cell["status"] != "ok":
+                continue
+            if quad_partner is None:
+                # No quad partner at this seed -> record but don't
+                # promote to a hard error. The analyst sees a
+                # "no_quad_partner" status and treats this cell as
+                # missing comparison data.
+                cell["status"] = "no_quad_partner"
+                cell["error"] = (
+                    f"quad_seed{seed} did not load; cannot compute "
+                    f"stats for {cell_name} without a ground truth."
+                )
+                continue
+            payload, _, _ = _load_probe_cell(
+                kernel_stem, precision, seed
+            )
+            stats, shape_err = _per_output_stats_vs_quad(
+                quad_partner, payload
+            )
+            if shape_err is not None:
+                cell["status"] = "shape_error"
+                cell["shape_error"] = shape_err
+                continue
+            cell["stats"] = stats
+
+    # Cross-seed deltas: for each non-quad precision, if both
+    # precision_seed42 and precision_seed43 have stats, compute the
+    # per-output delta of max_absrel. Stored at the top level under
+    # `cross_seed_deltas[<precision>][<output_name>]`.
+    cross_seed_deltas: dict[str, dict] = {}
+    if len(_PROBE_SEEDS) >= 2:
+        s_a, s_b = _PROBE_SEEDS[0], _PROBE_SEEDS[1]
+        for precision in precisions:
+            if precision == "quad":
+                continue
+            cell_a = cells.get(f"{precision}_seed{s_a}", {})
+            cell_b = cells.get(f"{precision}_seed{s_b}", {})
+            stats_a = cell_a.get("stats")
+            stats_b = cell_b.get("stats")
+            if not stats_a or not stats_b:
+                continue
+            per_output: dict[str, float] = {}
+            for name in sorted(set(stats_a.keys()) & set(stats_b.keys())):
+                per_output[name] = abs(
+                    stats_a[name]["max_absrel"]
+                    - stats_b[name]["max_absrel"]
+                )
+            if per_output:
+                cross_seed_deltas[precision] = per_output
+
+    evidence = {
+        "kernel_stem": kernel_stem,
+        "precisions": precisions,
+        "seeds": list(_PROBE_SEEDS),
+        "cells": cells,
+        "cross_seed_deltas": cross_seed_deltas,
+    }
+    try:
+        probe_dir.mkdir(parents=True, exist_ok=True)
+        evidence_path.write_text(json.dumps(evidence, indent=2))
+    except OSError as exc:
+        return _error(f"Failed to write {evidence_path}: {exc}")
+
+    # Summarize for the orchestrator's tool-result stdout: cell counts
+    # by status, plus the worst-case max_absrel across all ok cells.
+    status_counts: dict[str, int] = {}
+    worst_absrel = 0.0
+    worst_cell = ""
+    worst_output = ""
+    for cell_name, cell in cells.items():
+        st = cell["status"]
+        status_counts[st] = status_counts.get(st, 0) + 1
+        stats = cell.get("stats")
+        if not stats:
+            continue
+        for output_name, output_stats in stats.items():
+            if output_stats["max_absrel"] > worst_absrel:
+                worst_absrel = output_stats["max_absrel"]
+                worst_cell = cell_name
+                worst_output = output_name
+    summary_parts = [
+        f"{count} {status}" for status, count in sorted(status_counts.items())
+    ]
+    summary = (
+        f"Probe evidence written to {evidence_path}: "
+        f"{', '.join(summary_parts)}."
+    )
+    if worst_cell:
+        summary += (
+            f" Worst max_absrel vs quad: {worst_absrel:.3e} at "
+            f"{worst_cell}/{worst_output}."
+        )
+    return {
+        "status": "ok",
+        "stdout": summary,
+        "stderr": "",
+        "artifacts": [str(evidence_path)],
     }

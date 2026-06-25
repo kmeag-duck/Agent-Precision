@@ -14,14 +14,23 @@ and compile-flag parity with compile_baseline_driver. Also covers
 run_rewritten_driver — env-var contract shared with the baseline run,
 rewritten-subdir cwd / artifact path, missing-binary hint blaming
 compile_rewritten_driver, and isolation from the baseline tree.
-Finally covers compare_outputs — tolerance-kind dispatch (sig_figs and
+Also covers compare_outputs — tolerance-kind dispatch (sig_figs and
 decimal_digits with the documented strict-< thresholds), NaN-always-
 mismatches asymmetry, ±inf rules, shape-error vs tolerance-failure
 distinction, mismatch list truncation with a "+ K more suppressed"
 footer, comparison.json artifact on both pass and fail paths, and
-the uniform result schema. All tests monkeypatch subprocess.run so no
-real compiler or driver invocation happens; comparator tests use pure
-file I/O against tmp_path.
+the uniform result schema. Finally covers probe_step — RNG_SEED
+rewrite contract (exactly-one-match), template / sibling per-seed
+directory layout, seed-type validation (rejects bool), missing
+template hint blaming spawn_baseline_harness, and the uniform result
+schema; and probe_compare — quad_seed42 hard-error path, cell status
+classification (ok / missing / load_error / shape_error /
+no_quad_partner), per-output stats vs same-seed quad partner with
+the NaN/inf and eps-floor rules, cross-seed deltas, evidence.json
+schema, and the uniform result schema. All tests monkeypatch
+subprocess.run so no real compiler or driver invocation happens;
+comparator and probe_compare tests use pure file I/O against
+tmp_path.
 """
 
 import json
@@ -65,6 +74,8 @@ from workflow.tools import (
     compare_outputs,
     compile_baseline_driver,
     compile_rewritten_driver,
+    probe_compare,
+    probe_step,
     run_baseline_driver,
     run_rewritten_driver,
     splice_rewritten_kernel,
@@ -3205,3 +3216,621 @@ def test_splice_rewritten_kernel_omp_offload_reads_and_writes_dot_cpp(
     end = out_lines.index(KERNEL_END_SENTINEL)
     spliced = "\n".join(out_lines[begin + 1 : end])
     assert spliced == new_kernel.rstrip("\n")
+
+
+# ---------- probe_step ----------
+
+
+def _stage_probe_template(
+    tmp_path, stem, precision, seed_line="static constexpr int RNG_SEED = 42;",
+    extra_body="// kernel body\nint main(){return 0;}\n",
+):
+    """Write a fake per-precision probe driver template under tmp_path.
+
+    Mirrors what the v1 baseline_harness writes to
+    baselines/<stem>/probe/<precision>/driver.cpp. The seed_line is
+    the line probe_step rewrites; tests vary it to exercise the
+    exactly-one-match contract.
+    """
+    template_dir = tmp_path / "baselines" / stem / "probe" / precision
+    template_dir.mkdir(parents=True)
+    body = f"// header\n{seed_line}\n{extra_body}"
+    (template_dir / "driver.cpp").write_text(body)
+    return template_dir
+
+
+def test_probe_step_errors_when_template_missing(monkeypatch, tmp_path):
+    """probe_step returns status='error' (no subprocess call) when baselines/<stem>/probe/<precision>/driver.cpp does not exist, and the message blames spawn_baseline_harness so the operator knows which upstream tool was supposed to write it."""
+    monkeypatch.chdir(tmp_path)
+    root = _make_fake_kokkos_root(tmp_path)
+    monkeypatch.setenv(KOKKOS_ROOT_ENV, str(root))
+
+    def fail_run(*a, **kw):
+        raise AssertionError(
+            "subprocess.run must not be called when probe template is missing"
+        )
+
+    monkeypatch.setattr(subprocess, "run", fail_run)
+
+    result = probe_step("nbody_force", "quad", 42, "kokkos")
+
+    assert result["status"] == "error"
+    assert "spawn_baseline_harness" in result["stderr"]
+    assert "quad" in result["stderr"]
+    assert result["artifacts"] == []
+
+
+def test_probe_step_rejects_bool_as_seed(monkeypatch, tmp_path):
+    """probe_step rejects a bool seed (which is technically an int subclass in Python) without invoking subprocess.run, because True/False are almost never what the orchestrator meant to pass."""
+    monkeypatch.chdir(tmp_path)
+    root = _make_fake_kokkos_root(tmp_path)
+    monkeypatch.setenv(KOKKOS_ROOT_ENV, str(root))
+    _stage_probe_template(tmp_path, "k", "quad")
+
+    def fail_run(*a, **kw):
+        raise AssertionError("subprocess.run must not be called for bool seed")
+
+    monkeypatch.setattr(subprocess, "run", fail_run)
+
+    result = probe_step("k", "quad", True, "kokkos")
+
+    assert result["status"] == "error"
+    assert "seed" in result["stderr"].lower()
+    assert result["artifacts"] == []
+
+
+def test_probe_step_rejects_empty_precision(monkeypatch, tmp_path):
+    """probe_step rejects an empty / non-string precision without invoking subprocess.run; the precision is used as a directory name and an empty string would collapse onto the template root."""
+    monkeypatch.chdir(tmp_path)
+    root = _make_fake_kokkos_root(tmp_path)
+    monkeypatch.setenv(KOKKOS_ROOT_ENV, str(root))
+
+    def fail_run(*a, **kw):
+        raise AssertionError("subprocess.run must not be called for bad precision")
+
+    monkeypatch.setattr(subprocess, "run", fail_run)
+
+    result = probe_step("k", "", 42, "kokkos")
+
+    assert result["status"] == "error"
+    assert "precision" in result["stderr"].lower()
+
+
+def test_probe_step_errors_when_rng_seed_line_missing(monkeypatch, tmp_path):
+    """probe_step returns status='error' when the template has no RNG_SEED contract line (`static constexpr int RNG_SEED = <int>;` on its own line), with a message naming the RNG_SEED contract so the operator knows the harness output is malformed."""
+    monkeypatch.chdir(tmp_path)
+    root = _make_fake_kokkos_root(tmp_path)
+    monkeypatch.setenv(KOKKOS_ROOT_ENV, str(root))
+    _stage_probe_template(
+        tmp_path, "k", "quad",
+        seed_line="// no RNG_SEED line here",
+    )
+
+    def fail_run(*a, **kw):
+        raise AssertionError(
+            "subprocess.run must not be called when RNG_SEED is malformed"
+        )
+
+    monkeypatch.setattr(subprocess, "run", fail_run)
+
+    result = probe_step("k", "quad", 99, "kokkos")
+
+    assert result["status"] == "error"
+    assert "RNG_SEED" in result["stderr"]
+    assert result["artifacts"] == []
+
+
+def test_probe_step_errors_when_rng_seed_line_appears_twice(
+    monkeypatch, tmp_path
+):
+    """probe_step returns status='error' when the template has two RNG_SEED contract lines, because the rewrite would be ambiguous (the contract requires exactly one)."""
+    monkeypatch.chdir(tmp_path)
+    root = _make_fake_kokkos_root(tmp_path)
+    monkeypatch.setenv(KOKKOS_ROOT_ENV, str(root))
+    template_dir = tmp_path / "baselines" / "k" / "probe" / "quad"
+    template_dir.mkdir(parents=True)
+    (template_dir / "driver.cpp").write_text(
+        "static constexpr int RNG_SEED = 42;\n"
+        "static constexpr int RNG_SEED = 7;\n"
+        "int main(){return 0;}\n"
+    )
+
+    def fail_run(*a, **kw):
+        raise AssertionError(
+            "subprocess.run must not be called when RNG_SEED is ambiguous"
+        )
+
+    monkeypatch.setattr(subprocess, "run", fail_run)
+
+    result = probe_step("k", "quad", 99, "kokkos")
+
+    assert result["status"] == "error"
+    assert "RNG_SEED" in result["stderr"]
+    assert "2" in result["stderr"]
+
+
+def test_probe_step_writes_rewritten_seed_to_sibling_dir(
+    monkeypatch, tmp_path
+):
+    """On success, probe_step writes the rewritten source to baselines/<stem>/probe/<precision>_seed<seed>/driver.cpp (a sibling of the template dir), preserves every byte outside the matched RNG_SEED line, leaves the template dir untouched, and returns reference.json as its single artifact."""
+    monkeypatch.chdir(tmp_path)
+    root = _make_fake_kokkos_root(tmp_path)
+    monkeypatch.setenv(KOKKOS_ROOT_ENV, str(root))
+    template_dir = _stage_probe_template(
+        tmp_path, "k", "quad",
+        seed_line="static constexpr int RNG_SEED = 42;",
+        extra_body=(
+            "// preserved verbatim\n"
+            "static constexpr int NOT_THE_SEED = 42;  // also literally 42\n"
+            "int main(){return 0;}\n"
+        ),
+    )
+    template_path = template_dir / "driver.cpp"
+    template_before = template_path.read_text()
+
+    target_dir = tmp_path / "baselines" / "k" / "probe" / "quad_seed99"
+
+    def fake_run(cmd, **kw):
+        # Two subprocess calls land here: the compile (g++) and the run
+        # (./driver). The compile must produce the driver binary; the
+        # run must write reference.json. Both succeed.
+        class OkProc:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+        argv0 = cmd[0] if isinstance(cmd, list) else cmd
+        if isinstance(argv0, str) and argv0.endswith("driver"):
+            # ./driver invocation -> write reference.json
+            (target_dir / "reference.json").write_text(
+                json.dumps({"kernel": "k", "seed": 99, "inputs": {}, "outputs": {}})
+            )
+        else:
+            # compile invocation -> create the binary the run check expects
+            binary = target_dir / "driver"
+            binary.write_text("#!/bin/sh\nexit 0\n")
+            binary.chmod(binary.stat().st_mode | stat.S_IXUSR)
+        return OkProc()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = probe_step("k", "quad", 99, "kokkos")
+
+    assert result["status"] == "ok"
+    assert result["artifacts"] == [
+        "baselines/k/probe/quad_seed99/reference.json"
+    ]
+
+    # The sibling dir exists with the rewritten source; only the
+    # RNG_SEED line differs from the template.
+    rewritten_src = target_dir / "driver.cpp"
+    assert rewritten_src.is_file()
+    rewritten_text = rewritten_src.read_text()
+    assert "RNG_SEED = 99;" in rewritten_text
+    assert "RNG_SEED = 42;" not in rewritten_text
+    # The other literal "42" (NOT_THE_SEED) must survive verbatim -- the
+    # rewrite is on the exact contract line, not a literal-42 string
+    # replace.
+    assert "NOT_THE_SEED = 42" in rewritten_text
+
+    # Template dir is untouched: re-invocations always start from
+    # seed=42 source.
+    assert template_path.read_text() == template_before
+
+
+def test_probe_step_compile_failure_propagates(monkeypatch, tmp_path):
+    """If the compile step fails, probe_step returns the compile result verbatim (status='error', g++ stderr in `stderr`) without invoking the run step."""
+    monkeypatch.chdir(tmp_path)
+    root = _make_fake_kokkos_root(tmp_path)
+    monkeypatch.setenv(KOKKOS_ROOT_ENV, str(root))
+    _stage_probe_template(tmp_path, "k", "float")
+
+    run_calls = {"count": 0}
+
+    def fake_run(cmd, **kw):
+        run_calls["count"] += 1
+        # First call is compile; fail it.
+        class BadProc:
+            returncode = 1
+            stdout = ""
+            stderr = "boom: precision_too_imprecise\n"
+        return BadProc()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = probe_step("k", "float", 42, "kokkos")
+
+    assert result["status"] == "error"
+    assert "boom" in result["stderr"]
+    assert run_calls["count"] == 1  # compile only; run never invoked
+
+
+def test_probe_step_run_failure_propagates(monkeypatch, tmp_path):
+    """If the compile succeeds but the run step fails (driver exits non-zero), probe_step returns the run result (status='error') and does not claim a reference.json artifact."""
+    monkeypatch.chdir(tmp_path)
+    root = _make_fake_kokkos_root(tmp_path)
+    monkeypatch.setenv(KOKKOS_ROOT_ENV, str(root))
+    _stage_probe_template(tmp_path, "k", "float")
+
+    target_dir = tmp_path / "baselines" / "k" / "probe" / "float_seed42"
+
+    def fake_run(cmd, **kw):
+        class Proc:
+            stdout = ""
+            stderr = ""
+        argv0 = cmd[0] if isinstance(cmd, list) else cmd
+        if isinstance(argv0, str) and argv0.endswith("driver"):
+            # Run: exit non-zero, do not write reference.json.
+            Proc.returncode = 7
+            Proc.stderr = "kernel crashed\n"
+        else:
+            # Compile: succeed, create binary.
+            binary = target_dir / "driver"
+            binary.write_text("#!/bin/sh\nexit 0\n")
+            binary.chmod(binary.stat().st_mode | stat.S_IXUSR)
+            Proc.returncode = 0
+        return Proc()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = probe_step("k", "float", 42, "kokkos")
+
+    assert result["status"] == "error"
+    assert result["artifacts"] == []
+
+
+def test_probe_step_errors_on_unknown_language_id(monkeypatch, tmp_path):
+    """probe_step rejects an unknown language_id loudly via _resolve_profile rather than silently treating it as a default; this keeps the call-shape symmetric with the rest of the dynamic-verification chain."""
+    monkeypatch.chdir(tmp_path)
+
+    def fail_run(*a, **kw):
+        raise AssertionError("subprocess.run must not be called for unknown language")
+
+    monkeypatch.setattr(subprocess, "run", fail_run)
+
+    # _resolve_profile raises (it is not a normal _error result path).
+    import pytest
+
+    with pytest.raises(Exception):
+        probe_step("k", "quad", 42, "not_a_real_language")
+
+
+# ---------- probe_compare ----------
+
+
+def _stage_probe_template_dir(tmp_path, stem, precision):
+    """Create just the template directory baselines/<stem>/probe/<precision>/.
+
+    probe_compare lists this directory to discover which precisions to
+    walk, but does not actually read its contents (it only reads the
+    per-(precision, seed) reference.json files). The template dir
+    just needs to exist and be a directory; an empty dir is fine.
+    """
+    d = tmp_path / "baselines" / stem / "probe" / precision
+    d.mkdir(parents=True)
+    return d
+
+
+def _stage_probe_cell_reference(
+    tmp_path, stem, precision, seed, payload
+):
+    """Write baselines/<stem>/probe/<precision>_seed<seed>/reference.json."""
+    cell_dir = (
+        tmp_path / "baselines" / stem / "probe" / f"{precision}_seed{seed}"
+    )
+    cell_dir.mkdir(parents=True)
+    (cell_dir / "reference.json").write_text(json.dumps(payload))
+    return cell_dir
+
+
+def _make_ref_payload(kernel, seed, outputs):
+    """Build a reference.json payload matching the harness contract."""
+    return {
+        "kernel": kernel,
+        "seed": seed,
+        "inputs": {},
+        "outputs": outputs,
+    }
+
+
+def test_probe_compare_errors_when_quad_seed42_missing(monkeypatch, tmp_path):
+    """probe_compare hard-errors when the canonical quad cell (quad_seed42) is missing -- without ground truth there is nothing to compare against. The error message names quad_seed42 and probe_step so the operator knows which upstream call must be re-run."""
+    monkeypatch.chdir(tmp_path)
+    _stage_probe_template_dir(tmp_path, "k", "quad")
+    _stage_probe_template_dir(tmp_path, "k", "float")
+    # Note: NO quad_seed42 cell written.
+
+    result = probe_compare("k", "kokkos")
+
+    assert result["status"] == "error"
+    assert "quad_seed42" in result["stderr"]
+    assert "probe_step" in result["stderr"]
+    assert result["artifacts"] == []
+
+
+def test_probe_compare_writes_evidence_with_per_output_stats(
+    monkeypatch, tmp_path
+):
+    """Happy path with one non-quad cell: probe_compare writes evidence.json containing per-output stats vs the same-seed quad partner. The stats include n, n_finite, n_nonfinite, max_absrel, mean_absrel, max_abserror; the eps-floor handles exact-zero pairs without blowing up to inf."""
+    monkeypatch.chdir(tmp_path)
+    _stage_probe_template_dir(tmp_path, "k", "quad")
+    _stage_probe_template_dir(tmp_path, "k", "float")
+
+    # quad ground truth, seed=42, two outputs.
+    _stage_probe_cell_reference(
+        tmp_path, "k", "quad", 42,
+        _make_ref_payload("k", 42, {
+            "energy": [1.0, 2.0, 0.0],
+            "force":  [10.0, 20.0],
+        }),
+    )
+    # float cell, seed=42. Inject a known ~1e-7 rel error on `energy[0]`
+    # and an exact match on `energy[1]` and the exact-zero pair on
+    # `energy[2]`. Force matches exactly.
+    _stage_probe_cell_reference(
+        tmp_path, "k", "float", 42,
+        _make_ref_payload("k", 42, {
+            "energy": [1.0 + 1e-7, 2.0, 0.0],
+            "force":  [10.0, 20.0],
+        }),
+    )
+    # No seed=43 cells -> cross_seed_deltas should be empty for float.
+
+    result = probe_compare("k", "kokkos")
+
+    assert result["status"] == "ok"
+    assert result["artifacts"] == ["baselines/k/probe/evidence.json"]
+
+    evidence = json.loads(
+        (tmp_path / "baselines" / "k" / "probe" / "evidence.json").read_text()
+    )
+    assert evidence["kernel_stem"] == "k"
+    assert set(evidence["precisions"]) == {"quad", "float"}
+    assert evidence["seeds"] == [42, 43]
+
+    # quad_seed42 is ok; quad_seed43, float_seed43 are missing.
+    cells = evidence["cells"]
+    assert cells["quad_seed42"]["status"] == "ok"
+    assert cells["quad_seed43"]["status"] == "missing"
+    assert cells["float_seed43"]["status"] == "missing"
+
+    # float_seed42 is ok and has stats vs quad_seed42.
+    float_cell = cells["float_seed42"]
+    assert float_cell["status"] == "ok"
+    stats = float_cell["stats"]
+    energy = stats["energy"]
+    assert energy["n"] == 3
+    assert energy["n_finite"] == 3
+    assert energy["n_nonfinite"] == 0
+    # max_absrel ~ 1e-7 / max(1.0, 1.0+1e-7, eps) ~ 1e-7
+    assert 5e-8 < energy["max_absrel"] < 2e-7
+    # Exact-zero pair contributed 0.0 to the sum, exact match contributed
+    # 0.0, only energy[0] contributed ~1e-7; mean = sum / 3.
+    assert energy["mean_absrel"] < energy["max_absrel"]
+    force = stats["force"]
+    assert force["max_absrel"] == 0.0
+    assert force["max_abserror"] == 0.0
+
+    # No cross-seed deltas because seed=43 cells are missing.
+    assert evidence["cross_seed_deltas"] == {}
+
+
+def test_probe_compare_records_nan_and_inf_as_nonfinite(
+    monkeypatch, tmp_path
+):
+    """probe_compare counts NaN and inf entries on either side as n_nonfinite (excluded from the finite-arithmetic stats) rather than dropping them silently; this is the analyst-friendly signal that something special happened in that cell."""
+    monkeypatch.chdir(tmp_path)
+    _stage_probe_template_dir(tmp_path, "k", "quad")
+    _stage_probe_template_dir(tmp_path, "k", "float")
+
+    _stage_probe_cell_reference(
+        tmp_path, "k", "quad", 42,
+        _make_ref_payload("k", 42, {"out": [1.0, 2.0, 3.0, 4.0]}),
+    )
+    # float side has NaN, +inf, finite, finite (build via Python literals
+    # in the staged payload). JSON does not have a NaN/inf literal, so
+    # write them with json.dumps(..., allow_nan=True) which Python uses
+    # by default; the loader json.load reads them back as float.
+    cell_dir = tmp_path / "baselines" / "k" / "probe" / "float_seed42"
+    cell_dir.mkdir(parents=True)
+    (cell_dir / "reference.json").write_text(
+        json.dumps(_make_ref_payload("k", 42, {
+            "out": [float("nan"), float("inf"), 3.0, 4.0],
+        }))
+    )
+
+    result = probe_compare("k", "kokkos")
+    assert result["status"] == "ok"
+
+    evidence = json.loads(
+        (tmp_path / "baselines" / "k" / "probe" / "evidence.json").read_text()
+    )
+    out = evidence["cells"]["float_seed42"]["stats"]["out"]
+    assert out["n"] == 4
+    assert out["n_nonfinite"] == 2
+    assert out["n_finite"] == 2
+    assert out["max_absrel"] == 0.0
+    assert out["max_abserror"] == 0.0
+
+
+def test_probe_compare_records_shape_error_on_mismatched_outputs(
+    monkeypatch, tmp_path
+):
+    """When a non-quad cell's reference.json has a different output-array shape than the quad partner (different keys or different lengths), probe_compare records cell.status='shape_error' with a descriptive shape_error message, rather than computing meaningless stats. Other cells in the same run are unaffected."""
+    monkeypatch.chdir(tmp_path)
+    _stage_probe_template_dir(tmp_path, "k", "quad")
+    _stage_probe_template_dir(tmp_path, "k", "float")
+    _stage_probe_template_dir(tmp_path, "k", "double")
+
+    _stage_probe_cell_reference(
+        tmp_path, "k", "quad", 42,
+        _make_ref_payload("k", 42, {"out": [1.0, 2.0]}),
+    )
+    # float cell has a different output array length.
+    _stage_probe_cell_reference(
+        tmp_path, "k", "float", 42,
+        _make_ref_payload("k", 42, {"out": [1.0, 2.0, 3.0]}),
+    )
+    # double cell is well-formed.
+    _stage_probe_cell_reference(
+        tmp_path, "k", "double", 42,
+        _make_ref_payload("k", 42, {"out": [1.0, 2.0]}),
+    )
+
+    result = probe_compare("k", "kokkos")
+    assert result["status"] == "ok"
+
+    evidence = json.loads(
+        (tmp_path / "baselines" / "k" / "probe" / "evidence.json").read_text()
+    )
+    float_cell = evidence["cells"]["float_seed42"]
+    assert float_cell["status"] == "shape_error"
+    assert "shape_error" in float_cell
+    # The double cell with matching shape is fine.
+    double_cell = evidence["cells"]["double_seed42"]
+    assert double_cell["status"] == "ok"
+    assert "stats" in double_cell
+
+
+def test_probe_compare_records_no_quad_partner_when_quad_seed43_missing(
+    monkeypatch, tmp_path
+):
+    """When seed=42 has full coverage but seed=43 has a non-quad cell with no quad partner at the same seed, probe_compare records cell.status='no_quad_partner' for that cell rather than the misleading 'ok'. The seed=42 stats are unaffected."""
+    monkeypatch.chdir(tmp_path)
+    _stage_probe_template_dir(tmp_path, "k", "quad")
+    _stage_probe_template_dir(tmp_path, "k", "float")
+
+    _stage_probe_cell_reference(
+        tmp_path, "k", "quad", 42,
+        _make_ref_payload("k", 42, {"out": [1.0]}),
+    )
+    _stage_probe_cell_reference(
+        tmp_path, "k", "float", 42,
+        _make_ref_payload("k", 42, {"out": [1.0]}),
+    )
+    # float_seed43 present but quad_seed43 missing.
+    _stage_probe_cell_reference(
+        tmp_path, "k", "float", 43,
+        _make_ref_payload("k", 43, {"out": [1.0]}),
+    )
+
+    result = probe_compare("k", "kokkos")
+    assert result["status"] == "ok"
+
+    evidence = json.loads(
+        (tmp_path / "baselines" / "k" / "probe" / "evidence.json").read_text()
+    )
+    assert evidence["cells"]["float_seed42"]["status"] == "ok"
+    assert evidence["cells"]["float_seed43"]["status"] == "no_quad_partner"
+    assert "quad_seed43" in evidence["cells"]["float_seed43"]["error"]
+
+
+def test_probe_compare_computes_cross_seed_deltas(monkeypatch, tmp_path):
+    """When both precision_seed42 and precision_seed43 have ok stats, probe_compare adds cross_seed_deltas[<precision>][<output>] = |max_absrel_seed42 - max_absrel_seed43|. Quad is excluded (it is the ground truth, not a comparison target)."""
+    monkeypatch.chdir(tmp_path)
+    _stage_probe_template_dir(tmp_path, "k", "quad")
+    _stage_probe_template_dir(tmp_path, "k", "float")
+
+    # quad at both seeds, two outputs.
+    _stage_probe_cell_reference(
+        tmp_path, "k", "quad", 42,
+        _make_ref_payload("k", 42, {"a": [1.0], "b": [10.0]}),
+    )
+    _stage_probe_cell_reference(
+        tmp_path, "k", "quad", 43,
+        _make_ref_payload("k", 43, {"a": [1.0], "b": [10.0]}),
+    )
+    # float at seed=42: tiny error on `a`, exact on `b`.
+    _stage_probe_cell_reference(
+        tmp_path, "k", "float", 42,
+        _make_ref_payload("k", 42, {"a": [1.0 + 1e-7], "b": [10.0]}),
+    )
+    # float at seed=43: larger error on `a`, exact on `b`.
+    _stage_probe_cell_reference(
+        tmp_path, "k", "float", 43,
+        _make_ref_payload("k", 43, {"a": [1.0 + 5e-7], "b": [10.0]}),
+    )
+
+    result = probe_compare("k", "kokkos")
+    assert result["status"] == "ok"
+
+    evidence = json.loads(
+        (tmp_path / "baselines" / "k" / "probe" / "evidence.json").read_text()
+    )
+    deltas = evidence["cross_seed_deltas"]
+    assert "float" in deltas
+    assert "quad" not in deltas  # quad excluded by construction
+    assert deltas["float"]["b"] == 0.0  # exact match at both seeds
+    # delta_a ~ |1e-7 - 5e-7| ~ 4e-7 (modulo tiny denominator effects)
+    assert 1e-7 < deltas["float"]["a"] < 1e-6
+
+
+def test_probe_compare_classifies_load_error_for_invalid_json(
+    monkeypatch, tmp_path
+):
+    """A non-quad cell whose reference.json is not valid JSON is classified as cell.status='load_error' with a descriptive error message. Other cells continue to be processed normally."""
+    monkeypatch.chdir(tmp_path)
+    _stage_probe_template_dir(tmp_path, "k", "quad")
+    _stage_probe_template_dir(tmp_path, "k", "float")
+
+    _stage_probe_cell_reference(
+        tmp_path, "k", "quad", 42,
+        _make_ref_payload("k", 42, {"out": [1.0]}),
+    )
+    # float cell with garbage in reference.json.
+    cell_dir = tmp_path / "baselines" / "k" / "probe" / "float_seed42"
+    cell_dir.mkdir(parents=True)
+    (cell_dir / "reference.json").write_text("{not valid json")
+
+    result = probe_compare("k", "kokkos")
+    assert result["status"] == "ok"
+
+    evidence = json.loads(
+        (tmp_path / "baselines" / "k" / "probe" / "evidence.json").read_text()
+    )
+    float_cell = evidence["cells"]["float_seed42"]
+    assert float_cell["status"] == "load_error"
+    assert "error" in float_cell
+    assert "JSON" in float_cell["error"] or "json" in float_cell["error"]
+
+
+def test_probe_compare_summary_reports_worst_cell_and_output(
+    monkeypatch, tmp_path
+):
+    """probe_compare's stdout summary names the worst (cell, output) pair by max_absrel across all ok cells, so the operator and the orchestrator log get a one-line view of which precision/seed/output is most pessimistic vs quad."""
+    monkeypatch.chdir(tmp_path)
+    _stage_probe_template_dir(tmp_path, "k", "quad")
+    _stage_probe_template_dir(tmp_path, "k", "float")
+
+    _stage_probe_cell_reference(
+        tmp_path, "k", "quad", 42,
+        _make_ref_payload("k", 42, {"small_err": [1.0], "big_err": [1.0]}),
+    )
+    _stage_probe_cell_reference(
+        tmp_path, "k", "float", 42,
+        _make_ref_payload("k", 42, {
+            "small_err": [1.0 + 1e-7],
+            "big_err":   [1.0 + 1e-3],
+        }),
+    )
+
+    result = probe_compare("k", "kokkos")
+    assert result["status"] == "ok"
+    assert "float_seed42/big_err" in result["stdout"]
+    assert "max_absrel" in result["stdout"]
+
+
+def test_probe_compare_result_keys_are_stable(monkeypatch, tmp_path):
+    """probe_compare returns the uniform {status, stdout, stderr, artifacts} schema on both the success and the hard-error (no quad ground truth) paths, matching every other tool in workflow.tools."""
+    monkeypatch.chdir(tmp_path)
+    _stage_probe_template_dir(tmp_path, "k", "quad")
+    _stage_probe_cell_reference(
+        tmp_path, "k", "quad", 42,
+        _make_ref_payload("k", 42, {"out": [1.0]}),
+    )
+    ok = probe_compare("k", "kokkos")
+    assert set(ok.keys()) == {"status", "stdout", "stderr", "artifacts"}
+
+    # Hard-error path: remove the ground-truth file.
+    (tmp_path / "baselines" / "k" / "probe" / "quad_seed42" / "reference.json").unlink()
+    err = probe_compare("k", "kokkos")
+    assert set(err.keys()) == {"status", "stdout", "stderr", "artifacts"}
