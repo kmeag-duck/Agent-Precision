@@ -212,6 +212,129 @@ def test_compile_baseline_driver_success_returns_artifacts_and_uses_env_root(
     assert "baselines/nbody_force/driver.cpp" in cmd
 
 
+# ---------- v1 quad-precision compile-link detection ----------
+#
+# When the baseline_harness emits a quad-precision driver (per the
+# v1 BASELINE PRECISION directive resolving to `quad`), the source
+# uses GCC's `__float128` extension and `quadmath_snprintf` from
+# <quadmath.h>. Both require linking against `libquadmath`. The
+# Kokkos compile step detects this by substring-matching the driver
+# source for `__float128`; the token cannot appear in a non-quad
+# build (it has no business in float / double drivers and is not in
+# any Kokkos / STL header the driver transitively pulls in).
+#
+# These three tests pin (1) the positive case — `__float128` in
+# source -> `-lquadmath` on link line; (2) the negative case — no
+# such token -> no `-lquadmath`, preserving the v0-minimal link
+# line; and (3) the link-order invariant — `-lquadmath` must appear
+# AFTER the source file in the argv so GNU ld's left-to-right
+# symbol resolution sees `__float128`-referencing symbols in the
+# .o before scanning the lib.
+
+
+def test_compile_baseline_driver_quad_source_adds_lquadmath(
+    monkeypatch, tmp_path
+):
+    """When the staged driver.cpp contains the `__float128` token (the GCC quad-precision type the v1 quad-baseline harness emits), the Kokkos compile step appends `-lquadmath` to the link line. Without this the driver fails to link with undefined references to `quadmath_snprintf` / `__addtf3` / etc., breaking the entire probe pipeline at its true-ground-truth reference run."""
+    monkeypatch.chdir(tmp_path)
+    root = _make_fake_kokkos_root(tmp_path)
+    monkeypatch.setenv(KOKKOS_ROOT_ENV, str(root))
+    # Minimal source carrying the detection token; the harness's real
+    # output is much larger but only the substring match matters here.
+    _stage_driver(
+        tmp_path,
+        "quad_kernel",
+        body=(
+            "#include <quadmath.h>\n"
+            "int main(){ __float128 x = 0; (void)x; return 0; }\n"
+        ),
+    )
+
+    captured = {}
+
+    class FakeProc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(cmd, capture_output, text, check):
+        captured["cmd"] = cmd
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = compile_baseline_driver("quad_kernel", "kokkos")
+
+    assert result["status"] == "ok"
+    assert "-lquadmath" in captured["cmd"]
+
+
+def test_compile_baseline_driver_non_quad_source_omits_lquadmath(
+    monkeypatch, tmp_path
+):
+    """A staged driver.cpp without the `__float128` token (the historical default — every v0 driver, plus v1 float and double baselines) compiles WITHOUT `-lquadmath`. Adding the flag unconditionally would be harmless to the link but would expose every operator to a libquadmath dependency they neither use nor understand; precise detection keeps the non-quad path identical to v0."""
+    monkeypatch.chdir(tmp_path)
+    root = _make_fake_kokkos_root(tmp_path)
+    monkeypatch.setenv(KOKKOS_ROOT_ENV, str(root))
+    # Stock v0-shape driver — no `__float128`, no `<quadmath.h>`.
+    _stage_driver(tmp_path, "double_kernel")
+
+    captured = {}
+
+    class FakeProc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(cmd, capture_output, text, check):
+        captured["cmd"] = cmd
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = compile_baseline_driver("double_kernel", "kokkos")
+
+    assert result["status"] == "ok"
+    assert "-lquadmath" not in captured["cmd"]
+
+
+def test_compile_baseline_driver_quad_link_order_lquadmath_after_source(
+    monkeypatch, tmp_path
+):
+    """When `-lquadmath` is appended, it sits AFTER the driver source file path in the argv. GNU ld resolves symbols left-to-right, so an .o referencing `quadmath_snprintf` must be scanned before the lib that defines it; the reverse order would surface as undefined-reference errors at link time even with the flag present. This is the same ordering convention `-lkokkoscore` already follows in v0."""
+    monkeypatch.chdir(tmp_path)
+    root = _make_fake_kokkos_root(tmp_path)
+    monkeypatch.setenv(KOKKOS_ROOT_ENV, str(root))
+    _stage_driver(
+        tmp_path,
+        "quad_kernel",
+        body="int main(){ __float128 x = 0; (void)x; return 0; }\n",
+    )
+
+    captured = {}
+
+    class FakeProc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(cmd, capture_output, text, check):
+        captured["cmd"] = cmd
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    compile_baseline_driver("quad_kernel", "kokkos")
+
+    cmd = captured["cmd"]
+    src_idx = cmd.index("baselines/quad_kernel/driver.cpp")
+    lib_idx = cmd.index("-lquadmath")
+    assert src_idx < lib_idx, (
+        f"Link order broken: source at {src_idx}, -lquadmath at {lib_idx}; "
+        f"GNU ld needs the .o before the lib"
+    )
+
+
 def test_compile_baseline_driver_compile_failure_propagates_stderr(
     monkeypatch, tmp_path
 ):

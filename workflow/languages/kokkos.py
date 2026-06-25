@@ -35,6 +35,24 @@ OPT_FLAGS = ("-O2", "-fopenmp")
 KOKKOS_LIBS = ("-lkokkoscore", "-lkokkoscontainers")
 EXTRA_LIBS = ("-lpthread", "-ldl")
 
+# v1: detection token for the quad-precision probe path. When the
+# baseline_harness's BASELINE PRECISION directive resolves to `quad`,
+# the emitted driver source uses `__float128` and `quadmath_snprintf`,
+# both of which require linking against libquadmath. We detect that by
+# looking for the type name in the source — it cannot appear in a
+# non-quad build because it is a GCC-specific extension keyword with
+# no business in float or double drivers. A plain substring match is
+# safe: the keyword is not used in any Kokkos / STL header the driver
+# transitively includes (it would only appear after preprocessing,
+# which this read does not do), and a stray `__float128` in a comment
+# still warrants linking the lib (no harm, and the comment is
+# vanishingly unlikely outside an intentional quad driver). The flag
+# is appended AFTER the source file on the link line so GNU ld's
+# left-to-right symbol resolution sees `__float128`-referencing
+# symbols in the .o before it scans -lquadmath.
+QUAD_PROBE_TOKEN = "__float128"
+QUAD_LIB = "-lquadmath"
+
 
 def _build_compile_command(driver_src: Path, driver_bin: Path) -> list[str]:
     """Assemble the g++ argv list for a Kokkos driver compile.
@@ -43,10 +61,22 @@ def _build_compile_command(driver_src: Path, driver_bin: Path) -> list[str]:
     a test that monkeypatches the env affects every subsequent compile
     in the same process. Assumes preflight has already verified the
     var is set and the directory layout looks Kokkos-shaped.
+
+    Also peeks at `driver_src` to decide whether to append
+    `-lquadmath` (the GNU libquadmath link) — needed when (and only
+    when) the harness emitted a `__float128`/`quadmath_snprintf`
+    driver for the v1 probe pipeline's `quad` baseline. The file is
+    guaranteed to exist by this point (`_compile_driver` checks it
+    above us); a read failure here would surface as a
+    FileNotFoundError, same as it would from the subprocess attempt
+    that follows, so we let it propagate rather than swallowing it.
     """
     root = Path(os.environ[ROOT_ENV])
     include_dir = root / "include"
     lib_dir = root / "lib"
+    extra_libs: tuple[str, ...] = EXTRA_LIBS
+    if QUAD_PROBE_TOKEN in driver_src.read_text():
+        extra_libs = extra_libs + (QUAD_LIB,)
     return [
         CXX,
         CXX_STD,
@@ -55,7 +85,7 @@ def _build_compile_command(driver_src: Path, driver_bin: Path) -> list[str]:
         f"-L{lib_dir}",
         str(driver_src),
         *KOKKOS_LIBS,
-        *EXTRA_LIBS,
+        *extra_libs,
         "-o",
         str(driver_bin),
     ]
