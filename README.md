@@ -17,9 +17,10 @@ This is a research prototype and a deliberate learning exercise in agent
 orchestration and tool-calling. It is a single Python package (`workflow/`)
 that talks to the Anthropic SDK. There is no build system and no CI. A
 small Layer 1 test suite (`tests/`, run with `python -m pytest -q`) covers
-the workflow plumbing with monkeypatched API calls; there is no Layer 2
-evaluation of agent judgment yet. Features are added in small, observable
-steps rather than as end-to-end machinery.
+the workflow plumbing with monkeypatched API calls; a Layer 2 harness
+(`evals/layer2/`) grades agent judgment end-to-end over the 17-kernel
+`test-kernels/` corpus. Features are added in small, observable steps
+rather than as end-to-end machinery.
 
 If you want to hack on the workflow itself, read `AGENTS.md` first — it
 contains the gotchas (model id, env-loading, backend quirks) that will
