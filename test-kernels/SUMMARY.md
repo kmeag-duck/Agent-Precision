@@ -31,6 +31,40 @@ Common pattern: one op per element, no inter-element accumulation, output
 magnitudes bounded. Per-element relative error is bounded by `ulp(float)` ≈
 1.2e-7 regardless of `N`.
 
+> **Empirical correction — cancellation breaks "lowerable" for mixed-sign add/FMA:**
+> The per-element-bound argument above is right about the *operation*, but
+> wrong about the *outputs*. For `z = x + y` with `x, y ~ U(-1, 1)`, the
+> output density is triangular and peaked at zero; a small but nonzero
+> fraction of outputs falls below the fp32-input-quantization floor
+> (~1e-7 absolute), where the binding constraint stops being arithmetic
+> precision and becomes *input storage* precision — and `rtol = 1e-6`
+> is violated. Smoke runs at `--sig-figs 6` (cycle 1: all-`float`):
+>
+> | Kernel | Comparator failures (cycle 1) | Fraction |
+> |---|---|---|
+> | `kokkos/lowerable/vector_add.cpp`  |   230 / 16384   | ~1.4% |
+> | `kokkos/lowerable/saxpy_bounded.cpp` |   422 / 65536   | ~0.6% |
+> | `cuda/lowerable/saxpy.cu`          |  5865 / 1048576 | ~0.6% |
+>
+> In every case the cycle-2 analyst received the comparator evidence,
+> diagnosed the cancellation explicitly, and switched to all-`keep`;
+> the rewriter regenerated the original kernel; the verifier accepted;
+> the second comparator pass returned `status='ok'`. The workflow's
+> self-correction loop is doing the right thing — these were
+> ground-truth bugs in SUMMARY's "lowerable" labeling, not workflow
+> bugs. `evals/layer2/expected.py` encodes the empirically-correct
+> verdict (all `keep` for these four kernels) and tags them
+> `REVISED: empirical` with per-entry evidence pointers. `sigmoid.cu`
+> was likewise smoke-validated but stays `downcast` as written — the
+> output is bounded in (0, 1) and monotone in x, with no subtraction
+> site, so the pathology doesn't apply. `relu_activation.cpp` has no
+> arithmetic and is genuinely lowerable.
+>
+> The `lowerable` category here means "no per-element accumulation
+> pathology"; it does NOT mean "fp32 will pass `rtol = 1e-6` on this
+> input distribution." Future kernel additions to this category should
+> be smoke-validated before claiming lowerability.
+
 ---
 
 ## Needs precision — must stay double (or long double)
