@@ -256,13 +256,23 @@ def test_verifier_prompt_mentions_tolerance_and_precision_budget():
 
 
 def test_baseline_harness_schema_required_fields():
-    """The baseline_harness schema requires driver_source, kernel_function_name, inputs_summary, and output_arrays so a future mechanical comparator has everything it needs to compile, run, and read back the reference."""
+    """The Kokkos baseline_harness schema (v1) requires `drivers` (four per-precision driver sources), kernel_function_name, inputs_summary, and output_arrays. The orchestrator's spawn_baseline_harness branch writes drivers[baseline_precision] to baselines/<stem>/driver.cpp (the canonical baseline that feeds the v0 dynamic-verification chain) and the remaining drivers under baselines/<stem>/probe/<precision>/ for the v1 probe pipeline; absent or empty driver keys would silently collapse the probe into a single-precision run, so the schema rejects them."""
     assert set(BASELINE_HARNESS_OUTPUT_SCHEMA["required"]) == {
-        "driver_source",
+        "drivers",
         "kernel_function_name",
         "inputs_summary",
         "output_arrays",
     }
+    drivers_schema = BASELINE_HARNESS_OUTPUT_SCHEMA["properties"]["drivers"]
+    assert drivers_schema["type"] == "object"
+    assert set(drivers_schema["required"]) == {
+        "quad",
+        "double",
+        "float",
+        "mixed_io",
+    }
+    for precision in ("quad", "double", "float", "mixed_io"):
+        assert drivers_schema["properties"][precision]["type"] == "string"
 
 
 def test_baseline_harness_output_arrays_is_array_of_strings():
@@ -309,17 +319,24 @@ def test_baseline_harness_prompt_mandates_kernel_splice_sentinels():
     assert "// ---- KERNEL END ----" in prompt
 
 
-# ---------- v1 probe-pipeline contracts (BASELINE PRECISION + RNG_SEED) ----------
+# ---------- v1 probe-pipeline contracts (PER-PRECISION DRIVERS + RNG_SEED) ----------
 #
-# v1 added two new contracts to the Kokkos baseline harness so the
-# probe pipeline (a later commit) can drive the same harness output at
-# different precisions and seeds without re-asking the LLM.
+# v1 added two contracts to the Kokkos baseline harness so the probe
+# pipeline (a later commit) can drive the same kernel at different
+# precisions and seeds without re-asking the LLM per variant.
 #
-# (1) BASELINE PRECISION directive: an optional user-message line
-#     `BASELINE PRECISION: <token>` (token in {double, float, quad})
-#     that selects the storage type for all kernel-bound floating-
-#     point values and the JSON output format. Absent -> double
-#     (historical default). `quad` requires __float128 +
+# (1) PER-PRECISION DRIVERS: the harness emits FOUR drivers in a
+#     single submit_result call under `drivers.{quad,double,float,
+#     mixed_io}`. All four share the inlined kernel, alias names,
+#     RNG_SEED line, input sizes, and output array names+lengths
+#     (the comparator depends on shape-identical reference.json
+#     across precisions); they differ only in the per-parameter alias
+#     RHSes, host-side scratch precision, and reference.json
+#     formatting. `quad` is also the canonical baseline — the
+#     orchestrator writes drivers.quad to baselines/<stem>/driver.cpp
+#     so the v0 dynamic-verification chain compares the rewritten
+#     kernel against the true (quad) ground truth, not against a
+#     same-or-lower-precision reference. `quad` requires __float128 +
 #     <quadmath.h> + quadmath_snprintf "%.34Qg" and changes the
 #     compile link line (the compile step adds -lquadmath when the
 #     emitted source contains __float128).
@@ -333,12 +350,13 @@ def test_baseline_harness_prompt_mandates_kernel_splice_sentinels():
 #     re-run the driver at a different seed.
 
 
-def test_baseline_harness_prompt_honors_baseline_precision_directive():
-    """The Kokkos baseline harness prompt explains the optional `BASELINE PRECISION: <token>` user-message directive (token in {double, float, quad}) and defines what each token means for alias RHSes, JSON output format, and the `quad` case's __float128 / quadmath_snprintf machinery. Without this contract the probe pipeline cannot drive the same harness at different precisions; without the explicit `quad` instructions the harness would silently fall back to `double` (the historical default) and the probe's true-ground-truth signal would collapse."""
+def test_baseline_harness_prompt_mandates_per_precision_drivers():
+    """The Kokkos baseline harness prompt mandates the v1 PER-PRECISION DRIVERS contract: four drivers (quad, double, float, mixed_io) emitted in a single submit_result call under the `drivers` key. All four must share the inlined kernel, alias names, RNG_SEED line, input sizes, and output array names+lengths; they differ only in the per-parameter alias RHSes, host-side scratch precision, and reference.json formatting. The `quad` driver requires __float128 + <quadmath.h> + quadmath_snprintf %.34Qg (the canonical baseline; the orchestrator writes it to baselines/<stem>/driver.cpp). The `float` driver requires %.9g formatting. The `mixed_io` driver keeps I/O at the baseline precision but downcasts identified intermediate buffers to float, giving the analyst a cheap signal on output-vs-intermediate sensitivity. Without this contract the harness collapses back to a single-precision emit and the probe pipeline has nothing to consume."""
     prompt = AGENTS["baseline_harness"]["system_prompt"]
-    # The directive name and the three legal tokens are spelled out.
-    assert "BASELINE PRECISION" in prompt
-    assert "double" in prompt and "float" in prompt and "quad" in prompt
+    # The contract heading and the four precision tokens are spelled out.
+    assert "PER-PRECISION DRIVERS" in prompt
+    for precision in ("quad", "double", "float", "mixed_io"):
+        assert precision in prompt
     # The quad branch's load-bearing tokens — without these the harness
     # cannot actually emit a quad driver that compiles or formats JSON.
     assert "__float128" in prompt
@@ -348,6 +366,13 @@ def test_baseline_harness_prompt_honors_baseline_precision_directive():
     # The float branch's JSON format token (so the JSON file isn't
     # over-precise for the precision actually computed).
     assert "%.9g" in prompt
+    # The shape-identical-across-precisions rule (the comparator
+    # contract that the probe pipeline depends on).
+    lower = prompt.lower()
+    assert "shape-identical" in lower or "shape identical" in lower
+    # The mixed_io rule must name intermediate buffers as the thing
+    # that downcasts to float (vs. kernel I/O at baseline precision).
+    assert "intermediate" in lower
 
 
 def test_baseline_harness_prompt_mandates_named_rng_seed_constant():

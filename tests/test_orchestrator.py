@@ -1076,6 +1076,103 @@ def test_execute_tool_spawn_baseline_harness_overwrites_existing(
         == "NEW CONTENT"
 
 
+def test_execute_tool_spawn_baseline_harness_v1_drivers_fan_out(
+    monkeypatch, tmp_path
+):
+    """_execute_tool routes the Kokkos v1 4-driver harness output: drivers[baseline_precision] is written to baselines/<stem>/driver.cpp (the canonical baseline that feeds the v0 dynamic-verification chain), and every drivers[<precision>] is also written to baselines/<stem>/probe/<precision>/driver.cpp for the probe pipeline. The returned dict carries the canonical driver_path plus a probe_driver_paths map keyed by precision. The harness's v1 shape (drivers: dict) is detected by presence of the `drivers` key — the v0 shape (driver_source: str, still used by CUDA/HIP/SYCL/OMP-offload) remains supported on the same branch (separately asserted)."""
+    monkeypatch.chdir(tmp_path)
+
+    drivers_payload = {
+        "quad":     "// QUAD DRIVER\nint main(){return 0;}\n",
+        "double":   "// DOUBLE DRIVER\nint main(){return 0;}\n",
+        "float":    "// FLOAT DRIVER\nint main(){return 0;}\n",
+        "mixed_io": "// MIXED_IO DRIVER\nint main(){return 0;}\n",
+    }
+
+    def stub_run_agent(type_, task):
+        assert type_ == "baseline_harness_kokkos"
+        return {
+            "drivers": drivers_payload,
+            "kernel_function_name": "vector_add",
+            "inputs_summary": "N=16384, seed=42",
+            "output_arrays": ["z"],
+        }
+
+    monkeypatch.setattr(orchestrator, "run_agent", stub_run_agent)
+
+    result = _execute_tool(
+        "spawn_baseline_harness",
+        {"kernel_source": "KSRC", "kernel_stem": "vector_add"}, KOKKOS_PROFILE
+    )
+
+    assert result["status"] == "ok"
+    # The canonical baseline is the profile's baseline_precision
+    # variant (Kokkos -> "quad"). This is the file the existing v0
+    # compile_baseline_driver / run_baseline_driver / compare_outputs
+    # chain reads, so the finish gate now compares against the quad
+    # ground truth.
+    canonical = tmp_path / "baselines" / "vector_add" / "driver.cpp"
+    assert canonical.exists()
+    assert canonical.read_text() == drivers_payload[KOKKOS_PROFILE.baseline_precision]
+    assert result["driver_path"] == "baselines/vector_add/driver.cpp"
+
+    # Every precision variant ALSO lands under
+    # baselines/<stem>/probe/<precision>/driver.cpp (probe pipeline
+    # input). All four are emitted including the one that duplicates
+    # the canonical baseline — the probe_step tool in a later commit
+    # rewrites a seed line per-directory and reuses _compile_driver /
+    # _run_driver per-directory, so each precision needs its own
+    # self-contained tree.
+    probe_paths = result["probe_driver_paths"]
+    assert set(probe_paths.keys()) == set(drivers_payload.keys())
+    for precision, source in drivers_payload.items():
+        probe_file = (
+            tmp_path / "baselines" / "vector_add" / "probe" / precision / "driver.cpp"
+        )
+        assert probe_file.exists()
+        assert probe_file.read_text() == source
+        assert probe_paths[precision] == (
+            f"baselines/vector_add/probe/{precision}/driver.cpp"
+        )
+
+
+def test_execute_tool_spawn_baseline_harness_v0_driver_source_still_works(
+    monkeypatch, tmp_path
+):
+    """When the harness returns the v0 single-driver shape (`driver_source: str`, still used by CUDA / HIP / SYCL / OMP-offload profiles whose probe_precisions is the empty default), the orchestrator branch writes that source to the canonical baselines/<stem>/<driver_filename> and omits the v1-only probe_driver_paths key from the response. This back-compat path keeps the orchestrator language-agnostic until the deferred Commit 6 extends probe_precisions to the other profiles."""
+    monkeypatch.chdir(tmp_path)
+    from workflow.languages.cuda import CUDA_PROFILE
+
+    driver_text = "// cuda driver\nint main(){return 0;}\n"
+
+    def stub_run_agent(type_, task):
+        assert type_ == "baseline_harness_cuda"
+        return {
+            "driver_source": driver_text,
+            "kernel_function_name": "vector_add",
+            "inputs_summary": "N=16384, seed=42",
+            "output_arrays": ["z"],
+        }
+
+    monkeypatch.setattr(orchestrator, "run_agent", stub_run_agent)
+
+    result = _execute_tool(
+        "spawn_baseline_harness",
+        {"kernel_source": "KSRC", "kernel_stem": "vector_add"}, CUDA_PROFILE
+    )
+
+    assert result["status"] == "ok"
+    canonical = tmp_path / "baselines" / "vector_add" / "driver.cu"
+    assert canonical.exists()
+    assert canonical.read_text() == driver_text
+    # The v0 path MUST NOT advertise probe driver paths — the absence
+    # of this key is what tells a future probe orchestrator that this
+    # profile's probe pipeline is not yet wired.
+    assert "probe_driver_paths" not in result
+    # No probe/ subdirectory is created either.
+    assert not (tmp_path / "baselines" / "vector_add" / "probe").exists()
+
+
 # ---------- _format_baseline_block ----------
 
 

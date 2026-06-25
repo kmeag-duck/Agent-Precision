@@ -878,12 +878,12 @@ def _execute_tool(
             f"baseline_harness_{profile.id}",
             tool_input["kernel_source"],
         )
-        # Side artifact: persist the driver next to its kernel stem so the
-        # operator can `cd baselines/<stem>/` and compile it. This is the
-        # first _execute_tool branch that touches the filesystem; the path
-        # is computed from the orchestrator-supplied kernel_stem (not from
-        # the agent's output) so a misbehaving agent cannot redirect the
-        # write.
+        # Side artifact: persist the driver(s) next to its kernel stem so
+        # the operator can `cd baselines/<stem>/` and compile it. This is
+        # the first _execute_tool branch that touches the filesystem; the
+        # path is computed from the orchestrator-supplied kernel_stem (not
+        # from the agent's output) so a misbehaving agent cannot redirect
+        # the write.
         kernel_stem = tool_input["kernel_stem"]
         driver_dir = Path("baselines") / kernel_stem
         driver_dir.mkdir(parents=True, exist_ok=True)
@@ -891,12 +891,39 @@ def _execute_tool(
         # driver.cu for CUDA). Owned by the LanguageProfile so the
         # orchestrator stays language-agnostic.
         driver_path = driver_dir / profile.driver_filename
-        driver_path.write_text(result["driver_source"])
-        return {
+        # Two output shapes coexist: the v0 single-driver schema
+        # (`driver_source: str`) is still used by CUDA/HIP/SYCL/OMP-
+        # offload profiles; the v1 multi-driver schema (`drivers:
+        # {<precision>: str}`) is used by Kokkos (the only profile
+        # whose probe_precisions is populated). When `drivers` is
+        # present, the canonical baseline = `drivers[baseline_precision]`
+        # (which the profile pins to `quad` for Kokkos — so the finish-
+        # gate comparator compares the rewritten kernel against the
+        # true ground truth, not against a same-or-lower-precision
+        # reference). The remaining drivers fan out into per-precision
+        # probe subdirectories so the Commit 3 probe_step tool can
+        # reuse the existing compile/run helpers per directory.
+        probe_driver_paths: dict[str, str] = {}
+        if "drivers" in result:
+            drivers = result["drivers"]
+            canonical = drivers[profile.baseline_precision]
+            driver_path.write_text(canonical)
+            for precision, source in drivers.items():
+                probe_dir = driver_dir / "probe" / precision
+                probe_dir.mkdir(parents=True, exist_ok=True)
+                probe_path = probe_dir / profile.driver_filename
+                probe_path.write_text(source)
+                probe_driver_paths[precision] = str(probe_path)
+        else:
+            driver_path.write_text(result["driver_source"])
+        response: dict = {
             "status": "ok",
             "result": result,
             "driver_path": str(driver_path),
         }
+        if probe_driver_paths:
+            response["probe_driver_paths"] = probe_driver_paths
+        return response
     if tool_name == "compile_baseline_driver":
         # Deterministic tool (no LLM call): shells out to the
         # profile-selected compiler (g++ for Kokkos, eventually nvcc

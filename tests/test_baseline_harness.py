@@ -14,14 +14,32 @@ from .conftest import FakeResponse, ToolUseBlock
 
 
 def test_run_agent_baseline_harness_returns_submit_result_input(fake_anthropic):
-    """run_agent('baseline_harness', ...) returns the submit_result input and forces the baseline_harness output schema."""
+    """run_agent('baseline_harness', ...) returns the submit_result input and forces the baseline_harness output schema (v1: four per-precision drivers under `drivers`)."""
     payload = {
-        "driver_source": (
-            "// cd baselines/vector_add/ before running\n"
-            "// compile with a standard Kokkos toolchain\n"
-            "#include <Kokkos_Core.hpp>\n"
-            "int main() { Kokkos::initialize(); Kokkos::finalize(); }\n"
-        ),
+        "drivers": {
+            "quad": (
+                "// cd baselines/vector_add/ before running\n"
+                "#include <Kokkos_Core.hpp>\n"
+                "#include <quadmath.h>\n"
+                "int main() { Kokkos::initialize(); Kokkos::finalize(); }\n"
+            ),
+            "double": (
+                "// cd baselines/vector_add/ before running\n"
+                "#include <Kokkos_Core.hpp>\n"
+                "int main() { Kokkos::initialize(); Kokkos::finalize(); }\n"
+            ),
+            "float": (
+                "// cd baselines/vector_add/ before running\n"
+                "#include <Kokkos_Core.hpp>\n"
+                "int main() { Kokkos::initialize(); Kokkos::finalize(); }\n"
+            ),
+            "mixed_io": (
+                "// cd baselines/vector_add/ before running\n"
+                "#include <Kokkos_Core.hpp>\n"
+                "#include <quadmath.h>\n"
+                "int main() { Kokkos::initialize(); Kokkos::finalize(); }\n"
+            ),
+        },
         "kernel_function_name": "vector_add",
         "inputs_summary": "N=16384, seed=42, x,y ~ U(-1,1)",
         "output_arrays": ["z"],
@@ -46,10 +64,21 @@ def test_run_agent_baseline_harness_returns_submit_result_input(fake_anthropic):
     assert len(tools) == 1
     assert tools[0]["name"] == "submit_result"
     assert set(tools[0]["input_schema"]["required"]) == {
-        "driver_source",
+        "drivers",
         "kernel_function_name",
         "inputs_summary",
         "output_arrays",
+    }
+    # The `drivers` object itself requires all four precision keys —
+    # the schema rejects an absent or empty precision driver, which is
+    # the only signal that prevents the harness from collapsing the
+    # probe pipeline by silently omitting a variant.
+    drivers_schema = tools[0]["input_schema"]["properties"]["drivers"]
+    assert set(drivers_schema["required"]) == {
+        "quad",
+        "double",
+        "float",
+        "mixed_io",
     }
     # The user message passed to the model is exactly the task string.
     user_messages = call["messages"]

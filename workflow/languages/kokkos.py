@@ -145,20 +145,80 @@ def _detect_from_source(kernel_source: str) -> bool:
 BASELINE_HARNESS_OUTPUT_SCHEMA = {
     "type": "object",
     "properties": {
-        "driver_source": {
-            "type": "string",
+        "drivers": {
+            "type": "object",
             "description": (
-                "The full driver source as a single self-contained .cpp "
-                "translation unit. Must inline the kernel source verbatim, "
-                "compile against a standard Kokkos toolchain, and on "
-                "execution write reference outputs to ./reference.json."
+                "Four self-contained .cpp driver translation units, one per "
+                "probe precision. Each value is the full driver source as "
+                "a single string; each MUST inline the same kernel source "
+                "verbatim between the same splice sentinels, MUST declare "
+                "the same `static constexpr int RNG_SEED = ...;` constant "
+                "above the kernel begin sentinel, MUST share input sizes "
+                "and output array shapes (the comparator requires shape-"
+                "identical reference.json across precisions), and MUST "
+                "compile against a standard Kokkos toolchain. The four "
+                "drivers differ only in (a) the per-parameter "
+                "`<ParamName>Type` alias RHSes inside the kernel sentinels, "
+                "(b) any host-side scratch values that flow into the "
+                "kernel, and (c) the reference.json floating-point "
+                "formatting. The 'quad' driver is also the canonical "
+                "baseline (its reference.json is the finish-gate "
+                "ground truth); the other three feed the analyst probe "
+                "pipeline."
             ),
+            "properties": {
+                "quad": {
+                    "type": "string",
+                    "description": (
+                        "Driver with floating-point aliases resolved to "
+                        "`__float128` and reference.json values written "
+                        "via `quadmath_snprintf(buf, sizeof(buf), "
+                        "\"%.34Qg\", value)`. Includes <quadmath.h>; the "
+                        "compile step auto-links -lquadmath when the "
+                        "source contains the token __float128."
+                    ),
+                },
+                "double": {
+                    "type": "string",
+                    "description": (
+                        "Driver with floating-point aliases resolved to "
+                        "`double` and reference.json values written with "
+                        "`\"%.17g\"`."
+                    ),
+                },
+                "float": {
+                    "type": "string",
+                    "description": (
+                        "Driver with floating-point aliases resolved to "
+                        "`float` and reference.json values written with "
+                        "`\"%.9g\"`."
+                    ),
+                },
+                "mixed_io": {
+                    "type": "string",
+                    "description": (
+                        "Driver in which kernel I/O aliases (the values "
+                        "main() constructs and reads back) resolve to the "
+                        "baseline precision (`__float128`), but any "
+                        "intermediate buffers the kernel writes and then "
+                        "reads internally (if visible from the kernel "
+                        "signature as a distinct output-then-input View) "
+                        "resolve to `float`. For kernels with no such "
+                        "intermediate, this driver may be byte-identical "
+                        "to the `quad` driver — emit it anyway. "
+                        "reference.json formatting matches the I/O "
+                        "precision (quad / quadmath_snprintf %.34Qg)."
+                    ),
+                },
+            },
+            "required": ["quad", "double", "float", "mixed_io"],
         },
         "kernel_function_name": {
             "type": "string",
             "description": (
-                "Name of the kernel function the driver calls. Must match a "
-                "function defined in the inlined kernel source."
+                "Name of the kernel function the drivers call. Must match a "
+                "function defined in the inlined kernel source. Shared "
+                "across all four drivers."
             ),
         },
         "inputs_summary": {
@@ -166,21 +226,24 @@ BASELINE_HARNESS_OUTPUT_SCHEMA = {
             "description": (
                 "One-line human-readable summary of the chosen inputs, "
                 "e.g. 'N=16384, seed=42, x,y ~ U(-1,1)'. Mirrors the "
-                "'inputs' block the driver writes into reference.json."
+                "'inputs' block every driver writes into reference.json "
+                "(shape-identical across precisions)."
             ),
         },
         "output_arrays": {
             "type": "array",
             "description": (
-                "Names of the arrays the driver writes under the 'outputs' "
-                "key of reference.json. A future mechanical comparator "
-                "uses this list to know which arrays to read back."
+                "Names of the arrays each driver writes under the 'outputs' "
+                "key of reference.json. The comparator uses this list to "
+                "know which arrays to read back. Shared across all four "
+                "drivers (the probe pipeline depends on shape-identical "
+                "output layouts)."
             ),
             "items": {"type": "string"},
         },
     },
     "required": [
-        "driver_source",
+        "drivers",
         "kernel_function_name",
         "inputs_summary",
         "output_arrays",
@@ -198,37 +261,61 @@ the baseline against which a rewritten (lower-precision) version of the
 same kernel is compared.
 
 You do NOT compile, run, or simulate the kernel. You do NOT invent
-numerical output values. Your only output is the driver source.
+numerical output values. Your only output is the four driver sources.
 
-BASELINE PRECISION directive. The task message may include a line of
-the form `BASELINE PRECISION: <token>` where `<token>` is one of
-`double`, `float`, or `quad`. If absent, default to `double`. The
-directive selects the storage precision of every floating-point
-quantity the driver constructs that flows into the kernel (RHS of
-every per-parameter `using <ParamName>Type = ...;` alias defined
-below) AND the precision of the values written to reference.json.
+PER-PRECISION DRIVERS. You emit FOUR drivers in a single
+submit_result call under `drivers.{quad,double,float,mixed_io}`. All
+four MUST share:
+
+  - the same inlined kernel source (byte-identical between the
+    `// ---- KERNEL BEGIN ----` and `// ---- KERNEL END ----` sentinels),
+  - the same per-parameter `<ParamName>Type` alias NAMES (item 6),
+  - the same `static constexpr int RNG_SEED = ...;` line (item 3),
+  - the same input sizes, the same output array names, and the same
+    output array lengths (the comparator requires shape-identical
+    reference.json across precisions).
+
+The four drivers differ ONLY in:
+
+  - the RHS of each per-parameter `<ParamName>Type` alias,
+  - any host-side scratch values that ultimately flow into the kernel
+    (RNG fill loops, deep_copy targets, etc.) — these must be the
+    appropriate precision end-to-end, not down-converted through
+    `double` mid-driver,
+  - the reference.json floating-point formatting (item 8).
+
+Per-precision rules (apply to all four alias RHSes uniformly except
+in `mixed_io`):
 
   - `double`: aliases resolve to `double` / `Kokkos::View<double*>`;
-    JSON values written with `"%.17g"` (the historical default).
+    JSON values written with `"%.17g"`.
   - `float`: aliases resolve to `float` / `Kokkos::View<float*>`;
     JSON values written with `"%.9g"`.
   - `quad`: aliases resolve to `__float128` /
     `Kokkos::View<__float128*>`; the driver `#include <quadmath.h>`
     and writes JSON values via `quadmath_snprintf(buf, sizeof(buf),
     "%.34Qg", value)` (NOT via `snprintf` / `<<`, which do not
-    understand `__float128`). The compile step that follows expects
-    `-lquadmath` on the link line; you do not emit the compile
-    command, but the host-scratch helpers you write (RNG fill,
-    deep_copy targets) must therefore use `__float128` end-to-end
-    rather than down-converting through `double` mid-driver. Local
-    `std::uniform_real_distribution<...>` returns `double` — convert
-    explicitly with `static_cast<__float128>(...)` when storing into
-    the alias-typed view.
+    understand `__float128`). The compile step auto-links
+    `-lquadmath` when the driver source contains the token
+    `__float128`. Local `std::uniform_real_distribution<...>`
+    returns `double` — convert explicitly with
+    `static_cast<__float128>(...)` when storing into the alias-typed
+    view.
+  - `mixed_io`: aliases for kernel arguments that main() constructs
+    AND reads back (the kernel's external I/O) resolve to
+    `__float128` (the baseline precision); JSON formatting matches
+    (`quadmath_snprintf %.34Qg`). The exception is any kernel
+    parameter that is clearly an intermediate buffer (a View the
+    kernel writes early and reads back later within the same kernel
+    invocation, exposed in the signature only because Kokkos requires
+    it) — those aliases resolve to `float`. If no such intermediate
+    is identifiable from the kernel signature, this driver is
+    byte-identical to the `quad` driver; emit it anyway (the probe
+    pipeline still consumes it).
 
-The directive does NOT change the kernel function body. It changes
-the alias RHSes (item 6 below), the JSON output formatting (item 8),
-and any host-side scratch values that ultimately become kernel
-arguments.
+None of these driver variants changes the kernel function body. They
+change the alias RHSes (item 6 below), any host-side scratch values
+that flow into the kernel, and the JSON output formatting (item 8).
 
 Hard requirements on the driver:
 
@@ -360,14 +447,15 @@ Hard requirements on the driver:
 7. Kokkos::deep_copy any device Views you read from back to host Views
    before iterating them for JSON emission.
 
-8. Write the reference output to './reference.json' (relative to the
-   driver's working directory) using std::ofstream. Floating-point
-   formatting depends on the BASELINE PRECISION directive: `%.17g`
-   for `double`, `%.9g` for `float`, `quadmath_snprintf("%.34Qg", ...)`
-   for `quad`. Do NOT pull in a third-party JSON library — hand-roll
-   the writer; output arrays are flat arrays of one floating-point
-   type, so a few loops with manual braces, commas, and newlines are
-   sufficient.
+8. Each driver writes its reference output to './reference.json'
+   (relative to its own working directory; the orchestrator will
+   place each driver in a separate directory before running it) using
+   std::ofstream. Floating-point formatting follows the per-precision
+   rules above: `%.17g` for `double`, `%.9g` for `float`,
+   `quadmath_snprintf("%.34Qg", ...)` for `quad` and `mixed_io`. Do
+   NOT pull in a third-party JSON library — hand-roll the writer;
+   output arrays are flat arrays of one floating-point type, so a few
+   loops with manual braces, commas, and newlines are sufficient.
 
 9. The JSON document must have exactly this shape:
 
@@ -391,9 +479,15 @@ Hard requirements on the driver:
     line is fine; the operator will adapt it).
 
 Set kernel_function_name and output_arrays in your submit_result
-payload so they exactly match what the driver actually does. If your
-driver writes an array under "outputs" by some name, that same name
-must appear in output_arrays.
+payload so they exactly match what the four drivers actually do
+(shape-identical across precisions). If your drivers write an array
+under "outputs" by some name, that same name must appear in
+output_arrays.
+
+Populate `drivers.quad`, `drivers.double`, `drivers.float`, and
+`drivers.mixed_io` with the four full driver sources as described in
+PER-PRECISION DRIVERS above. All four are required; an absent or
+empty driver fails the schema.
 
 Return your result by calling the submit_result tool."""
 
