@@ -16,3 +16,4 @@ error_dumps/
 # runs
 baselines/
 kokkos/
+evals/results/
