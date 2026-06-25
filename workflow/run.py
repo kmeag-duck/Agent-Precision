@@ -42,6 +42,22 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
             "recommended for first-time debugging of a kernel."
         ),
     )
+    parser.add_argument(
+        "--no-probe",
+        action="store_true",
+        help=(
+            "Skip the precision probe step. By default, on language "
+            "profiles whose probe_precisions is non-empty (Kokkos in "
+            "v1), the orchestrator runs a small (precision, seed) "
+            "matrix of probe drivers before invoking the analyst and "
+            "attaches the aggregated evidence to the analyst task. "
+            "Pass this flag to reproduce the v0 (pre-probe) behavior "
+            "exactly, or for kernels where the probe's wall-clock cost "
+            "is not worth its evidence value. Profiles without probe "
+            "templates (every profile other than Kokkos in v1) ignore "
+            "this flag — they never had a probe step to skip."
+        ),
+    )
     tol_group = parser.add_mutually_exclusive_group()
     tol_group.add_argument(
         "--sig-figs",
@@ -99,6 +115,7 @@ def main(argv: list[str] | None = None) -> int:
         kernel_source,
         tolerance=tolerance,
         auto=args.auto,
+        run_probe=not args.no_probe,
     )
 
     if result is None:

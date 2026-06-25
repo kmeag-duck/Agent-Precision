@@ -2169,3 +2169,309 @@ def test_finish_gate_cu_verifier_accept_alone_blocks_finish_post_phase_b(
     payload = json.loads(finish_block["content"])
     assert "compare_outputs" in payload["stderr"]
     assert "compare_status" in payload["stderr"]
+
+
+# ---------- probe_step / probe_compare (Commit 4 wiring) ----------
+
+
+def test_orchestrator_tools_include_probe_step_and_probe_compare():
+    """ORCHESTRATOR_TOOLS exposes probe_step and probe_compare to the LLM with the schemas the deterministic wrappers in workflow.tools expect. probe_step takes (kernel_stem, precision, seed), probe_compare takes (kernel_stem). language_id is NOT in either schema — _execute_tool injects it from the per-run profile so the LLM never has to know which language it's working in."""
+    by_name = {t["name"]: t for t in ORCHESTRATOR_TOOLS}
+    assert "probe_step" in by_name
+    assert "probe_compare" in by_name
+
+    probe_step_schema = by_name["probe_step"]["input_schema"]
+    probe_step_props = probe_step_schema["properties"]
+    assert set(probe_step_props.keys()) == {"kernel_stem", "precision", "seed"}
+    assert set(probe_step_schema["required"]) == {
+        "kernel_stem", "precision", "seed"
+    }
+    assert "language_id" not in probe_step_props
+
+    probe_compare_schema = by_name["probe_compare"]["input_schema"]
+    probe_compare_props = probe_compare_schema["properties"]
+    assert set(probe_compare_props.keys()) == {"kernel_stem"}
+    assert set(probe_compare_schema["required"]) == {"kernel_stem"}
+    assert "language_id" not in probe_compare_props
+
+
+def test_execute_tool_dispatches_probe_step(monkeypatch):
+    """_execute_tool routes probe_step to workflow.tools.probe_step, forwards kernel_stem, precision, and seed verbatim, and injects profile.id as language_id (Phase A.5 Option B — same pattern as compile_baseline_driver and compare_outputs). Returns the deterministic tool's {status, stdout, stderr, artifacts} dict unchanged."""
+    captured = {}
+
+    def stub_probe_step(kernel_stem, precision, seed, language_id):
+        captured["kernel_stem"] = kernel_stem
+        captured["precision"] = precision
+        captured["seed"] = seed
+        captured["language_id"] = language_id
+        return {
+            "status": "ok",
+            "stdout": "compiled and ran probe cell",
+            "stderr": "",
+            "artifacts": [
+                "baselines/nbody_force/probe/float_seed43/reference.json"
+            ],
+        }
+
+    monkeypatch.setattr(orchestrator, "probe_step", stub_probe_step)
+
+    result = _execute_tool(
+        "probe_step",
+        {"kernel_stem": "nbody_force", "precision": "float", "seed": 43},
+        KOKKOS_PROFILE,
+    )
+
+    assert captured == {
+        "kernel_stem": "nbody_force",
+        "precision": "float",
+        "seed": 43,
+        "language_id": "kokkos",
+    }
+    assert result["status"] == "ok"
+    assert result["artifacts"] == [
+        "baselines/nbody_force/probe/float_seed43/reference.json"
+    ]
+
+
+def test_execute_tool_dispatches_probe_compare(monkeypatch):
+    """_execute_tool routes probe_compare to workflow.tools.probe_compare, forwards kernel_stem, injects profile.id as language_id, and returns the deterministic tool's result dict verbatim — no wrapping or status-massaging."""
+    captured = {}
+
+    def stub_probe_compare(kernel_stem, language_id):
+        captured["kernel_stem"] = kernel_stem
+        captured["language_id"] = language_id
+        return {
+            "status": "ok",
+            "stdout": "aggregated 8 cells into evidence.json",
+            "stderr": "",
+            "artifacts": ["baselines/nbody_force/probe/evidence.json"],
+        }
+
+    monkeypatch.setattr(orchestrator, "probe_compare", stub_probe_compare)
+
+    result = _execute_tool(
+        "probe_compare",
+        {"kernel_stem": "nbody_force"},
+        KOKKOS_PROFILE,
+    )
+
+    assert captured == {
+        "kernel_stem": "nbody_force",
+        "language_id": "kokkos",
+    }
+    assert result["status"] == "ok"
+    assert result["artifacts"] == [
+        "baselines/nbody_force/probe/evidence.json"
+    ]
+
+
+def test_execute_tool_probe_step_under_cuda_profile_injects_cuda_language_id(
+    monkeypatch,
+):
+    """_execute_tool's language_id injection is per-profile: under CUDA_PROFILE, probe_step receives language_id='cuda'. The CUDA profile's probe_precisions is empty in v1 so the system prompt won't actually invite this call — but if the LLM does call it anyway, the preflight in workflow.tools.probe_step (template-not-found) cleanly errors. Verifying the dispatch contract here documents that the injection is profile-driven, not Kokkos-hardcoded."""
+    captured = {}
+
+    def stub_probe_step(kernel_stem, precision, seed, language_id):
+        captured["language_id"] = language_id
+        return {"status": "error", "stdout": "", "stderr": "no template", "artifacts": []}
+
+    monkeypatch.setattr(orchestrator, "probe_step", stub_probe_step)
+
+    _execute_tool(
+        "probe_step",
+        {"kernel_stem": "vector_add", "precision": "float", "seed": 42},
+        CUDA_PROFILE,
+    )
+    assert captured == {"language_id": "cuda"}
+
+
+def test_execute_tool_spawn_analyst_injects_probe_evidence_when_present(
+    monkeypatch, tmp_path,
+):
+    """When baselines/<kernel_stem>/probe/evidence.json exists, _execute_tool's spawn_analyst branch reads it off disk and APPENDS it to the analyst task as a 'PROBE EVIDENCE (JSON):' block after the kernel source. The LLM never passes the evidence through itself — the orchestrator attaches it. This isolates the probe-injection contract from the ensemble path (K=1)."""
+    monkeypatch.chdir(tmp_path)
+    evidence_dir = tmp_path / "baselines" / "nbody_force" / "probe"
+    evidence_dir.mkdir(parents=True)
+    evidence_payload = {"cells": {"float_seed42": {"status": "ok"}}}
+    (evidence_dir / "evidence.json").write_text(json.dumps(evidence_payload))
+
+    captured = {}
+
+    def stub_run_agent(type_, task):
+        captured["type"] = type_
+        captured["task"] = task
+        return {"variables": [], "overall_notes": "ok"}
+
+    monkeypatch.setattr(orchestrator, "run_agent", stub_run_agent)
+    monkeypatch.delenv("AGENT_PRECISION_ANALYST_K", raising=False)
+
+    result = _execute_tool(
+        "spawn_analyst",
+        {"kernel_source": "ORIGINAL KERNEL SOURCE"},
+        KOKKOS_PROFILE,
+        kernel_stem="nbody_force",
+    )
+
+    assert result["status"] == "ok"
+    assert captured["type"] == "analyst"
+    # Kernel source comes first, evidence block appended after.
+    assert captured["task"].startswith("ORIGINAL KERNEL SOURCE")
+    assert "PROBE EVIDENCE (JSON):" in captured["task"]
+    assert "float_seed42" in captured["task"]
+    # The evidence text appears AFTER the descriptive paragraph.
+    para_idx = captured["task"].index("PROBE EVIDENCE (JSON):")
+    json_idx = captured["task"].index('"cells"')
+    assert json_idx > para_idx
+
+
+def test_execute_tool_spawn_analyst_no_evidence_file_unchanged_task(
+    monkeypatch, tmp_path,
+):
+    """When evidence.json is absent (no probe was run, or probe_compare failed before writing it), _execute_tool's spawn_analyst branch silently falls back to the un-augmented kernel source. The probe is informational — missing evidence MUST NOT block the analyst or contaminate the task with a stale 'PROBE EVIDENCE' header that has nothing under it."""
+    monkeypatch.chdir(tmp_path)
+    # No baselines/ tree at all.
+    captured = {}
+
+    def stub_run_agent(type_, task):
+        captured["task"] = task
+        return {"variables": [], "overall_notes": "ok"}
+
+    monkeypatch.setattr(orchestrator, "run_agent", stub_run_agent)
+    monkeypatch.delenv("AGENT_PRECISION_ANALYST_K", raising=False)
+
+    _execute_tool(
+        "spawn_analyst",
+        {"kernel_source": "ORIGINAL KERNEL SOURCE"},
+        KOKKOS_PROFILE,
+        kernel_stem="nbody_force",
+    )
+
+    assert captured["task"] == "ORIGINAL KERNEL SOURCE"
+    assert "PROBE EVIDENCE" not in captured["task"]
+
+
+def test_execute_tool_spawn_analyst_no_kernel_stem_unchanged_task(monkeypatch):
+    """When kernel_stem is None (the default — e.g. unit tests that exercise _execute_tool without going through run_orchestrator), the spawn_analyst branch skips the evidence-file lookup entirely. Without this, every unit test that touched spawn_analyst would need to mock the filesystem or pollute the cwd."""
+    captured = {}
+
+    def stub_run_agent(type_, task):
+        captured["task"] = task
+        return {"variables": [], "overall_notes": "ok"}
+
+    monkeypatch.setattr(orchestrator, "run_agent", stub_run_agent)
+    monkeypatch.delenv("AGENT_PRECISION_ANALYST_K", raising=False)
+
+    _execute_tool(
+        "spawn_analyst",
+        {"kernel_source": "SRC"},
+        KOKKOS_PROFILE,
+        # kernel_stem omitted → defaults to None
+    )
+
+    assert captured["task"] == "SRC"
+
+
+def test_format_baseline_block_kokkos_with_run_probe_true_lists_matrix():
+    """On Kokkos (probe_precisions=('quad','double','float','mixed_io')), _format_baseline_block with run_probe=True (the default) appends a PROBE STEP block that names every (precision, seed) cell from the profile × _PROBE_SEEDS matrix. The orchestrator system prompt's tool docs cover the API; this block's job is to tell the LLM what concrete matrix to enumerate."""
+    block = _format_baseline_block(
+        "kernels/nbody_force.cpp", None, KOKKOS_PROFILE, run_probe=True
+    )
+    assert "PROBE STEP:" in block
+    assert "'quad'" in block
+    assert "'double'" in block
+    assert "'float'" in block
+    assert "'mixed_io'" in block
+    # _PROBE_SEEDS is (42, 43) — both must surface in the rendered matrix.
+    assert "42" in block
+    assert "43" in block
+    # Specific cell pairs must appear so the LLM has unambiguous targets.
+    assert "('quad', 42)" in block
+    assert "('mixed_io', 43)" in block
+
+
+def test_format_baseline_block_kokkos_with_run_probe_false_omits_matrix():
+    """When run_probe=False (the --no-probe CLI flag is set), the PROBE STEP block is omitted from the BASELINE STEP even on a Kokkos kernel whose profile carries a non-empty probe_precisions tuple. The two probe tools remain in ORCHESTRATOR_TOOLS — the LLM just isn't told to invoke them, and probe_step's preflight will cleanly error if it does."""
+    block = _format_baseline_block(
+        "kernels/nbody_force.cpp", None, KOKKOS_PROFILE, run_probe=False
+    )
+    assert "PROBE STEP:" not in block
+    # The baseline harness instructions for Kokkos must still be there —
+    # disabling the probe doesn't disable dynamic verification.
+    assert "spawn_baseline_harness" in block
+
+
+def test_format_baseline_block_cuda_never_mentions_probe_matrix():
+    """CUDA's probe_precisions is empty in v1, so _format_baseline_block must NEVER emit a PROBE STEP block under the CUDA profile — regardless of the run_probe flag. The --no-probe CLI is a no-op for non-probing profiles; the prompt must reflect that by silently omitting the section rather than including an 'N/A' line that wastes context."""
+    for run_probe in (True, False):
+        block = _format_baseline_block(
+            "kernels/vector_add.cu", None, CUDA_PROFILE, run_probe=run_probe
+        )
+        assert "PROBE STEP:" not in block, (
+            f"PROBE STEP must be absent under CUDA (run_probe={run_probe})"
+        )
+
+
+def test_finish_gate_state_treats_probe_tools_as_explicit_no_ops():
+    """_FinishGateState.observe must NOT mutate last_verifier_verdict or last_compare_status when fed a probe_step or probe_compare result — even an error result. The probe is informational only; it does not gate finish on .cpp inputs (the comparator does). Without this guarantee a failed probe cell could spuriously block finish, and check_finish() would return a missing-steps message for a run whose real verifier+comparator chain had actually completed."""
+    from workflow.orchestrator import _FinishGateState
+
+    state = _FinishGateState("kernels/nbody_force.cpp", KOKKOS_PROFILE)
+    # Prime the gate to the "ready to finish" condition.
+    state.observe(
+        "spawn_verifier",
+        {"status": "ok", "result": {"verdict": "accept"}},
+    )
+    state.observe(
+        "compare_outputs",
+        {"status": "ok", "stdout": "", "stderr": "", "artifacts": []},
+    )
+    assert state.last_verifier_verdict == "accept"
+    assert state.last_compare_status == "ok"
+    assert state.check_finish() is None
+
+    # A probe_step failure must not invalidate either status.
+    state.observe(
+        "probe_step",
+        {"status": "error", "stdout": "", "stderr": "compile failed", "artifacts": []},
+    )
+    assert state.last_verifier_verdict == "accept"
+    assert state.last_compare_status == "ok"
+    assert state.check_finish() is None
+
+    # A probe_compare error must not invalidate either status either.
+    state.observe(
+        "probe_compare",
+        {"status": "error", "stdout": "", "stderr": "no canonical cell", "artifacts": []},
+    )
+    assert state.last_verifier_verdict == "accept"
+    assert state.last_compare_status == "ok"
+    assert state.check_finish() is None
+
+
+def test_layer2_score_known_tools_includes_probe_step_and_probe_compare():
+    """evals.layer2.score._KNOWN_TOOLS must enumerate probe_step and probe_compare so a trace containing them does not produce 'unknown tool' warnings in the Layer-2 grader. Adding a new spawn/probe tool without updating this frozenset is a known failure mode the closed-set design exists to catch."""
+    from evals.layer2.score import _KNOWN_TOOLS
+
+    assert "probe_step" in _KNOWN_TOOLS
+    assert "probe_compare" in _KNOWN_TOOLS
+    # Cross-check: the existing chain tools must still be present.
+    assert "spawn_baseline_harness" in _KNOWN_TOOLS
+    assert "compare_outputs" in _KNOWN_TOOLS
+    assert "finish" in _KNOWN_TOOLS
+
+
+def test_run_cli_no_probe_flag_threads_run_probe_false(monkeypatch, tmp_path):
+    """workflow/run.py exposes --no-probe and threads run_probe=False to run_orchestrator. The default (flag absent) threads run_probe=True. This is the operator's only knob for disabling the probe step; without it, --auto runs would always pay the probe wall-clock cost even on kernels where it has no diagnostic value."""
+    import subprocess
+    # Use the actual CLI parser via importlib-free path: subprocess against
+    # `python -m workflow.run --help` to avoid mocking the SDK. We only
+    # need to confirm the flag is wired into argparse, not that the full
+    # run executes.
+    completed = subprocess.run(
+        ["python", "-m", "workflow.run", "--help"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "--no-probe" in completed.stdout

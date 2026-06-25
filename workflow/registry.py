@@ -450,7 +450,40 @@ Return your result by calling the submit_result tool with:
   tolerance.
 - overall_notes: brief cross-cutting observations that shaped your calls.
 
-You do not rewrite code. Another agent will do that based on your verdict."""
+You do not rewrite code. Another agent will do that based on your verdict.
+
+PROBE EVIDENCE (when present in your task):
+- If your task includes a 'PROBE EVIDENCE (JSON)' block at the end,
+  the orchestrator already ran the kernel at several precisions
+  (currently quad / double / float / mixed_io) and seeds (currently
+  42 and 43) before invoking you, and is showing you per-output
+  numerical stats from those runs against the quad/seed=42 ground
+  truth. Use this evidence to corroborate or temper your verdict —
+  do NOT let it override the source-level analysis you would
+  otherwise do. Specifically:
+  - A 'float_seed42' or 'mixed_io_seed42' cell whose per-output
+    stats are well below the tolerance is evidence in favor of a
+    'downcast' verdict for the kernel's float-storage variables;
+    a cell whose stats are AT or ABOVE the tolerance is evidence
+    against the same.
+  - A large cross-seed delta (the same precision behaves very
+    differently at seed=42 vs seed=43) is evidence of input-
+    dependent rounding pain — usually a sign that downcast is risky
+    even if the seed=42 cell looks fine. Lean toward 'keep' or
+    'emulate' for the dominant accumulator in that case.
+  - A 'no_quad_partner' or 'missing' or 'load_error' cell means no
+    signal — NOT 'precision is safe'. Reason from source for those
+    variables.
+  - The evidence is per-output (e.g. the kernel's final array),
+    not per-variable. Map outputs back to the variables that
+    produced them using your source-level understanding of the
+    kernel; if a variable feeds a clean output, its downcast is
+    safer than a variable that feeds a noisy one.
+  - The probe was run on the canonical seed (42) plus one adjacent
+    seed (43); it is a sanity check, not a stress test. A clean
+    probe does not license aggressive downcasting on edge-case
+    inputs the probe never saw. Keep your precision_budget
+    headroom_argument source-grounded."""
 
 # ---------------------------------------------------------------------------
 # Rewriter

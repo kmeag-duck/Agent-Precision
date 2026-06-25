@@ -27,6 +27,8 @@ from .tools import (
     compare_outputs,
     compile_baseline_driver,
     compile_rewritten_driver,
+    probe_compare,
+    probe_step,
     run_baseline_driver,
     run_rewritten_driver,
     splice_rewritten_kernel,
@@ -45,7 +47,13 @@ ORCHESTRATOR_MODEL = "claude-opus-4-7"
 # left unattended. Raised from 20 to 40 to accommodate the dynamic-
 # verification chain (splice -> compile_rewritten -> run_rewritten ->
 # compare) appended after the analyst -> rewriter -> verifier loop.
-MAX_TURNS = 40
+# Raised again from 40 to 60 in v1 to accommodate the precision probe
+# (1 baseline harness + 1 baseline compile + 1 baseline run + up to 8
+# probe_step cells + 1 probe_compare = up to 12 calls before the
+# analyst even starts), plus headroom for a verifier-driven rewriter
+# retry (analyst -> rewriter -> verifier -> rewriter -> verifier ->
+# splice -> compile -> run -> compare).
+MAX_TURNS = 60
 
 # Fallback tolerance applied when the user did not pass --sig-figs or
 # --decimal-digits AND the precision_advisor returned kind='unknown'. 6
@@ -173,6 +181,39 @@ You also have two deterministic (non-LLM) tools:
     profiles where the chain is required) but does NOT block the
     analyst -> rewriter -> verifier pipeline itself.
 
+  - probe_step: takes a kernel_stem, a precision, and a seed. Reads
+    the per-precision driver template at
+    baselines/<kernel_stem>/probe/<precision>/driver.cpp (written by
+    the v1 baseline_harness alongside the canonical baseline),
+    rewrites its 'static constexpr int RNG_SEED = ...;' line to the
+    requested seed, then compiles and runs the rewritten driver under
+    baselines/<kernel_stem>/probe/<precision>_seed<seed>/. The
+    template directory is never touched. Returns
+    {status, stdout, stderr, artifacts}. The probe is INFORMATIONAL:
+    its output flows into the analyst as evidence (see probe_compare
+    below); it is NOT a finish-gate precondition, and a failed cell
+    does NOT block any downstream step. Call this exactly once per
+    (precision, seed) cell, and only when the BASELINE STEP block in
+    the user message tells you to. The user message lists the exact
+    (precision, seed) matrix to drive; do not invent additional
+    cells, and do not skip cells the matrix lists. Profiles whose
+    BASELINE STEP block does not mention probe_step have no probe
+    templates on disk and the tool will hard-error if called.
+
+  - probe_compare: takes a kernel_stem and aggregates whatever
+    per-cell probe_step results landed under baselines/<kernel_stem>/
+    probe/ into a single baselines/<kernel_stem>/probe/evidence.json
+    document. Returns {status, stdout, stderr, artifacts}. Hard-errors
+    only when the canonical quad/seed=42 cell is missing (no ground
+    truth -> no comparison); any other missing or failed cell is
+    recorded with a non-ok status and skipped during the stats walk.
+    The aggregated evidence is INFORMATIONAL: the orchestrator loop
+    automatically attaches it to the next spawn_analyst call's task
+    prompt as a PROBE EVIDENCE (JSON) block — you do NOT need to
+    pass it through yourself. Call this exactly once, after all
+    probe_step cells the matrix lists have been attempted (succeed or
+    fail), and before spawn_analyst.
+
   - splice_rewritten_kernel: takes a kernel_stem and the rewriter's
     rewritten kernel source. Reads the baseline driver source under
     baselines/<kernel_stem>/ (written by spawn_baseline_harness),
@@ -265,10 +306,20 @@ Tolerance handling:
   analyst saw so it can audit the precision_budget block.
 
 Your job after the tolerance is fixed:
+0. If the user message's BASELINE STEP block invites it (Kokkos C++
+   in v1; other languages today silently skip this whole step), run
+   spawn_baseline_harness, then compile_baseline_driver, then
+   run_baseline_driver. If the BASELINE STEP block additionally lists
+   a probe matrix (precision/seed pairs), drive each cell with one
+   probe_step call, then call probe_compare exactly once. Failures
+   in any baseline or probe call are non-fatal to the analyst ->
+   rewriter -> verifier loop; proceed to step 1 in either case.
 1. Call spawn_analyst with a kernel_source argument that contains the
    kernel and a clearly-labeled tolerance block (target_kind,
    target_value, source). The analyst will fill precision_budget from
-   that block.
+   that block. If probe_compare succeeded, the orchestrator will
+   automatically attach the aggregated probe evidence to the task; you
+   do not need to thread it through yourself.
 2. Translate the analyst's verdict into a self-contained task_prompt for
    the rewriter. The prompt must include the full kernel source, the
    agreed tolerance, and, for each variable, the analyst's chosen
@@ -647,6 +698,94 @@ ORCHESTRATOR_TOOLS = [
         },
     },
     {
+        "name": "probe_step",
+        "description": (
+            "Deterministic (non-LLM) tool. Runs one (precision, seed) "
+            "cell of the precision probe: rewrites the RNG_SEED line of "
+            "baselines/<kernel_stem>/probe/<precision>/driver.cpp "
+            "(written by spawn_baseline_harness as a template for "
+            "seed=42), writes the rewritten source to "
+            "baselines/<kernel_stem>/probe/<precision>_seed<seed>/"
+            "driver.cpp, compiles it, runs it, and validates the "
+            "resulting reference.json. The template directory is never "
+            "touched. Returns {status, stdout, stderr, artifacts}. The "
+            "probe is INFORMATIONAL for the analyst (it lets the "
+            "analyst reason from numerical evidence, not just from "
+            "source); it is NOT a finish-gate precondition. Available "
+            "only on language profiles whose probe_precisions is "
+            "non-empty (currently Kokkos: quad / double / float / "
+            "mixed_io). Call once per (precision, seed) cell after a "
+            "successful run_baseline_driver and before spawn_analyst; "
+            "skip cleanly on profiles where the BASELINE STEP block "
+            "does not mention probe_step."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "kernel_stem": {
+                    "type": "string",
+                    "description": (
+                        "Filesystem-safe short name for this kernel; "
+                        "MUST match the kernel_stem passed to the "
+                        "preceding spawn_baseline_harness call."
+                    ),
+                },
+                "precision": {
+                    "type": "string",
+                    "description": (
+                        "Which probe driver template to use. Must be a "
+                        "key the harness emitted under drivers.* "
+                        "(Kokkos: 'quad', 'double', 'float', 'mixed_io')."
+                    ),
+                },
+                "seed": {
+                    "type": "integer",
+                    "description": (
+                        "The RNG seed to bake into the rewritten driver "
+                        "source. v1 drives the canonical seed 42 and "
+                        "the adjacent seed 43; vary one cell at a time."
+                    ),
+                },
+            },
+            "required": ["kernel_stem", "precision", "seed"],
+        },
+    },
+    {
+        "name": "probe_compare",
+        "description": (
+            "Deterministic (non-LLM) tool. Aggregates the per-cell "
+            "probe runs under baselines/<kernel_stem>/probe/ into a "
+            "single evidence.json document for the analyst: per-output "
+            "stats for every non-quad cell against its same-seed quad "
+            "ground truth, plus cross-seed deltas so the analyst can "
+            "tell seed-correlated precision pain from seed-independent "
+            "pain. Cells whose probe_step failed (or was never run) "
+            "are recorded with a non-ok status and skipped in the "
+            "stats walk; the analyst sees exactly which signals are "
+            "real. Returns {status, stdout, stderr, artifacts}. "
+            "Hard-errors only when the canonical quad_seed42 cell is "
+            "missing — without it there is no ground truth. Call once "
+            "after all probe_step cells have been attempted, and "
+            "before spawn_analyst. The evidence is INFORMATIONAL: the "
+            "analyst sees it but is told to treat it as one input "
+            "among several, not as a verdict."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "kernel_stem": {
+                    "type": "string",
+                    "description": (
+                        "Filesystem-safe short name for this kernel; "
+                        "MUST match the kernel_stem passed to the "
+                        "preceding probe_step calls."
+                    ),
+                },
+            },
+            "required": ["kernel_stem"],
+        },
+    },
+    {
         "name": "compare_outputs",
         "description": (
             "Deterministic (non-LLM) tool. Numerically compares "
@@ -768,7 +907,10 @@ def _hitl_pause(tool_name: str, tool_input: dict) -> str:
 
 
 def _execute_tool(
-    tool_name: str, tool_input: dict, profile: LanguageProfile
+    tool_name: str,
+    tool_input: dict,
+    profile: LanguageProfile,
+    kernel_stem: str | None = None,
 ) -> dict:
     """Actually run the requested tool. Returns the result to feed back.
 
@@ -780,11 +922,59 @@ def _execute_tool(
     The LLM never sees or chooses `language_id` — that would be a
     constant per run with no real choice — so this is the single
     chokepoint where the per-run profile meets the per-tool call.
+
+    `kernel_stem` is the per-run kernel stem (Path(kernel_path).stem) so
+    the spawn_analyst branch can locate the probe evidence written by
+    a prior probe_compare call at baselines/<kernel_stem>/probe/
+    evidence.json and inject it into the analyst's task prompt as a
+    PROBE EVIDENCE (JSON) block. The LLM does not pass the evidence
+    through itself (that would be both fragile and a large token
+    duplicate of what is already on disk); the orchestrator attaches
+    it on the analyst's behalf. None means "no probe evidence
+    available" — kept optional for tests that exercise _execute_tool
+    in isolation.
     """
     if tool_name == "spawn_precision_advisor":
         result = run_agent("precision_advisor", tool_input["kernel_source"])
         return {"status": "ok", "result": result}
     if tool_name == "spawn_analyst":
+        # Probe evidence injection: if a prior probe_compare call wrote
+        # baselines/<kernel_stem>/probe/evidence.json, append it to the
+        # analyst task as a PROBE EVIDENCE (JSON) block. The block is
+        # appended (not prepended) so it sits AFTER the kernel source
+        # the LLM passed in -- mirroring the orchestrator's existing
+        # convention of putting raw inputs first and metadata blocks
+        # second. If evidence.json is absent (no probe was run, or
+        # probe_compare failed before writing it) or unreadable, we
+        # silently fall back to the un-augmented task: the probe is
+        # informational and missing evidence must not block the
+        # analyst.
+        analyst_task = tool_input["kernel_source"]
+        if kernel_stem is not None:
+            evidence_path = (
+                Path("baselines") / kernel_stem / "probe" / "evidence.json"
+            )
+            if evidence_path.is_file():
+                try:
+                    evidence_text = evidence_path.read_text()
+                except OSError:
+                    evidence_text = None
+                if evidence_text is not None:
+                    analyst_task = (
+                        f"{analyst_task}\n\n"
+                        "PROBE EVIDENCE (JSON): the orchestrator ran a "
+                        "precision probe on this kernel before invoking "
+                        "you. The aggregated evidence below shows, for "
+                        "each (precision, seed) cell that succeeded, "
+                        "per-output stats against the quad/seed=42 "
+                        "ground truth, plus cross-seed deltas. Treat it "
+                        "as ONE input among several: corroborate it "
+                        "against the source you can see, do not let it "
+                        "override your own analysis, and remember that "
+                        "a 'no_quad_partner' or 'missing' cell means no "
+                        "signal -- not 'precision is safe'.\n"
+                        f"{evidence_text}"
+                    )
         # Optional self-consistency ensemble: when AGENT_PRECISION_ANALYST_K
         # is > 1, run the analyst K times in parallel at
         # AGENT_PRECISION_ANALYST_T (default 0.7 for genuine diversity)
@@ -800,7 +990,7 @@ def _execute_tool(
             )
             verdicts = run_agent_ensemble(
                 "analyst",
-                tool_input["kernel_source"],
+                analyst_task,
                 k=k,
                 temperature=temperature,
             )
@@ -810,7 +1000,7 @@ def _execute_tool(
                 "result": aggregated,
                 "aggregator_metadata": report,
             }
-        result = run_agent("analyst", tool_input["kernel_source"])
+        result = run_agent("analyst", analyst_task)
         return {"status": "ok", "result": result}
     if tool_name == "spawn_rewriter":
         result = run_agent("rewriter", tool_input["task_prompt"])
@@ -990,6 +1180,33 @@ def _execute_tool(
             tool_input["tolerance_json"],
             profile.id,
         )
+    if tool_name == "probe_step":
+        # Deterministic tool (no LLM call): seed-rewrites a per-precision
+        # driver template that the v1 baseline_harness wrote under
+        # baselines/<stem>/probe/<precision>/, then compiles and runs it
+        # under baselines/<stem>/probe/<precision>_seed<seed>/. The
+        # template directory is never touched. `profile.id` is injected
+        # here so the LLM never has to pass it; only profiles whose
+        # probe_precisions is non-empty have working templates to act
+        # on (the system prompt's BASELINE STEP block silently omits
+        # the probe instructions otherwise). Returns the same
+        # {status, stdout, stderr, artifacts} shape verbatim.
+        return probe_step(
+            tool_input["kernel_stem"],
+            tool_input["precision"],
+            tool_input["seed"],
+            profile.id,
+        )
+    if tool_name == "probe_compare":
+        # Deterministic tool (no LLM call): aggregates the per-cell
+        # probe runs into baselines/<stem>/probe/evidence.json. The
+        # orchestrator does NOT pass this evidence into spawn_analyst
+        # as a tool argument; instead, the spawn_analyst branch below
+        # reads evidence.json off disk and appends it to the analyst
+        # task prompt as a PROBE EVIDENCE block (mirroring the
+        # tolerance / baseline blocks pattern). Returns the same
+        # {status, stdout, stderr, artifacts} shape verbatim.
+        return probe_compare(tool_input["kernel_stem"], profile.id)
     raise ValueError(f"Unknown tool: {tool_name}")
 
 
@@ -1026,7 +1243,10 @@ def _format_tolerance_block(tolerance: dict | None) -> str:
 
 
 def _format_baseline_block(
-    kernel_path: str, kernel_name: str | None, profile: LanguageProfile
+    kernel_path: str,
+    kernel_name: str | None,
+    profile: LanguageProfile,
+    run_probe: bool = True,
 ) -> str:
     """Render the BASELINE STEP block embedded in the initial user message.
 
@@ -1059,6 +1279,49 @@ def _format_baseline_block(
     target_line = (
         f"TARGET KERNEL: {kernel_name}\n" if kernel_name else ""
     )
+    # Probe matrix is silently omitted on profiles whose
+    # probe_precisions tuple is empty (every profile other than
+    # Kokkos in v1). The two probe tools still exist in
+    # ORCHESTRATOR_TOOLS, but without explicit instructions naming
+    # the matrix the orchestrator should not invoke them on a
+    # non-probing profile; if it does, probe_step's preflight
+    # ("template not found") cleanly errors.
+    if profile.probe_precisions and run_probe:
+        from .tools import _PROBE_SEEDS  # local import: private helper
+        precisions_list = ", ".join(repr(p) for p in profile.probe_precisions)
+        seeds_list = ", ".join(str(s) for s in _PROBE_SEEDS)
+        cells = [
+            f"({precision!r}, {seed})"
+            for seed in _PROBE_SEEDS
+            for precision in profile.probe_precisions
+        ]
+        probe_block = (
+            "PROBE STEP: this kernel's language profile carries a "
+            f"non-empty probe_precisions tuple ({precisions_list}). "
+            "After run_baseline_driver returns status='ok', drive the "
+            "precision probe before calling spawn_analyst. The probe "
+            "matrix for this run is:\n"
+            f"  precisions: {precisions_list}\n"
+            f"  seeds:      {seeds_list}\n"
+            f"  cells:      {len(cells)} total = "
+            + " | ".join(cells) + "\n"
+            "Call probe_step exactly once per cell (the order does not "
+            "matter; canonical order is seeds outer, precisions inner). "
+            "Each probe_step call takes kernel_stem (same KERNEL STEM "
+            "as above), precision (one of the precisions listed), and "
+            "seed (one of the seeds listed). Cell failures are "
+            "non-fatal: continue to the next cell. After every cell has "
+            "been attempted, call probe_compare exactly once with the "
+            "same KERNEL STEM. probe_compare hard-errors only if the "
+            "canonical quad/seed=42 cell is missing. The aggregated "
+            "evidence is attached to spawn_analyst automatically; you "
+            "do not pass it through yourself. If run_baseline_driver "
+            "did NOT return status='ok' (so the probe templates may "
+            "not be on disk in usable shape), skip the probe step "
+            "entirely and proceed to spawn_analyst.\n"
+        )
+    else:
+        probe_block = ""
     return (
         f"BASELINE STEP: this is a {profile.display_name} kernel, so "
         "you SHOULD call spawn_baseline_harness exactly once to generate "
@@ -1079,6 +1342,7 @@ def _format_baseline_block(
         "status='ok', follow it immediately with a single call to "
         "run_baseline_driver using the same KERNEL STEM. A non-zero "
         "compile or run result must NOT block the rest of the pipeline.\n"
+        f"{probe_block}"
         "Later, after spawn_verifier returns verdict='accept' AND the "
         "preceding run_baseline_driver returned status='ok', call "
         "splice_rewritten_kernel exactly once with the same KERNEL STEM "
@@ -1186,7 +1450,12 @@ class _FinishGateState:
             return
         # Other tools (spawn_precision_advisor, spawn_analyst,
         # spawn_baseline_harness, compile_baseline_driver,
-        # run_baseline_driver) do not affect the gate.
+        # run_baseline_driver, probe_step, probe_compare) do not affect
+        # the gate. The probe tools in particular are INFORMATIONAL --
+        # they exist to give the analyst evidence, not to gate finish;
+        # a failed or skipped probe does not block finish, and a
+        # successful probe does not earn finish without the regular
+        # verifier+comparator chain.
         return
 
     def check_finish(self) -> str | None:
@@ -1229,6 +1498,7 @@ def run_orchestrator(
     kernel_name: str | None = None,
     max_turns: int = MAX_TURNS,
     auto: bool = False,
+    run_probe: bool = True,
 ) -> dict | None:
     """Run the orchestrator loop.
 
@@ -1253,6 +1523,18 @@ def run_orchestrator(
     is truncated at the start of every auto run; MAX_TURNS remains the
     only backstop against runaway loops in this mode.
 
+    `run_probe` (default True) toggles whether the BASELINE STEP block
+    includes the precision-probe matrix. When False, the probe matrix
+    is silently omitted from the system-message prompt and the
+    orchestrator should not invoke probe_step / probe_compare at all.
+    This is the --no-probe escape hatch for batch runs where the
+    operator wants to reproduce the v0 (pre-probe) behavior exactly,
+    or for kernels where the probe's wall-clock cost (up to 8 cells
+    on a quad-emulated build) is not worth its evidence value.
+    Profiles whose probe_precisions tuple is empty (every profile
+    other than Kokkos in v1) ignore this flag — they never had probe
+    instructions in their BASELINE STEP block to begin with.
+
     Returns the final finish() arguments dict, or None if the user quit,
     the orchestrator stopped without finishing, or max_turns was exhausted.
     """
@@ -1267,7 +1549,7 @@ def run_orchestrator(
     profile = detect_language(kernel_path, kernel_source)
     tolerance_block = _format_tolerance_block(tolerance)
     baseline_block = _format_baseline_block(
-        kernel_path, kernel_name, profile
+        kernel_path, kernel_name, profile, run_probe=run_probe
     )
     user_message = (
         f"Kernel file: {kernel_path}\n\n"
@@ -1394,7 +1676,12 @@ def run_orchestrator(
                     "is_error": True,
                 })
                 continue
-            exec_result = _execute_tool(tu.name, dict(tu.input), profile)
+            exec_result = _execute_tool(
+                tu.name,
+                dict(tu.input),
+                profile,
+                kernel_stem=Path(kernel_path).stem,
+            )
             gate.observe(tu.name, exec_result)
             _append_trace(
                 trace_path, turns, tu.name, dict(tu.input), exec_result
