@@ -1079,7 +1079,7 @@ def test_execute_tool_spawn_baseline_harness_overwrites_existing(
 def test_execute_tool_spawn_baseline_harness_v1_drivers_fan_out(
     monkeypatch, tmp_path
 ):
-    """_execute_tool routes the Kokkos v1 4-driver harness output: drivers[baseline_precision] is written to baselines/<stem>/driver.cpp (the canonical baseline that feeds the v0 dynamic-verification chain), and every drivers[<precision>] is also written to baselines/<stem>/probe/<precision>/driver.cpp for the probe pipeline. The returned dict carries the canonical driver_path plus a probe_driver_paths map keyed by precision. The harness's v1 shape (drivers: dict) is detected by presence of the `drivers` key — the v0 shape (driver_source: str, still used by CUDA/HIP/SYCL/OMP-offload) remains supported on the same branch (separately asserted)."""
+    """_execute_tool routes the Kokkos v1 4-driver harness output: drivers['double'] is written to baselines/<stem>/driver.cpp (the canonical splice scaffold that feeds the v0 dynamic-verification chain), and every drivers[<precision>] is also written to baselines/<stem>/probe/<precision>/driver.cpp for the probe pipeline. The canonical baseline is the DOUBLE driver, NOT drivers[baseline_precision] (which is 'quad'): Kokkos has no `__float128` math overload (`Kokkos::sqrt(__float128)` does not exist), so the quad driver is plain C++ + quadmath per the harness prompt — uncompilable as a splice target for the rewriter's Kokkos kernels. The quad driver still serves as the ground-truth oracle: its seed=42 reference.json is promoted to baselines/<stem>/reference.json later in the chain by the probe_compare branch (separately asserted). The returned dict carries the canonical driver_path plus a probe_driver_paths map keyed by precision. The harness's v1 shape (drivers: dict) is detected by presence of the `drivers` key — the v0 shape (driver_source: str, still used by CUDA/HIP/SYCL/OMP-offload) remains supported on the same branch (separately asserted)."""
     monkeypatch.chdir(tmp_path)
 
     drivers_payload = {
@@ -1106,14 +1106,20 @@ def test_execute_tool_spawn_baseline_harness_v1_drivers_fan_out(
     )
 
     assert result["status"] == "ok"
-    # The canonical baseline is the profile's baseline_precision
-    # variant (Kokkos -> "quad"). This is the file the existing v0
-    # compile_baseline_driver / run_baseline_driver / compare_outputs
-    # chain reads, so the finish gate now compares against the quad
-    # ground truth.
+    # The canonical baseline is the DOUBLE driver — the splice
+    # scaffold the rewriter targets. NOT drivers[baseline_precision]
+    # (which is "quad"): Kokkos has no `__float128` overload for its
+    # math intrinsics, so the quad driver is plain C++ + quadmath
+    # per the kokkos harness prompt — uncompilable as a Kokkos splice
+    # target. The quad driver fills the ground-truth-oracle role
+    # instead: its seed=42 reference.json is promoted into
+    # baselines/<stem>/reference.json by the probe_compare branch
+    # later in the chain (see test_execute_tool_probe_compare_*).
+    # KOKKOS_PROFILE.baseline_precision stays "quad" — it names the
+    # oracle precision, not the splice-scaffold precision.
     canonical = tmp_path / "baselines" / "vector_add" / "driver.cpp"
     assert canonical.exists()
-    assert canonical.read_text() == drivers_payload[KOKKOS_PROFILE.baseline_precision]
+    assert canonical.read_text() == drivers_payload["double"]
     assert result["driver_path"] == "baselines/vector_add/driver.cpp"
 
     # Every precision variant ALSO lands under
@@ -2263,6 +2269,173 @@ def test_execute_tool_dispatches_probe_compare(monkeypatch):
     assert result["artifacts"] == [
         "baselines/nbody_force/probe/evidence.json"
     ]
+
+
+def test_execute_tool_probe_compare_promotes_quad_oracle_to_baseline_reference(
+    monkeypatch, tmp_path
+):
+    """After probe_compare returns status='ok' under a profile whose baseline_precision differs from the canonical splice-scaffold precision 'double' (Kokkos: baseline_precision='quad'), _execute_tool copies baselines/<stem>/probe/<baseline_precision>_seed42/reference.json over baselines/<stem>/reference.json. This is the ORACLE PROMOTION step: the canonical baselines/<stem>/driver.cpp is the double splice scaffold (Kokkos has no `__float128` math overloads, so the quad driver could never be a splice target), and run_baseline_driver wrote a double-precision reference.json earlier in the chain. Promoting the quad probe reference into the canonical slot is what lets the finish-gate comparator (compare_outputs) measure the rewritten kernel against true ground truth instead of against a same-precision double oracle. The destination filename (baselines/<stem>/reference.json) is the file compare_outputs reads as the baseline by contract — promoting in place means compare_outputs stays fully language-agnostic at the file-path level."""
+    monkeypatch.chdir(tmp_path)
+
+    # Stage a "stale" double-precision baseline reference (the file
+    # run_baseline_driver would have written) and the quad probe
+    # reference (the file probe_step quad_seed42 would have written).
+    baseline_dir = tmp_path / "baselines" / "nbody_force"
+    baseline_dir.mkdir(parents=True)
+    stale_double_ref = baseline_dir / "reference.json"
+    stale_double_ref.write_text(
+        '{"kernel": "step", "seed": 42, "outputs": {"x": [1.0]}}'
+    )
+    quad_probe_dir = baseline_dir / "probe" / "quad_seed42"
+    quad_probe_dir.mkdir(parents=True)
+    quad_probe_ref = quad_probe_dir / "reference.json"
+    quad_ref_text = (
+        '{"kernel": "step", "seed": 42, '
+        '"outputs": {"x": [1.0000000000000002]}}'
+    )
+    quad_probe_ref.write_text(quad_ref_text)
+
+    def stub_probe_compare(kernel_stem, language_id):
+        return {
+            "status": "ok",
+            "stdout": "aggregated 8 cells into evidence.json",
+            "stderr": "",
+            "artifacts": ["baselines/nbody_force/probe/evidence.json"],
+        }
+
+    monkeypatch.setattr(orchestrator, "probe_compare", stub_probe_compare)
+
+    result = _execute_tool(
+        "probe_compare",
+        {"kernel_stem": "nbody_force"},
+        KOKKOS_PROFILE,
+    )
+
+    assert result["status"] == "ok"
+    # The canonical baseline reference is now the quad probe reference,
+    # verbatim — NOT the stale double reference that was there before.
+    assert stale_double_ref.read_text() == quad_ref_text
+    # The probe source must not have been moved or deleted; it stays in
+    # the probe tree for the trace/inspection.
+    assert quad_probe_ref.read_text() == quad_ref_text
+
+
+def test_execute_tool_probe_compare_skips_promotion_when_probe_failed(
+    monkeypatch, tmp_path
+):
+    """If probe_compare returns status != 'ok' (e.g. the required quad_seed42 cell was missing — the only hard-error path in probe_compare), _execute_tool MUST NOT promote anything: there is no trustworthy quad oracle to promote, and silently copying a partial / stale file into the canonical reference slot would corrupt the finish-gate comparator's ground truth. The existing run_baseline_driver double-precision reference stays in place; the comparator will run against it, which is suboptimal but safe."""
+    monkeypatch.chdir(tmp_path)
+
+    baseline_dir = tmp_path / "baselines" / "nbody_force"
+    baseline_dir.mkdir(parents=True)
+    stale_double_ref = baseline_dir / "reference.json"
+    original_text = '{"kernel": "step", "seed": 42, "outputs": {"x": [1.0]}}'
+    stale_double_ref.write_text(original_text)
+    # Even stage a quad probe ref to prove the promotion path is gated
+    # on probe_compare's status, not just on the source file's
+    # existence.
+    quad_probe_dir = baseline_dir / "probe" / "quad_seed42"
+    quad_probe_dir.mkdir(parents=True)
+    (quad_probe_dir / "reference.json").write_text(
+        '{"kernel": "step", "seed": 42, "outputs": {"x": [9.9]}}'
+    )
+
+    def stub_probe_compare(kernel_stem, language_id):
+        return {
+            "status": "error",
+            "stdout": "",
+            "stderr": "missing quad_seed42 ground-truth cell",
+            "artifacts": [],
+        }
+
+    monkeypatch.setattr(orchestrator, "probe_compare", stub_probe_compare)
+
+    result = _execute_tool(
+        "probe_compare",
+        {"kernel_stem": "nbody_force"},
+        KOKKOS_PROFILE,
+    )
+
+    assert result["status"] == "error"
+    # The canonical baseline reference is untouched.
+    assert stale_double_ref.read_text() == original_text
+
+
+def test_execute_tool_probe_compare_skips_promotion_when_oracle_source_missing(
+    monkeypatch, tmp_path
+):
+    """If probe_compare returns ok but the quad_seed42 probe reference.json does not exist on disk (a non-fatal cell failure earlier in the probe pipeline — probe_compare tolerates per-cell `missing` / `load_error` / `shape_error` for non-quad cells and only hard-errors on missing quad_seed42, so this path is only really reachable if the file is deleted between probe_compare and the promotion), _execute_tool MUST NOT crash and MUST NOT touch the canonical baseline reference. A stderr log line is emitted documenting the skip so the operator can correlate with the trace, but compare_result's status is returned verbatim."""
+    monkeypatch.chdir(tmp_path)
+
+    baseline_dir = tmp_path / "baselines" / "nbody_force"
+    baseline_dir.mkdir(parents=True)
+    stale_double_ref = baseline_dir / "reference.json"
+    original_text = '{"kernel": "step", "seed": 42, "outputs": {"x": [1.0]}}'
+    stale_double_ref.write_text(original_text)
+    # Intentionally do NOT create baselines/nbody_force/probe/quad_seed42/.
+
+    def stub_probe_compare(kernel_stem, language_id):
+        return {
+            "status": "ok",
+            "stdout": "aggregated cells",
+            "stderr": "",
+            "artifacts": ["baselines/nbody_force/probe/evidence.json"],
+        }
+
+    monkeypatch.setattr(orchestrator, "probe_compare", stub_probe_compare)
+
+    result = _execute_tool(
+        "probe_compare",
+        {"kernel_stem": "nbody_force"},
+        KOKKOS_PROFILE,
+    )
+
+    # probe_compare's status is returned unchanged: the promotion step
+    # is a downstream artifact and its failure does NOT propagate into
+    # the tool result (the orchestrator LLM should see exactly what
+    # probe_compare itself returned).
+    assert result["status"] == "ok"
+    assert stale_double_ref.read_text() == original_text
+
+
+def test_execute_tool_probe_compare_no_promotion_under_cuda_profile(
+    monkeypatch, tmp_path
+):
+    """For profiles whose baseline_precision is already 'double' (the canonical splice-scaffold precision), oracle promotion is a no-op: there is no higher-precision oracle to promote from. CUDA / HIP / SYCL / OMP-offload all set probe_precisions=() in v1 and therefore never reach the probe_compare branch in production, but the guard must be coded against baseline_precision (not against profile.id) so that a future profile adding a non-quad probe pipeline (e.g. CUDA with a `double`-as-oracle config) does not accidentally trigger a copy of a non-existent file. This test pins the guard's shape: promotion only fires when baseline_precision != 'double' AND baseline_precision in probe_precisions."""
+    monkeypatch.chdir(tmp_path)
+
+    baseline_dir = tmp_path / "baselines" / "vector_add"
+    baseline_dir.mkdir(parents=True)
+    stale_ref = baseline_dir / "reference.json"
+    original_text = '{"kernel": "vec_add", "seed": 42, "outputs": {"y": [3.0]}}'
+    stale_ref.write_text(original_text)
+    # Stage a probe directory that LOOKS promotable, to prove the guard
+    # is profile-driven, not file-existence-driven.
+    spoof_probe_dir = baseline_dir / "probe" / "double_seed42"
+    spoof_probe_dir.mkdir(parents=True)
+    (spoof_probe_dir / "reference.json").write_text(
+        '{"kernel": "vec_add", "seed": 42, "outputs": {"y": [4.0]}}'
+    )
+
+    def stub_probe_compare(kernel_stem, language_id):
+        return {
+            "status": "ok",
+            "stdout": "",
+            "stderr": "",
+            "artifacts": [],
+        }
+
+    monkeypatch.setattr(orchestrator, "probe_compare", stub_probe_compare)
+
+    result = _execute_tool(
+        "probe_compare",
+        {"kernel_stem": "vector_add"},
+        CUDA_PROFILE,
+    )
+
+    assert result["status"] == "ok"
+    # The canonical reference is untouched — no promotion under CUDA.
+    assert stale_ref.read_text() == original_text
 
 
 def test_execute_tool_probe_step_under_cuda_profile_injects_cuda_language_id(

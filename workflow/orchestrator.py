@@ -16,6 +16,7 @@ per-variable precision decisions — that is the analyst's job.
 
 import json
 import os
+import sys
 from pathlib import Path
 
 import anthropic
@@ -1086,17 +1087,45 @@ def _execute_tool(
         # offload profiles; the v1 multi-driver schema (`drivers:
         # {<precision>: str}`) is used by Kokkos (the only profile
         # whose probe_precisions is populated). When `drivers` is
-        # present, the canonical baseline = `drivers[baseline_precision]`
-        # (which the profile pins to `quad` for Kokkos — so the finish-
-        # gate comparator compares the rewritten kernel against the
-        # true ground truth, not against a same-or-lower-precision
-        # reference). The remaining drivers fan out into per-precision
-        # probe subdirectories so the Commit 3 probe_step tool can
-        # reuse the existing compile/run helpers per directory.
+        # present, the canonical splice scaffold at
+        # `baselines/<stem>/driver.cpp` = `drivers["double"]`, NOT
+        # `drivers[profile.baseline_precision]`. The role split
+        # exists because Kokkos has no `__float128` math overloads
+        # (`Kokkos::sqrt(__float128)` does not exist), so the quad
+        # driver is plain C++ + quadmath (per the kokkos harness
+        # prompt's quad bullet) — uncompilable as a splice target
+        # for the rewriter's Kokkos kernels. The DOUBLE driver fills
+        # the splice-scaffold role; the QUAD driver fills the
+        # ground-truth-oracle role and its seed=42 reference.json is
+        # promoted to `baselines/<stem>/reference.json` later in the
+        # chain (see the probe_compare branch below) so the finish-
+        # gate comparator measures against true quad ground truth.
+        # The remaining drivers fan out into per-precision probe
+        # subdirectories so the probe_step tool can reuse the existing
+        # compile/run helpers per directory.
         probe_driver_paths: dict[str, str] = {}
+        # TEMPORARY DIAGNOSTIC (remove after we identify why some
+        # backends return a payload missing both `drivers` and
+        # `driver_source`). Dumps the result keys + a short JSON
+        # preview to stderr so the operator can see what the
+        # baseline-harness agent actually submitted.
+        _preview = {
+            k: (v if not isinstance(v, str) else v[:200] + ("..." if len(v) > 200 else ""))
+            for k, v in result.items()
+        }
+        print(
+            f"[orchestrator] baseline_harness result keys={list(result.keys())} "
+            f"preview={json.dumps(_preview)[:1000]}",
+            file=sys.stderr,
+        )
         if "drivers" in result:
             drivers = result["drivers"]
-            canonical = drivers[profile.baseline_precision]
+            # SPLICE-SCAFFOLD CHOICE: the canonical baseline is the
+            # DOUBLE driver (a real Kokkos driver), not the
+            # baseline_precision driver. baseline_precision="quad" is
+            # the oracle role only — see the role-split comment above
+            # for why these can't be the same file.
+            canonical = drivers["double"]
             driver_path.write_text(canonical)
             for precision, source in drivers.items():
                 probe_dir = driver_dir / "probe" / precision
@@ -1104,8 +1133,27 @@ def _execute_tool(
                 probe_path = probe_dir / profile.driver_filename
                 probe_path.write_text(source)
                 probe_driver_paths[precision] = str(probe_path)
-        else:
+        elif "driver_source" in result:
             driver_path.write_text(result["driver_source"])
+        else:
+            raise RuntimeError(
+                f"baseline_harness agent for profile {profile.id!r} "
+                f"returned a submit_result payload that has neither "
+                f"`drivers` (v1 multi-driver schema) nor "
+                f"`driver_source` (v0 single-driver schema). "
+                f"Keys present: {sorted(result.keys())}. "
+                f"This is a schema-enforcement failure upstream of "
+                f"this code: either the model returned a malformed "
+                f"tool call that the SDK accepted, or the proxy "
+                f"stripped a required field. Check the [run_agent] "
+                f"stop_reason warning above this line — if it says "
+                f"stop_reason='max_tokens', the model truncated "
+                f"mid-tool-use and the input dict is empty by "
+                f"definition (raise max_tokens in workflow/"
+                f"run_agent.py beyond the current 32768). Otherwise "
+                f"inspect the diagnostic print above for the full "
+                f"payload preview."
+            )
         response: dict = {
             "status": "ok",
             "result": result,
@@ -1206,7 +1254,67 @@ def _execute_tool(
         # task prompt as a PROBE EVIDENCE block (mirroring the
         # tolerance / baseline blocks pattern). Returns the same
         # {status, stdout, stderr, artifacts} shape verbatim.
-        return probe_compare(tool_input["kernel_stem"], profile.id)
+        compare_result = probe_compare(tool_input["kernel_stem"], profile.id)
+        # ORACLE PROMOTION: when probe_compare succeeded for a profile
+        # whose baseline_precision differs from the canonical splice-
+        # scaffold precision (currently only Kokkos:
+        # baseline_precision="quad", splice scaffold = "double"),
+        # promote the higher-precision probe reference into the
+        # canonical baseline slot so the finish-gate comparator
+        # (compare_outputs) measures the rewritten kernel against true
+        # ground truth instead of against the same-precision double
+        # reference that run_baseline_driver wrote earlier in the
+        # chain. The destination (baselines/<stem>/reference.json) is
+        # the file compare_outputs reads as the baseline; the source
+        # is the probe seed=42 cell for baseline_precision. For
+        # profiles where baseline_precision == "double" (CUDA / HIP /
+        # SYCL / OMP-offload today), this is a no-op. For profiles
+        # whose probe pipeline is disabled (probe_precisions=()), the
+        # probe_compare branch is never reached.
+        if (
+            compare_result.get("status") == "ok"
+            and profile.baseline_precision != "double"
+            and profile.baseline_precision in profile.probe_precisions
+        ):
+            stem = tool_input["kernel_stem"]
+            oracle_src = (
+                Path("baselines") / stem / "probe"
+                / f"{profile.baseline_precision}_seed42" / "reference.json"
+            )
+            oracle_dst = Path("baselines") / stem / "reference.json"
+            if oracle_src.is_file():
+                try:
+                    oracle_dst.write_text(oracle_src.read_text())
+                    print(
+                        f"[orchestrator] oracle promotion: copied "
+                        f"{oracle_src} -> {oracle_dst} (profile "
+                        f"{profile.id!r}, baseline_precision="
+                        f"{profile.baseline_precision!r})",
+                        file=sys.stderr,
+                    )
+                except OSError as exc:
+                    # Non-fatal: leave the run_baseline_driver output
+                    # in place. The comparator will still run, just
+                    # against a lower-precision baseline. We surface
+                    # the failure in stderr but don't change
+                    # compare_result's status (probe_compare itself
+                    # succeeded; this is a downstream artifact).
+                    print(
+                        f"[orchestrator] oracle promotion FAILED: "
+                        f"{exc}. Finish-gate comparator will run "
+                        f"against the double-precision baseline.",
+                        file=sys.stderr,
+                    )
+            else:
+                print(
+                    f"[orchestrator] oracle promotion skipped: "
+                    f"{oracle_src} does not exist (the "
+                    f"{profile.baseline_precision}_seed42 probe cell "
+                    f"may have failed). Finish-gate comparator will "
+                    f"run against the double-precision baseline.",
+                    file=sys.stderr,
+                )
+        return compare_result
     raise ValueError(f"Unknown tool: {tool_name}")
 
 

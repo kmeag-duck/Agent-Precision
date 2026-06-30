@@ -59,7 +59,6 @@ What is intentionally **not** here yet:
 
 - The `verifier` agent itself remains a **static / textual** check on faithfulness of code to verdict; mechanical verification of the rewritten kernel is now done by the `compare_outputs` tool downstream of it (not by the verifier agent). No micro-benchmark of the rewritten kernel — `compare_outputs` checks numerical agreement under tolerance, not throughput.
 - End-to-end smoke validation for HIP, SYCL, and OpenMP-offload (the relevant toolchains were not available on the development host). All three are exercised by the unit tests in `tests/test_tools.py` / `tests/test_registry.py` / `tests/test_languages.py` but no real kernel in each language has been driven through the full chain yet.
-- No automated evaluation across the `test-kernels/` corpus.
 - No framework (LangGraph etc.). See "Design notes" and "Roadmap".
 
 ## Run
@@ -350,7 +349,13 @@ exiting.
   - `run_agent.py` — generic agent runner. Forces structured output via
     `tool_choice={"type":"tool","name":"submit_result"}` whose input schema
     is the registry entry's `output_schema`. Never edited per-agent.
-    Also exports `run_agent_ensemble(type, task, k, temperature)` — a
+    Sets `max_tokens=32768` (raised from 8192 to accommodate the Kokkos
+    v1 baseline_harness, which emits four full per-precision drivers in
+    one `submit_result` call) and passes an explicit `timeout=600.0` to
+    the SDK (the SDK refuses non-streaming requests whose own estimated
+    duration exceeds 10 minutes; an explicit `timeout` is the
+    SDK-sanctioned escape hatch). Also exports
+    `run_agent_ensemble(type, task, k, temperature)` — a
     `ThreadPoolExecutor` fan-out used by the analyst self-consistency
     ensemble and (via the verifier panel) the per-lens verifier runs.
   - `aggregator.py` — deterministic K-fold aggregator for analyst
@@ -393,6 +398,17 @@ exiting.
   `baselines/<kernel_stem>/orchestrator_trace.jsonl` (one JSONL record per
   executed tool: `{turn, tool_name, tool_input, exec_result}`, truncated
   at the start of each auto run). Gitignored.
+- `evals/layer2/` — Layer 2 (agent-judgment) evaluation harness. Grades
+  the workflow end-to-end over the 17-kernel `test-kernels/` corpus by
+  spawning `python -m workflow.run --auto ...` per kernel as a
+  subprocess, then reading `baselines/<stem>/orchestrator_trace.jsonl`
+  and scoring it against `evals/layer2/expected.py` (the hand-
+  transcribed per-variable ground-truth registry, kept in sync with
+  `test-kernels/SUMMARY.md` by `tests/test_evals_expected.py`). The
+  harness does not import from `workflow.*` — it is a strict subprocess-
+  contract consumer. Run output lands in `evals/results/<timestamp>_<label>/`
+  and is gitignored. See `AGENTS.md` ("Conventions") for the run / report
+  / score module split.
 - `scripts/` — Argo backend wrappers (`run-argoproxy.sh`, `run-argo.sh`).
 - `flowchart.md` — high-level orchestrator flowchart (HITL branches,
   tool dispatch); a companion to the sequence diagram above.
@@ -442,7 +458,7 @@ is a reader-facing summary.
 2. **Smoke-validation of HIP / SYCL / OpenMP-offload profiles** — these three profiles ship unit-tested only (no `hipcc` / `icpx` / `clang++ -fopenmp -fopenmp-targets=...` toolchain was available at implementation time). Once a host with the respective runtime is available, drive a real kernel through the full chain and confirm the comparator step passes; remove the "unit-tested but not smoke-validated" caveat from `AGENTS.md`.
 3. **JLSE / async toolchain migration** — move compile/run to a remote scheduler.
 4. **Emulation library upgrade** — replace inline Dekker float-float with a vendored header.
-5. **Corpus evaluation** — run the workflow across all 17 `test-kernels/`, feeding each kernel's expected tolerance from `test-kernels/SUMMARY.md`, and compare verdicts against ground-truth labels.
+5. **Corpus evaluation hardening** — the Layer 2 harness (`evals/layer2/`) already runs the workflow across the 17-kernel `test-kernels/` corpus in `--auto` mode and grades the resulting `orchestrator_trace.jsonl` against the per-variable ground truth in `evals/layer2/expected.py`. Open work: extend the scorer to cover the rework / precision_budget axes (today it grades per-variable verdicts and finish-gate status); add a "regression vs baseline" comparator that takes two `results.json` runs as input; explore re-running the harness under non-default `AGENT_PRECISION_ANALYST_K` / `AGENT_PRECISION_VERIFIER_K` settings to measure the ensemble's effect on judgment quality.
 
 Explicitly **not** on the roadmap (see `AGENTS.md` for rationale):
 multiple per-method analysts, and adopting LangGraph at this scale.

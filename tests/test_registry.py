@@ -375,6 +375,28 @@ def test_baseline_harness_prompt_mandates_per_precision_drivers():
     assert "intermediate" in lower
 
 
+def test_baseline_harness_prompt_forbids_quad_numeric_literal_suffix():
+    """The Kokkos baseline harness prompt must explicitly forbid the GNU `q` / `Q` numeric-literal suffix for `__float128` constants in the quad driver. C++23 disallows it as an extension, and g++ rejects it under `-std=c++20` without `-fext-numeric-literals` — which the compile step intentionally does not pass (so the rest of the source stays standard-conformant). The first end-to-end smoke run of the role-split / oracle-promotion fix uncovered this: the LLM emitted `__float128 ax = 0.0q;`, both quad probe cells failed to compile, probe_compare hard-errored on the missing quad_seed42 ground truth, and the comparator silently fell back to the double-precision baseline reference — a real (if recoverable) probe-pipeline degradation. The fix is purely prompt-level: forbid the suffix, mandate the constructor / cast forms `__float128(x)`, `(__float128)x`, `static_cast<__float128>(x)`. This test pins the contract so a future prompt edit cannot silently regress."""
+    prompt = AGENTS["baseline_harness"]["system_prompt"]
+    # The forbidden tokens must be called out by example. We assert on
+    # the prose, not on the literal `0.0q` token in isolation — the
+    # prompt has to actually tell the LLM NOT to write it.
+    assert "0.0q" in prompt or "1.5q" in prompt
+    # At least one of the sanctioned alternative forms must be shown
+    # by example. The LLM has to see the replacement, not just the
+    # prohibition.
+    assert (
+        "__float128(0.0)" in prompt
+        or "(__float128)" in prompt
+        or "static_cast<__float128>" in prompt
+    )
+    # The compile-flag rationale must be named — without it a future
+    # edit might "fix" the prompt by recommending -fext-numeric-literals
+    # instead, which would diverge the prompt from the compile step.
+    lower = prompt.lower()
+    assert "fext-numeric-literals" in lower or "c++23" in lower
+
+
 def test_baseline_harness_prompt_mandates_named_rng_seed_constant():
     """The Kokkos baseline harness prompt mandates a single `static constexpr int RNG_SEED = <N>;` declaration on its own line above the KERNEL BEGIN sentinel (so it sits OUTSIDE the splice region and survives a kernel-body rewrite) and requires every other seed reference (RNG construction, JSON 'seed' field) to read RNG_SEED rather than re-typing the integer. Without the exact declaration shape and out-of-sentinel placement the probe pipeline cannot deterministically rewrite the seed line to re-run the driver at a different seed."""
     prompt = AGENTS["baseline_harness"]["system_prompt"]

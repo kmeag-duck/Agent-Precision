@@ -96,13 +96,42 @@ def run_agent(
     if system_prompt_suffix is not None:
         system_prompt = f"{system_prompt}\n\n{system_prompt_suffix}"
 
+    # max_tokens ceiling for any single agent call. Bumped from 8192
+    # to 32768 because the Kokkos v1 baseline_harness emits FOUR full
+    # per-precision drivers in one submit_result call (see
+    # workflow/languages/kokkos.py:BASELINE_HARNESS_OUTPUT_SCHEMA),
+    # and a single Kokkos driver is already 100-200 lines of source —
+    # four of them easily blow past 8192 output tokens. When the model
+    # truncates mid-tool-use it returns `stop_reason='max_tokens'`
+    # with a partial (often empty) tool_use input, which then surfaces
+    # downstream as a baffling "submit_result payload has no keys"
+    # RuntimeError in orchestrator._execute_tool. 32768 matches Argo's
+    # documented opus-4-7 output cap; smaller agents (analyst, verifier,
+    # etc.) cost nothing extra because max_tokens is a ceiling, not a
+    # target. If a future agent type genuinely needs more, lift this
+    # to a per-entry registry field rather than bumping the global
+    # again.
+    # Explicit per-request timeout (seconds). The SDK refuses
+    # non-streaming requests when its own conservative estimate
+    # (a function of `max_tokens`) exceeds 10 minutes, raising
+    # `ValueError("Streaming is required for operations that may
+    # take longer than 10 minutes.")` at create() time. With
+    # `max_tokens=32768` we trip that guard even though our actual
+    # response times are seconds, not minutes. Passing an explicit
+    # `timeout` is the SDK-sanctioned escape hatch — it signals
+    # "operator accepts responsibility for this duration" and the
+    # guard is skipped. 600s matches AGENT_PRECISION_ORCHESTRATOR_
+    # TIMEOUT_SEC's default in the orchestrator and is the upper
+    # bound on how long any single tool call should ever take in
+    # this workflow.
     create_kwargs = {
         "model": spec["model"],
-        "max_tokens": 8192,
+        "max_tokens": 32768,
         "system": system_prompt,
         "tools": [submit_result_tool],
         "tool_choice": {"type": "tool", "name": "submit_result"},
         "messages": [{"role": "user", "content": task}],
+        "timeout": 600.0,
     }
 
     # Temperature handling. Argo's `claude-opus-4-7` snapshot rejects
@@ -153,6 +182,35 @@ def run_agent(
             f"response_id={getattr(response, 'id', '<unknown>')}. "
             f"This usually indicates a backend/proxy returned a "
             f"malformed message body; retry, or inspect the proxy logs."
+        )
+
+    # With tool_choice forcing submit_result, the expected stop_reason
+    # is "tool_use". Any other value is a smoking gun for downstream
+    # weirdness: "max_tokens" means the model truncated mid-tool-use
+    # and the submit_result input dict is almost certainly partial /
+    # empty (this is the primary failure mode that prompted the
+    # max_tokens=32768 bump above — kept as a runtime tripwire in
+    # case a future schema regrows past the new ceiling, or in case a
+    # proxy quietly caps output tokens below what we requested).
+    # "end_turn" means the model decided it was done without calling
+    # the forced tool, which contradicts tool_choice and points at a
+    # proxy that's stripping or rewriting the tool_choice field.
+    # Warn loudly with the diagnostic context — the actual
+    # "submit_result missing" or "empty input dict" failure will
+    # surface a few lines below this; this print just makes the
+    # WHY visible without rerunning.
+    if response.stop_reason != "tool_use":
+        usage = getattr(response, "usage", None)
+        print(
+            f"[run_agent] warning: agent {type!r} returned "
+            f"stop_reason={response.stop_reason!r} (expected 'tool_use'). "
+            f"response_id={getattr(response, 'id', '<unknown>')}, "
+            f"usage={usage}. "
+            f"If stop_reason is 'max_tokens', the submit_result input "
+            f"is likely truncated and the next failure will be a "
+            f"missing or empty payload — raise max_tokens in "
+            f"workflow/run_agent.py.",
+            file=sys.stderr,
         )
 
     for block in response.content:

@@ -288,41 +288,100 @@ Per-precision rules (apply to all four alias RHSes uniformly except
 in `mixed_io`):
 
   - `double`: aliases resolve to `double` / `Kokkos::View<double*>`;
-    JSON values written with `"%.17g"`.
+    JSON values written with `"%.17g"`. This driver is also the
+    canonical splice scaffold (see SPLICE-TARGET ROLE below) — the
+    rewriter will splice lower-precision kernels into a copy of it.
   - `float`: aliases resolve to `float` / `Kokkos::View<float*>`;
     JSON values written with `"%.9g"`.
-  - `quad`: aliases resolve to `__float128` /
-    `Kokkos::View<__float128*>`; the driver `#include <quadmath.h>`
-    and writes JSON values via `quadmath_snprintf(buf, sizeof(buf),
-    "%.34Qg", value)` (NOT via `snprintf` / `<<`, which do not
-    understand `__float128`). The compile step auto-links
-    `-lquadmath` when the driver source contains the token
-    `__float128`. Local `std::uniform_real_distribution<...>`
-    returns `double` — convert explicitly with
-    `static_cast<__float128>(...)` when storing into the alias-typed
-    view.
+  - `quad`: SPECIAL CASE — this driver does NOT use Kokkos at all.
+    Kokkos's math intrinsics (`Kokkos::sqrt`, `Kokkos::sin`, …) have
+    no `__float128` overload, so any kernel that calls a Kokkos math
+    function inside a `KOKKOS_LAMBDA` is uncompilable at quad
+    precision. Emit the quad driver as plain C++ that:
+      * does NOT `#include <Kokkos_Core.hpp>`, does NOT call
+        `Kokkos::initialize` / `Kokkos::finalize`, does NOT use
+        `Kokkos::parallel_for` / `KOKKOS_LAMBDA` / `Kokkos::View`;
+      * `#include <quadmath.h>` and uses `__float128` throughout;
+        replace each `Kokkos::sqrt(x)` with `sqrtq(x)`, each
+        `Kokkos::sin(x)` with `sinq(x)`, similarly for `cosq`,
+        `expq`, `logq`, `fabsq`, `powq`, `atan2q`, etc.;
+      * DOES NOT use the GNU `q` / `Q` numeric-literal suffix for
+        `__float128` constants. C++23 disallows it as an extension
+        and g++ rejects it under `-std=c++20` without
+        `-fext-numeric-literals` (which the compile step does NOT
+        pass). Write `__float128(0.0)`, `(__float128)1.5`, or
+        `static_cast<__float128>(0.0)` instead of `0.0q` / `1.5q`.
+        This includes ALL constants used inside the kernel body —
+        accumulator initializers (`__float128 ax = __float128(0.0);`),
+        scalar multipliers, comparison thresholds, anything that
+        would otherwise be a bare floating literal;
+      * replaces each `Kokkos::View<T*>` argument with a plain
+        contiguous host buffer (`std::vector<__float128>` or
+        `std::unique_ptr<__float128[]>`), accessed with `[]` instead
+        of `()`. The aliases in this driver resolve to those host
+        types (e.g. `using aType = std::vector<__float128>;`,
+        `using alphaType = __float128;`);
+      * replaces the kernel's `parallel_for(N, KOKKOS_LAMBDA(int i){
+        ... })` loop body with a plain serial `for (int i = 0; i < N;
+        ++i) { ... }` containing the SAME kernel body text (with
+        Kokkos math calls swapped for their `q`-suffixed quadmath
+        equivalents). The kernel function itself stays inside the
+        sentinels and keeps its `<ParamName>Type` alias-typed
+        signature — only the alias RHSes and the per-element math
+        change;
+      * writes JSON values via `quadmath_snprintf(buf, sizeof(buf),
+        "%.34Qg", value)` (NOT via `snprintf` / `<<`, which do not
+        understand `__float128`). The compile step auto-links
+        `-lquadmath` when the driver source contains the token
+        `__float128`. Local `std::uniform_real_distribution<...>`
+        returns `double` — convert explicitly with
+        `static_cast<__float128>(...)` when storing into the alias-
+        typed buffer.
+    The quad driver's job is purely to produce a ground-truth
+    `reference.json` against which the (Kokkos-based) rewritten
+    driver is later compared by the comparator; it is NEVER a
+    splice target, so it does not need to share a Kokkos runtime
+    with the other drivers.
   - `mixed_io`: aliases for kernel arguments that main() constructs
-    AND reads back (the kernel's external I/O) resolve to
-    `__float128` (the baseline precision); JSON formatting matches
-    (`quadmath_snprintf %.34Qg`). The exception is any kernel
+    AND reads back (the kernel's external I/O) resolve to `double`
+    (matching the canonical splice-scaffold precision); JSON
+    formatting matches (`"%.17g"`). The exception is any kernel
     parameter that is clearly an intermediate buffer (a View the
     kernel writes early and reads back later within the same kernel
     invocation, exposed in the signature only because Kokkos requires
     it) — those aliases resolve to `float`. If no such intermediate
     is identifiable from the kernel signature, this driver is
-    byte-identical to the `quad` driver; emit it anyway (the probe
-    pipeline still consumes it).
+    byte-identical to the `double` driver; emit it anyway (the
+    probe pipeline still consumes it).
 
-None of these driver variants changes the kernel function body. They
-change the alias RHSes (item 6 below), any host-side scratch values
-that flow into the kernel, and the JSON output formatting (item 8).
+SPLICE-TARGET ROLE. The orchestrator writes `drivers["double"]` (NOT
+`drivers["quad"]`) to `baselines/<stem>/driver.cpp` as the canonical
+splice scaffold. The rewriter later splices its kernel between the
+sentinels of that file to produce `baselines/<stem>/rewritten/
+driver.cpp`. The other three drivers (quad, float, mixed_io) live
+only under `baselines/<stem>/probe/<precision>/` and feed the probe-
+evidence pipeline. The quad driver additionally serves as the
+ground-truth oracle: its `reference.json` from seed=42 is promoted
+to `baselines/<stem>/reference.json` (overwriting whatever
+`run_baseline_driver` wrote there from the double driver) so the
+finish-gate comparator measures the rewritten kernel against true
+quad ground truth, not against a same-or-lower-precision reference.
+
+None of these driver variants changes the kernel function body
+(except the `quad` driver, which rewrites Kokkos math calls to
+quadmath equivalents and unrolls the parallel_for into a serial
+host loop — see the quad bullet above). They change the alias RHSes
+(item 6 below), any host-side scratch values that flow into the
+kernel, and the JSON output formatting (item 8).
 
 Hard requirements on the driver:
 
 1. Single translation unit. Inline the kernel source verbatim into the
    driver (above main()). Do not introduce a build system or external
    headers beyond <Kokkos_Core.hpp>, the C and C++ standard library, and
-   anything the kernel itself already includes.
+   anything the kernel itself already includes. (Exception: the quad
+   driver omits <Kokkos_Core.hpp> entirely and adds <quadmath.h>; see
+   the quad bullet in PER-PRECISION DRIVERS above.)
 
    The inlined kernel MUST be bracketed by these two sentinel comment
    lines, verbatim, each on its own line and with no surrounding
@@ -343,7 +402,11 @@ Hard requirements on the driver:
 2. Use Kokkos::initialize / Kokkos::finalize. Run on the serial host
    execution space (Kokkos::Serial / Kokkos::HostSpace). This is a v0
    reproducibility constraint: parallel reductions are order-dependent
-   and would make the baseline non-deterministic.
+   and would make the baseline non-deterministic. (Exception: the
+   quad driver runs as plain C++ with a serial host `for` loop and
+   omits Kokkos entirely — see the quad bullet in PER-PRECISION
+   DRIVERS above. Reproducibility is satisfied by the serial loop
+   alone.)
 
 3. Seed any RNG with a fixed integer. The driver must produce the
    same numbers on every run.
@@ -445,7 +508,9 @@ Hard requirements on the driver:
    the aliases.
 
 7. Kokkos::deep_copy any device Views you read from back to host Views
-   before iterating them for JSON emission.
+   before iterating them for JSON emission. (Not applicable to the
+   quad driver, which uses plain host buffers and reads them
+   directly.)
 
 8. Each driver writes its reference output to './reference.json'
    (relative to its own working directory; the orchestrator will
