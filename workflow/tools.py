@@ -119,6 +119,8 @@ import math
 import os
 import re
 import subprocess
+import sys
+import tempfile
 from pathlib import Path
 from typing import Iterator
 
@@ -227,6 +229,87 @@ def _compile_driver(
         "stderr": proc.stderr,
         "artifacts": [str(driver_bin)],
     }
+
+
+def syntax_check_driver_source(
+    profile: LanguageProfile, source: str, label: str
+) -> dict | None:
+    """Syntax-check a candidate driver source in a temp dir.
+
+    Returns None on success (or when the profile has no gate / the
+    toolchain isn't available — validation is silently skipped in both
+    cases, since forcing a check would tie every harness run to a
+    working install the operator might not have set up yet).
+
+    Returns a `_error()`-shaped dict on failure, with `label` folded
+    into the stderr so a multi-driver payload (Kokkos v1's 4-driver
+    output) can name which precision failed. The dict shape matches
+    what workflow.tools._compile_driver returns on a real compile
+    failure, so the orchestrator's harness branch can hand it straight
+    back as an `is_error: True` tool_result and let the harness see
+    exactly what g++ said.
+
+    The driver source is written to a NamedTemporaryFile with the
+    profile's driver_filename suffix (so g++ picks the right frontend
+    from the extension) and the compiler is invoked with
+    -fsyntax-only, which stops after parsing + typechecking and never
+    writes an object file or invokes the linker. That means we can
+    validate the harness's structural correctness (aliases resolve,
+    every declared name has a matching declaration, function calls
+    match signatures, ...) without needing any of the compile step's
+    -l<lib> / -L / -o flags. The include path IS required for Kokkos
+    (its <Kokkos_Core.hpp> is what defines the View/parallel_for
+    surface the harness uses); the profile's callable takes care of
+    that.
+    """
+    build = profile.build_syntax_check_command
+    # Extension-only suffix (e.g. ".cpp") so the compiler's frontend
+    # dispatch picks the right language.
+    suffix = Path(profile.driver_filename).suffix or ""
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=suffix, delete=False
+    ) as tmp:
+        tmp.write(source)
+        tmp_path = Path(tmp.name)
+    try:
+        cmd = build(tmp_path)
+        if cmd is None:
+            return None
+        compiler_name = cmd[0] if cmd else "<empty command>"
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except FileNotFoundError as exc:
+            # Missing compiler is treated as a skip, same as a missing
+            # env var: we can't check, so we don't block the harness.
+            print(
+                f"[syntax_check] skipping {label} check: "
+                f"failed to invoke {compiler_name!r}: {exc}",
+                file=sys.stderr,
+            )
+            return None
+        if proc.returncode != 0:
+            return {
+                "status": "error",
+                "stdout": proc.stdout,
+                "stderr": (
+                    f"{compiler_name} -fsyntax-only rejected the "
+                    f"baseline_harness output ({label}).\n"
+                    f"Fix the driver source and resubmit.\n"
+                    f"Command: {' '.join(cmd)}\n\n{proc.stderr}"
+                ),
+                "artifacts": [],
+            }
+        return None
+    finally:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
 
 
 def compile_baseline_driver(

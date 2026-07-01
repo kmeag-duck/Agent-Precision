@@ -1149,6 +1149,191 @@ def test_execute_tool_spawn_baseline_harness_v0_driver_source_still_works(
     assert not (tmp_path / "baselines" / "vector_add" / "probe").exists()
 
 
+# ---------- spawn_baseline_harness syntax-check gate ----------
+#
+# The gate rejects malformed harness output BEFORE it hits disk, so
+# the orchestrator can retry the harness (`is_error: True`
+# tool_result) with the compiler diagnostic verbatim instead of
+# wasting a full compile_baseline_driver HITL cycle on a driver we
+# already know won't compile. See workflow.tools.syntax_check_driver_
+# source and the docstring of the gate's motivating case (an
+# nbody_force run whose harness emitted two inconsistent alias
+# naming conventions in one declaration).
+
+
+def test_execute_tool_spawn_baseline_harness_gate_rejects_bad_v0_source(
+    monkeypatch, tmp_path
+):
+    """When the profile's syntax-check gate rejects a v0 driver_source payload, _execute_tool returns the gate's error dict with `is_error: True` added — the tool_result-block layer of run_orchestrator translates that into `is_error: True` on the Anthropic message, so the model retries the harness. Critically, no driver file is written to disk: the write-first path is what caused the motivating alias-drift bug to burn a full compile HITL cycle."""
+    monkeypatch.chdir(tmp_path)
+
+    def stub_run_agent(type_, task):
+        return {
+            "driver_source": "malformed source",
+            "kernel_function_name": "vector_add",
+            "inputs_summary": "N=16384, seed=42",
+            "output_arrays": ["z"],
+        }
+
+    def stub_syntax_check(profile, source, label):
+        assert source == "malformed source"
+        assert label == "driver_source"
+        return {
+            "status": "error",
+            "stdout": "",
+            "stderr": "g++ -fsyntax-only rejected driver_source ...",
+            "artifacts": [],
+        }
+
+    monkeypatch.setattr(orchestrator, "run_agent", stub_run_agent)
+    monkeypatch.setattr(
+        orchestrator, "syntax_check_driver_source", stub_syntax_check
+    )
+
+    result = _execute_tool(
+        "spawn_baseline_harness",
+        {"kernel_source": "KSRC", "kernel_stem": "vector_add"},
+        CUDA_PROFILE,
+    )
+
+    assert result["status"] == "error"
+    assert result["is_error"] is True
+    assert "g++ -fsyntax-only rejected" in result["stderr"]
+    # NO file must have been written under baselines/<stem>/.
+    assert not (tmp_path / "baselines" / "vector_add").exists()
+
+
+def test_execute_tool_spawn_baseline_harness_gate_rejects_bad_v1_driver(
+    monkeypatch, tmp_path
+):
+    """When one of the drivers in a v1 multi-driver payload fails the syntax-check gate, _execute_tool returns the gate error with `is_error: True` and writes NOTHING to disk (all-or-nothing — a partial fan-out would leave stale files that later probe_step calls would silently reuse). The label folded into the error names WHICH precision failed so the harness re-run can target its fix."""
+    monkeypatch.chdir(tmp_path)
+
+    drivers_payload = {
+        "quad":     "// QUAD driver\n",
+        "double":   "// DOUBLE driver (broken)\n",
+        "float":    "// FLOAT driver\n",
+        "mixed_io": "// MIXED_IO driver\n",
+    }
+
+    def stub_run_agent(type_, task):
+        return {
+            "drivers": drivers_payload,
+            "kernel_function_name": "vector_add",
+            "inputs_summary": "N=16384, seed=42",
+            "output_arrays": ["z"],
+        }
+
+    def stub_syntax_check(profile, source, label):
+        if source == drivers_payload["double"]:
+            return {
+                "status": "error",
+                "stdout": "",
+                "stderr": f"g++ -fsyntax-only rejected {label}\n",
+                "artifacts": [],
+            }
+        return None
+
+    monkeypatch.setattr(orchestrator, "run_agent", stub_run_agent)
+    monkeypatch.setattr(
+        orchestrator, "syntax_check_driver_source", stub_syntax_check
+    )
+
+    result = _execute_tool(
+        "spawn_baseline_harness",
+        {"kernel_source": "KSRC", "kernel_stem": "vector_add"},
+        KOKKOS_PROFILE,
+    )
+
+    assert result["status"] == "error"
+    assert result["is_error"] is True
+    # Label naming which precision failed — necessary for the harness
+    # re-run to know which of the four drivers to fix.
+    assert "drivers['double']" in result["stderr"]
+    # All-or-nothing: no partial write, no probe/ subdirectory.
+    assert not (tmp_path / "baselines" / "vector_add").exists()
+
+
+def test_execute_tool_spawn_baseline_harness_gate_passes_writes_all(
+    monkeypatch, tmp_path
+):
+    """When every driver in a v1 payload passes the syntax-check gate (stub returns None), _execute_tool proceeds with the normal fan-out write: baselines/<stem>/driver.cpp (the DOUBLE splice scaffold) plus baselines/<stem>/probe/<precision>/driver.cpp per precision. The is_error key must NOT appear in the result on the pass path."""
+    monkeypatch.chdir(tmp_path)
+
+    drivers_payload = {
+        "quad":     "// QUAD\nint main(){return 0;}\n",
+        "double":   "// DOUBLE\nint main(){return 0;}\n",
+        "float":    "// FLOAT\nint main(){return 0;}\n",
+        "mixed_io": "// MIXED_IO\nint main(){return 0;}\n",
+    }
+
+    def stub_run_agent(type_, task):
+        return {
+            "drivers": drivers_payload,
+            "kernel_function_name": "vector_add",
+            "inputs_summary": "N=16384, seed=42",
+            "output_arrays": ["z"],
+        }
+
+    # Stub gate: always pass.
+    monkeypatch.setattr(orchestrator, "run_agent", stub_run_agent)
+    monkeypatch.setattr(
+        orchestrator,
+        "syntax_check_driver_source",
+        lambda profile, source, label: None,
+    )
+
+    result = _execute_tool(
+        "spawn_baseline_harness",
+        {"kernel_source": "KSRC", "kernel_stem": "vector_add"},
+        KOKKOS_PROFILE,
+    )
+
+    assert result["status"] == "ok"
+    assert "is_error" not in result
+    # Canonical splice scaffold + probe fan-out both present.
+    assert (tmp_path / "baselines" / "vector_add" / "driver.cpp").exists()
+    for precision in drivers_payload:
+        assert (
+            tmp_path
+            / "baselines" / "vector_add" / "probe" / precision / "driver.cpp"
+        ).exists()
+
+
+def test_execute_tool_spawn_baseline_harness_gate_skipped_writes_all(
+    monkeypatch, tmp_path
+):
+    """When the profile's syntax-check gate is unavailable (stub returns None to simulate an unset AGENT_PRECISION_KOKKOS_ROOT), _execute_tool must still write every driver — the gate is a quality improvement, not a hard requirement. This test pins the silent-skip contract at the orchestrator layer so a future refactor doesn't turn 'unavailable toolchain' into a hard failure."""
+    monkeypatch.chdir(tmp_path)
+
+    driver_text = "// v0 driver\nint main(){return 0;}\n"
+
+    def stub_run_agent(type_, task):
+        return {
+            "driver_source": driver_text,
+            "kernel_function_name": "vector_add",
+            "inputs_summary": "N=16384, seed=42",
+            "output_arrays": ["z"],
+        }
+
+    monkeypatch.setattr(orchestrator, "run_agent", stub_run_agent)
+    # None means "gate unavailable / silent skip".
+    monkeypatch.setattr(
+        orchestrator,
+        "syntax_check_driver_source",
+        lambda profile, source, label: None,
+    )
+
+    result = _execute_tool(
+        "spawn_baseline_harness",
+        {"kernel_source": "KSRC", "kernel_stem": "vector_add"},
+        CUDA_PROFILE,
+    )
+
+    assert result["status"] == "ok"
+    assert (tmp_path / "baselines" / "vector_add" / "driver.cu").exists()
+
+
 # ---------- _format_baseline_block ----------
 
 

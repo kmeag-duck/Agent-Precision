@@ -91,6 +91,45 @@ def _build_compile_command(driver_src: Path, driver_bin: Path) -> list[str]:
     ]
 
 
+def _build_syntax_check_command(driver_src: Path) -> list[str] | None:
+    """Assemble the g++ argv list for a syntax-only Kokkos driver check.
+
+    Returns None when AGENT_PRECISION_KOKKOS_ROOT is unset or when the
+    install prefix doesn't look Kokkos-shaped — the harness-validation
+    gate then skips silently rather than failing every run on a host
+    without a Kokkos install (validation is a quality improvement,
+    not a hard requirement).
+
+    The flag set is a strict subset of the real compile flags: no
+    -L, no -l<lib>, no -o. `-fsyntax-only` stops after parsing +
+    typechecking, so the linker is never invoked and the .o is never
+    written. The include path IS required — without it, every
+    <Kokkos_Core.hpp> include fails and the check false-negatives on
+    every driver. The quad-driver's `__float128` is a GCC built-in
+    (not a header dependency), so `-lquadmath` is irrelevant for a
+    syntax check and deliberately omitted.
+
+    -fopenmp stays in because Kokkos's OpenMP host backend uses
+    `#pragma omp` directives that g++ warns about (and, with -Werror
+    somewhere upstream, could fail) when the flag is missing.
+    """
+    kokkos_root = os.environ.get(ROOT_ENV)
+    if not kokkos_root:
+        return None
+    root = Path(kokkos_root)
+    include_dir = root / "include"
+    if not include_dir.is_dir():
+        return None
+    return [
+        CXX,
+        CXX_STD,
+        "-fsyntax-only",
+        "-fopenmp",
+        f"-I{include_dir}",
+        str(driver_src),
+    ]
+
+
 def _preflight() -> dict | None:
     """Verify the Kokkos install before invoking the compiler.
 
@@ -569,6 +608,7 @@ KOKKOS_PROFILE = LanguageProfile(
     build_compile_command=_build_compile_command,
     preflight=_preflight,
     detect_from_source=_detect_from_source,
+    build_syntax_check_command=_build_syntax_check_command,
     # v1 probe pipeline. The baseline is quad (highest available
     # precision via libquadmath) so the probe measures float / double
     # drift against true ground truth rather than against a same-or-

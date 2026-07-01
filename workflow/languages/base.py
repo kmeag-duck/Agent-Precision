@@ -127,6 +127,22 @@ class LanguageProfile:
                           workflow.tools._compile_driver short-circuits
                           on the dict.
 
+      build_syntax_check_command(driver_src) -> list[str] | None
+                          Optional. Returns the argv list for a
+                          syntax-only compile (`-fsyntax-only` in gcc /
+                          clang parlance) used by the baseline-harness
+                          validation gate in _execute_tool to reject
+                          malformed driver source BEFORE it hits disk.
+                          Returns None when the profile has no gate or
+                          when its env/toolchain isn't available (the
+                          gate then skips silently — validation is a
+                          quality improvement, not a hard requirement,
+                          and forcing it would tie harness runs to a
+                          working toolchain the user might not have
+                          set up yet). Default is a lambda returning
+                          None; profiles opt in by supplying a real
+                          callable.
+
       detect_from_source(kernel_source) -> bool
                           Used only when the source suffix is claimed by
                           more than one profile. Should look at
@@ -180,6 +196,13 @@ class LanguageProfile:
     sentinel_end: str = DEFAULT_SENTINEL_END
     probe_precisions: tuple[str, ...] = ()
     baseline_precision: str = "double"
+    # Default: no syntax-check gate. Profiles opt in by supplying a
+    # callable that returns the argv list (or None to skip). Kept as a
+    # field-with-default rather than a method so profiles compose the
+    # same way for every other hook.
+    build_syntax_check_command: Callable[[Path], list[str] | None] = field(
+        default=lambda _driver_src: None
+    )
 
 
 __all__ = [

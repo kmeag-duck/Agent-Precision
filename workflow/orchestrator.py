@@ -33,6 +33,7 @@ from .tools import (
     run_baseline_driver,
     run_rewritten_driver,
     splice_rewritten_kernel,
+    syntax_check_driver_source,
 )
 from .verifier_panel import (
     VERIFIER_LENSES,
@@ -1024,10 +1025,14 @@ def _execute_tool(
         # the write.
         kernel_stem = tool_input["kernel_stem"]
         driver_dir = Path("baselines") / kernel_stem
-        driver_dir.mkdir(parents=True, exist_ok=True)
         # Per-language driver filename (driver.cpp for Kokkos,
         # driver.cu for CUDA). Owned by the LanguageProfile so the
         # orchestrator stays language-agnostic.
+        # NOTE: driver_dir.mkdir is deferred to AFTER the syntax-check
+        # gate so a gate failure leaves the filesystem untouched — the
+        # all-or-nothing contract is what makes the gate safe to retry
+        # (no half-written baselines/<stem>/ tree the next probe_step
+        # call could silently reuse).
         driver_path = driver_dir / profile.driver_filename
         # Two output shapes coexist: the v0 single-driver schema
         # (`driver_source: str`) is still used by CUDA/HIP/SYCL/OMP-
@@ -1073,6 +1078,27 @@ def _execute_tool(
             # the oracle role only — see the role-split comment above
             # for why these can't be the same file.
             canonical = drivers["double"]
+            # SYNTAX-CHECK GATE. Validate every driver source in the
+            # payload BEFORE we touch the filesystem. If any driver
+            # fails to parse under g++ -fsyntax-only, return an
+            # is_error tool_result and let the orchestrator's harness
+            # re-run see the compiler diagnostic verbatim — the
+            # motivating case is the "alias-naming drift" bug seen on
+            # a real nbody_force run where the harness declared
+            # `vxType vx(...); vyType_v vy(...);` (two different alias
+            # conventions in one line), which compiled cleanly enough
+            # under the write-first path to reach compile_baseline_
+            # driver and only failed there, wasting a full HITL cycle.
+            # The gate silently skips when the profile has no check
+            # command or KOKKOS_ROOT is unset (see
+            # syntax_check_driver_source in tools.py).
+            for precision, source in drivers.items():
+                gate_err = syntax_check_driver_source(
+                    profile, source, f"drivers[{precision!r}]"
+                )
+                if gate_err is not None:
+                    return {**gate_err, "is_error": True}
+            driver_dir.mkdir(parents=True, exist_ok=True)
             driver_path.write_text(canonical)
             for precision, source in drivers.items():
                 probe_dir = driver_dir / "probe" / precision
@@ -1081,6 +1107,12 @@ def _execute_tool(
                 probe_path.write_text(source)
                 probe_driver_paths[precision] = str(probe_path)
         elif "driver_source" in result:
+            gate_err = syntax_check_driver_source(
+                profile, result["driver_source"], "driver_source"
+            )
+            if gate_err is not None:
+                return {**gate_err, "is_error": True}
+            driver_dir.mkdir(parents=True, exist_ok=True)
             driver_path.write_text(result["driver_source"])
         else:
             raise RuntimeError(
@@ -1727,11 +1759,22 @@ def run_orchestrator(
             _append_trace(
                 trace_path, turns, tu.name, dict(tu.input), exec_result
             )
-            tool_results.append({
+            # If the tool itself flagged an error condition (e.g. the
+            # baseline_harness syntax-check gate rejected the driver
+            # source), surface that at the Anthropic tool_result block
+            # level so the model treats it as a failed tool call and
+            # self-corrects on its next turn. The `is_error` key is a
+            # tool-side signal; it does not belong in the JSON payload
+            # the model reads, so we pop it before serializing content.
+            is_error_flag = bool(exec_result.pop("is_error", False))
+            tool_result_block = {
                 "type": "tool_result",
                 "tool_use_id": tu.id,
                 "content": json.dumps(exec_result),
-            })
+            }
+            if is_error_flag:
+                tool_result_block["is_error"] = True
+            tool_results.append(tool_result_block)
 
         if user_quit:
             print("\nUser quit. Stopping.")

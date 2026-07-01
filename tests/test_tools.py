@@ -79,7 +79,9 @@ from workflow.tools import (
     run_baseline_driver,
     run_rewritten_driver,
     splice_rewritten_kernel,
+    syntax_check_driver_source,
 )
+from workflow.languages import KOKKOS_PROFILE
 
 
 # ---------- env-var handling ----------
@@ -3834,3 +3836,159 @@ def test_probe_compare_result_keys_are_stable(monkeypatch, tmp_path):
     (tmp_path / "baselines" / "k" / "probe" / "quad_seed42" / "reference.json").unlink()
     err = probe_compare("k", "kokkos")
     assert set(err.keys()) == {"status", "stdout", "stderr", "artifacts"}
+
+
+# ---------- syntax_check_driver_source (baseline-harness validation gate) ----------
+#
+# The gate exists to catch harness output that is structurally malformed
+# (missing/misnamed alias types, undefined symbols, mismatched
+# signatures) BEFORE it hits disk and burns a full compile-driver HITL
+# cycle downstream. The motivating case is a real nbody_force run
+# whose harness emitted `vxType vx(...); vyType_v vy(...);` — two
+# different alias-naming conventions in the same declaration — that
+# compiled cleanly through spawn_baseline_harness only to fail at
+# compile_baseline_driver, wasting turns and forcing MAX_TURNS
+# backstop. Gating at the harness boundary lets the orchestrator
+# retry the harness (`is_error: True` tool_result) with the compiler
+# diagnostic verbatim instead of the model having to guess.
+
+
+def test_syntax_check_returns_none_when_env_unset(monkeypatch, tmp_path):
+    """syntax_check_driver_source returns None (silent skip) when the profile's build_syntax_check_command returns None (e.g. Kokkos with AGENT_PRECISION_KOKKOS_ROOT unset). The gate is a quality improvement, not a hard requirement — a missing toolchain must not block harness runs on hosts where the operator hasn't set up an install yet."""
+    monkeypatch.delenv(KOKKOS_ROOT_ENV, raising=False)
+
+    def fail_run(*a, **kw):
+        raise AssertionError(
+            "subprocess.run must not be called when the profile's "
+            "syntax-check command is unavailable"
+        )
+
+    monkeypatch.setattr(subprocess, "run", fail_run)
+
+    result = syntax_check_driver_source(
+        KOKKOS_PROFILE, "int main(){return 0;}\n", "test_label"
+    )
+    assert result is None
+
+
+def test_syntax_check_returns_none_on_clean_source(monkeypatch, tmp_path):
+    """When the compiler subprocess exits 0, syntax_check_driver_source returns None — the caller (spawn_baseline_harness branch of _execute_tool) proceeds to write the driver to disk."""
+    monkeypatch.chdir(tmp_path)
+    root = _make_fake_kokkos_root(tmp_path)
+    monkeypatch.setenv(KOKKOS_ROOT_ENV, str(root))
+
+    captured = {}
+
+    class FakeProc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(cmd, capture_output, text, check):
+        captured["cmd"] = cmd
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = syntax_check_driver_source(
+        KOKKOS_PROFILE, "int main(){return 0;}\n", "test_label"
+    )
+    assert result is None
+    # The command should be g++ -fsyntax-only (not a full compile — no
+    # -L, no -l<lib>, no -o), with the -I pointing at the fake Kokkos
+    # root's include dir.
+    cmd = captured["cmd"]
+    assert cmd[0] == "g++"
+    assert "-fsyntax-only" in cmd
+    assert "-std=c++20" in cmd
+    assert "-fopenmp" in cmd
+    assert f"-I{root / 'include'}" in cmd
+    assert "-L" not in " ".join(cmd)
+    assert "-o" not in cmd
+    assert "-lkokkoscore" not in cmd
+
+
+def test_syntax_check_returns_error_dict_on_nonzero_exit(monkeypatch, tmp_path):
+    """When the compiler subprocess exits non-zero, syntax_check_driver_source returns an `_error()`-shaped dict — the caller (spawn_baseline_harness branch) returns it as an `is_error: True` tool_result so the orchestrator's harness re-runs. The `label` argument is folded into stderr so a multi-driver payload can name which precision failed. The command line is included in stderr so the operator can reproduce the failure locally, and the compiler's own stderr is preserved verbatim so the model sees the diagnostic."""
+    monkeypatch.chdir(tmp_path)
+    root = _make_fake_kokkos_root(tmp_path)
+    monkeypatch.setenv(KOKKOS_ROOT_ENV, str(root))
+
+    class FakeProc:
+        returncode = 1
+        stdout = ""
+        stderr = "driver.cpp:71:34: error: expected initializer before 'vy'\n"
+
+    def fake_run(cmd, capture_output, text, check):
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = syntax_check_driver_source(
+        KOKKOS_PROFILE, "malformed source", "drivers['double']"
+    )
+    assert result is not None
+    assert set(result.keys()) == {"status", "stdout", "stderr", "artifacts"}
+    assert result["status"] == "error"
+    assert result["artifacts"] == []
+    # Label naming which driver failed
+    assert "drivers['double']" in result["stderr"]
+    # The verbatim compiler diagnostic
+    assert "expected initializer before 'vy'" in result["stderr"]
+    # The command line for reproducibility
+    assert "g++" in result["stderr"]
+    assert "-fsyntax-only" in result["stderr"]
+
+
+def test_syntax_check_returns_none_when_compiler_missing(
+    monkeypatch, tmp_path
+):
+    """When g++ itself is not on PATH (FileNotFoundError from subprocess.run), syntax_check_driver_source returns None (silent skip) rather than failing every harness call. Same rationale as the env-unset skip: validation is a quality improvement, not a hard prerequisite."""
+    monkeypatch.chdir(tmp_path)
+    root = _make_fake_kokkos_root(tmp_path)
+    monkeypatch.setenv(KOKKOS_ROOT_ENV, str(root))
+
+    def raise_fnf(*a, **kw):
+        raise FileNotFoundError("g++ not on PATH")
+
+    monkeypatch.setattr(subprocess, "run", raise_fnf)
+
+    result = syntax_check_driver_source(
+        KOKKOS_PROFILE, "int main(){return 0;}\n", "test_label"
+    )
+    assert result is None
+
+
+def test_syntax_check_writes_source_to_tempfile_with_right_suffix(
+    monkeypatch, tmp_path
+):
+    """The candidate source is written to a temp file whose suffix matches profile.driver_filename (so g++'s language-frontend dispatch picks C++, not C). The tempfile is passed to the compiler command and cleaned up after the check regardless of exit status."""
+    monkeypatch.chdir(tmp_path)
+    root = _make_fake_kokkos_root(tmp_path)
+    monkeypatch.setenv(KOKKOS_ROOT_ENV, str(root))
+
+    captured = {}
+
+    class FakeProc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(cmd, capture_output, text, check):
+        # The last positional arg to g++ is the source file path.
+        captured["source_arg"] = cmd[-1]
+        # File must exist AT THE TIME the compiler runs (not deleted early).
+        captured["exists_during_run"] = os.path.exists(cmd[-1])
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    syntax_check_driver_source(
+        KOKKOS_PROFILE, "int main(){return 0;}\n", "test_label"
+    )
+
+    assert captured["exists_during_run"] is True
+    # Kokkos driver_filename is "driver.cpp" -> suffix ".cpp"
+    assert captured["source_arg"].endswith(".cpp")
+    # And the tempfile must be cleaned up after the check returns.
+    assert not os.path.exists(captured["source_arg"])
