@@ -114,6 +114,67 @@ def test_ignores_non_submit_result_tool_use(fake_anthropic):
     assert result == payload
 
 
+# ---------- tool_use.input coercion ----------
+#
+# Motivating incident (2026-07-01, K=3 nbody_force retry): one of three
+# parallel analyst calls came back with `tool_use.input` as a JSON string
+# instead of a decoded object (Argo proxy quirk), which flowed into
+# aggregate_analyst_verdicts as `'str' object has no attribute 'get'`
+# six frames deep. The coercion helper turns valid JSON strings into
+# dicts silently, and turns everything else into a diagnosable
+# RuntimeError naming the agent and response id.
+
+
+def test_coerces_string_tool_input_via_json_decode(fake_anthropic):
+    """run_agent silently JSON-decodes tool_use.input when the proxy forwards it as a string, so K>1 runs against Argo don't crash on a proxy quirk."""
+    payload = {"rewritten_code": "code", "summary_of_changes": "changes"}
+    import json as _json
+    fake_anthropic([
+        FakeResponse(
+            content=[ToolUseBlock(name="submit_result", input=_json.dumps(payload))],
+            stop_reason="tool_use",
+        ),
+    ])
+    result = run_agent("rewriter", "task")
+    assert result == payload
+
+
+def test_raises_when_string_tool_input_is_not_valid_json(fake_anthropic):
+    """A tool_use.input string that isn't valid JSON raises RuntimeError naming the agent and response id, not a bare JSONDecodeError."""
+    fake_anthropic([
+        FakeResponse(
+            content=[ToolUseBlock(name="submit_result", input="{not json")],
+            stop_reason="tool_use",
+        ),
+    ])
+    with pytest.raises(RuntimeError, match="not valid JSON"):
+        run_agent("rewriter", "task")
+
+
+def test_raises_when_string_tool_input_decodes_to_non_dict(fake_anthropic):
+    """A JSON-string tool_use.input that decodes to a list (or other non-object) raises RuntimeError — the aggregator and downstream tool-result plumbing require a dict."""
+    fake_anthropic([
+        FakeResponse(
+            content=[ToolUseBlock(name="submit_result", input='["not", "an", "object"]')],
+            stop_reason="tool_use",
+        ),
+    ])
+    with pytest.raises(RuntimeError, match="JSON-encoded list"):
+        run_agent("rewriter", "task")
+
+
+def test_raises_when_tool_input_is_neither_dict_nor_string(fake_anthropic):
+    """A tool_use.input of an unexpected type (e.g. int) raises RuntimeError — defensive guard against future SDK/proxy shape changes."""
+    fake_anthropic([
+        FakeResponse(
+            content=[ToolUseBlock(name="submit_result", input=42)],
+            stop_reason="tool_use",
+        ),
+    ])
+    with pytest.raises(RuntimeError, match="expected dict or JSON-string"):
+        run_agent("rewriter", "task")
+
+
 # ---------- temperature plumbing ----------
 
 

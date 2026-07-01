@@ -64,6 +64,13 @@ def test_raises_on_empty_input():
         aggregate_analyst_verdicts([])
 
 
+def test_raises_typeerror_when_any_verdict_is_not_a_dict():
+    """A non-dict verdict (e.g. a str that slipped through an unpatched run_agent path) is rejected at the front door with a TypeError naming the offending index — prevents the cryptic 'str' object has no attribute 'get' six-frames-deep failure observed on the K=3 nbody_force retry run (2026-07-01)."""
+    good = _verdict(variables=[_var("x", "keep")])
+    with pytest.raises(TypeError, match=r"verdicts\[1\] is a str"):
+        aggregate_analyst_verdicts([good, "oops not a dict", good])
+
+
 # ---------- variables: unanimous ----------
 
 

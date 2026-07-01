@@ -16,6 +16,7 @@ results into aggregator.aggregate_analyst_verdicts (or an equivalent
 type-specific aggregator) to fold ensemble noise into a stable decision.
 """
 
+import json
 import sys
 from concurrent.futures import ThreadPoolExecutor
 
@@ -215,12 +216,69 @@ def run_agent(
 
     for block in response.content:
         if block.type == "tool_use" and block.name == "submit_result":
-            return dict(block.input)
+            return _coerce_tool_input_to_dict(
+                block.input, type, getattr(response, "id", "<unknown>")
+            )
 
     raise RuntimeError(
         f"Agent {type!r} did not call submit_result. "
         f"stop_reason={response.stop_reason}, "
         f"blocks={[b.type for b in response.content]}"
+    )
+
+
+def _coerce_tool_input_to_dict(
+    raw: object, agent_type: str, response_id: str
+) -> dict:
+    """Normalize `tool_use.input` payloads that come in as JSON strings.
+
+    The Anthropic SDK types `ContentBlock.input` as `dict`, and on
+    api.anthropic.com the field is always a decoded object. Some Argo
+    proxy paths (notably the `:8083` `claude-argo-proxy.py` transparent
+    shim) forward the upstream body without re-parsing, and the
+    upstream occasionally emits `input` as a JSON-encoded string.
+    Downstream code (aggregator, orchestrator tool-result plumbing) all
+    assumes a dict, so a string reaches
+    `aggregate_analyst_verdicts` as an `'str' object has no attribute
+    'get'` mystery-traceback deep inside the K-fold — that was the
+    concrete failure mode that motivated this guard on the K=3
+    nbody_force retry run (2026-07-01).
+
+    Silent JSON-decode is the deliberate policy: the upstream payload
+    is well-formed 99% of the time, the proxy quirk is transient, and
+    turning it into a hard crash would make every K>1 Argo run
+    fragile. If the string is not valid JSON, or decodes to something
+    other than a dict, we raise a RuntimeError naming the agent and
+    response id (same idiom as the `content=None` guard above) so the
+    failure is diagnosable at the source instead of six frames deep.
+    """
+    if isinstance(raw, dict):
+        return dict(raw)
+    if isinstance(raw, str):
+        try:
+            decoded = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                f"Agent {agent_type!r} returned tool_use.input as a "
+                f"string that is not valid JSON: {exc}. "
+                f"response_id={response_id}, "
+                f"payload_preview={raw[:200]!r}. "
+                f"This usually indicates a proxy is forwarding an "
+                f"unparsed upstream body; retry, or inspect the proxy "
+                f"logs."
+            ) from exc
+        if not isinstance(decoded, dict):
+            raise RuntimeError(
+                f"Agent {agent_type!r} returned tool_use.input as a "
+                f"JSON-encoded {type(decoded).__name__}, expected object. "
+                f"response_id={response_id}, "
+                f"decoded_preview={str(decoded)[:200]!r}."
+            )
+        return decoded
+    raise RuntimeError(
+        f"Agent {agent_type!r} returned tool_use.input of type "
+        f"{type(raw).__name__}, expected dict or JSON-string. "
+        f"response_id={response_id}."
     )
 
 

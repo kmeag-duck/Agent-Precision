@@ -110,6 +110,24 @@ def aggregate_analyst_verdicts(
     if not verdicts:
         raise ValueError("Cannot aggregate zero verdicts")
 
+    # Front-door type check: every element must be a dict. Historically
+    # this was implicit and a stray str verdict (e.g. from an upstream
+    # proxy that forwarded tool_use.input as a JSON string that never
+    # got decoded — see `_coerce_tool_input_to_dict` in run_agent.py)
+    # surfaced six frames deep as `'str' object has no attribute 'get'`
+    # inside the rework vote comprehension. This guard fails loudly at
+    # the entry point instead, naming the offending index and type.
+    # `run_agent`'s guard should catch this upstream in practice; this
+    # is defense in depth for direct callers and for future ensemble
+    # sources that might not route through `run_agent`.
+    for i, v in enumerate(verdicts):
+        if not isinstance(v, dict):
+            raise TypeError(
+                f"aggregate_analyst_verdicts: verdicts[{i}] is a "
+                f"{type(v).__name__}, expected dict. "
+                f"preview={str(v)[:200]!r}"
+            )
+
     # ---- per-variable vote ---------------------------------------------
     # Map normalized name -> list of raw names (for choosing display form)
     name_raw_forms: dict[str, list[str]] = {}
