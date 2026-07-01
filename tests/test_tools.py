@@ -71,6 +71,7 @@ from workflow.tools import (
     KERNEL_END_SENTINEL,
     KOKKOS_ROOT_ENV,
     RUN_TIMEOUT_ENV,
+    check_analyst_verdict_against_probe,
     compare_outputs,
     compile_baseline_driver,
     compile_rewritten_driver,
@@ -3992,3 +3993,295 @@ def test_syntax_check_writes_source_to_tempfile_with_right_suffix(
     assert captured["source_arg"].endswith(".cpp")
     # And the tempfile must be cleaned up after the check returns.
     assert not os.path.exists(captured["source_arg"])
+
+
+# ---------- check_analyst_verdict_against_probe ----------
+#
+# Helper builders keep the tests focused on the check's decision
+# logic rather than repeating dict-scaffolding in every test body.
+
+
+def _mk_verdict(*variables):
+    """Build a minimally-shaped analyst verdict dict from (name, action, target_precision) tuples."""
+    return {
+        "variables": [
+            {
+                "name": name,
+                "action": action,
+                "target_precision": target,
+                "emulation_type": "",
+                "reason": "test",
+            }
+            for name, action, target in variables
+        ]
+    }
+
+
+def _mk_evidence(cells):
+    """Build a minimally-shaped probe evidence dict from a {cell_name: {output_name: max_absrel_value}} shorthand."""
+    return {
+        "cells": {
+            cell_name: {
+                "status": "ok",
+                "stats": {
+                    output_name: {
+                        "n": 1024,
+                        "n_finite": 1024,
+                        "n_nonfinite": 0,
+                        "max_absrel": absrel,
+                        "mean_absrel": absrel / 100.0,
+                        "max_abserror": absrel,
+                    }
+                    for output_name, absrel in outputs.items()
+                },
+            }
+            for cell_name, outputs in cells.items()
+        }
+    }
+
+
+def test_check_flags_downcast_when_probe_cell_violates_sig_figs_tolerance():
+    """A downcast-to-float verdict is flagged when the float probe cell's max_absrel exceeds the sig_figs threshold."""
+    verdict = _mk_verdict(("vy", "downcast", "float"))
+    # sig_figs=6 -> threshold 1e-6; probe shows 3.4e-4 -- five orders over.
+    evidence = _mk_evidence({"float_seed42": {"vy": 3.4e-4}})
+    tolerance = {"kind": "sig_figs", "value": 6, "source": "user_cli"}
+
+    violations = check_analyst_verdict_against_probe(
+        verdict, evidence, tolerance
+    )
+
+    assert len(violations) == 1
+    msg = violations[0]
+    assert "vy" in msg
+    assert "float_seed42" in msg
+    assert "downcast" in msg
+    assert "sig_figs" in msg
+
+
+def test_check_does_not_flag_downcast_when_probe_cell_passes_tolerance():
+    """A downcast-to-float verdict is NOT flagged when the float probe cell's max_absrel is within the sig_figs threshold."""
+    verdict = _mk_verdict(("x", "downcast", "float"))
+    # sig_figs=3 -> threshold 1e-3; probe shows 1e-5 -- well within.
+    evidence = _mk_evidence({"float_seed42": {"x": 1e-5}})
+    tolerance = {"kind": "sig_figs", "value": 3, "source": "user_cli"}
+
+    assert (
+        check_analyst_verdict_against_probe(verdict, evidence, tolerance)
+        == []
+    )
+
+
+def test_check_skips_emulate_action_entirely():
+    """An emulate verdict is never flagged, even when the corresponding-looking probe cell would violate tolerance (v0 has no float-float probe cell)."""
+    verdict = {
+        "variables": [
+            {
+                "name": "acc",
+                "action": "emulate",
+                "target_precision": "",
+                "emulation_type": "float-float",
+                "reason": "test",
+            }
+        ]
+    }
+    # Even if a float cell exists and violates, emulate is skipped.
+    evidence = _mk_evidence({"float_seed42": {"acc": 1.0}})
+    tolerance = {"kind": "sig_figs", "value": 6, "source": "user_cli"}
+
+    assert (
+        check_analyst_verdict_against_probe(verdict, evidence, tolerance)
+        == []
+    )
+
+
+def test_check_skips_keep_action():
+    """A keep verdict is never flagged regardless of probe evidence."""
+    verdict = _mk_verdict(("m", "keep", ""))
+    # Probe shows atrocious float error, but the analyst chose keep.
+    evidence = _mk_evidence({"float_seed42": {"m": 1.0}})
+    tolerance = {"kind": "sig_figs", "value": 6, "source": "user_cli"}
+
+    assert (
+        check_analyst_verdict_against_probe(verdict, evidence, tolerance)
+        == []
+    )
+
+
+def test_check_skips_when_probe_cell_status_is_not_ok():
+    """A downcast verdict is not flagged when the matching probe cell has status != 'ok' (missing / load_error / etc)."""
+    verdict = _mk_verdict(("vy", "downcast", "float"))
+    evidence = {
+        "cells": {
+            "float_seed42": {"status": "missing", "error": "no such file"}
+        }
+    }
+    tolerance = {"kind": "sig_figs", "value": 6, "source": "user_cli"}
+
+    assert (
+        check_analyst_verdict_against_probe(verdict, evidence, tolerance)
+        == []
+    )
+
+
+def test_check_skips_when_target_precision_has_no_matching_probe_cell():
+    """A downcast-to-half verdict is not flagged when the probe matrix only covered float / mixed_io (no half cell to compare against)."""
+    verdict = _mk_verdict(("vy", "downcast", "half"))
+    evidence = _mk_evidence({"float_seed42": {"vy": 3.4e-4}})
+    tolerance = {"kind": "sig_figs", "value": 6, "source": "user_cli"}
+
+    assert (
+        check_analyst_verdict_against_probe(verdict, evidence, tolerance)
+        == []
+    )
+
+
+def test_check_uses_max_abserror_for_decimal_digits_tolerance():
+    """A downcast verdict is flagged/unflagged against max_abserror when tolerance.kind='decimal_digits'."""
+    verdict = _mk_verdict(("x", "downcast", "float"))
+    # Craft an evidence dict where max_absrel is fine (1e-9) but
+    # max_abserror is over (1e-2 vs decimal_digits=3 threshold 1e-3).
+    evidence = {
+        "cells": {
+            "float_seed42": {
+                "status": "ok",
+                "stats": {
+                    "x": {
+                        "n": 100,
+                        "n_finite": 100,
+                        "n_nonfinite": 0,
+                        "max_absrel": 1e-9,
+                        "mean_absrel": 1e-11,
+                        "max_abserror": 1e-2,
+                    }
+                },
+            }
+        }
+    }
+    tolerance = {
+        "kind": "decimal_digits",
+        "value": 3,
+        "source": "user_cli",
+    }
+
+    violations = check_analyst_verdict_against_probe(
+        verdict, evidence, tolerance
+    )
+    assert len(violations) == 1
+    assert "max_abserror" in violations[0]
+    assert "decimal_digits" in violations[0]
+
+
+def test_check_uses_canonical_seed_42_not_seed_43():
+    """The check consults the seed=42 probe cell (canonical, first in _PROBE_SEEDS) even if seed=43 would look different."""
+    verdict = _mk_verdict(("vy", "downcast", "float"))
+    # seed=42 passes tolerance; seed=43 would violate. Verdict should NOT be flagged.
+    evidence = _mk_evidence(
+        {
+            "float_seed42": {"vy": 1e-9},
+            "float_seed43": {"vy": 1e-3},
+        }
+    )
+    tolerance = {"kind": "sig_figs", "value": 6, "source": "user_cli"}
+
+    assert (
+        check_analyst_verdict_against_probe(verdict, evidence, tolerance)
+        == []
+    )
+
+
+def test_check_returns_empty_list_when_evidence_has_no_cells():
+    """The check silently returns [] when evidence.json has no 'cells' key (or an empty one) -- no basis to flag anything."""
+    verdict = _mk_verdict(("vy", "downcast", "float"))
+    tolerance = {"kind": "sig_figs", "value": 6, "source": "user_cli"}
+
+    assert (
+        check_analyst_verdict_against_probe(verdict, {}, tolerance) == []
+    )
+    assert (
+        check_analyst_verdict_against_probe(
+            verdict, {"cells": {}}, tolerance
+        )
+        == []
+    )
+
+
+def test_check_returns_empty_list_when_tolerance_kind_is_unknown():
+    """The check silently returns [] when tolerance.kind is not 'sig_figs' or 'decimal_digits' -- malformed tolerances are not this helper's problem."""
+    verdict = _mk_verdict(("vy", "downcast", "float"))
+    evidence = _mk_evidence({"float_seed42": {"vy": 1.0}})
+
+    for bad in [
+        {"kind": "unknown", "value": 6, "source": "user_cli"},
+        {"kind": "sig_figs", "value": 0, "source": "user_cli"},
+        {"kind": "sig_figs", "value": -3, "source": "user_cli"},
+        {"kind": "sig_figs", "value": "6", "source": "user_cli"},
+        {},
+    ]:
+        assert (
+            check_analyst_verdict_against_probe(verdict, evidence, bad)
+            == []
+        )
+
+
+def test_check_flags_every_downcast_to_a_violating_precision():
+    """The check is cell-level (worst output across the cell), not per-variable: every variable downcast to a precision whose probe cell violates tolerance is flagged, and 'keep' variables are always skipped."""
+    verdict = _mk_verdict(
+        ("x", "downcast", "float"),
+        ("vy", "downcast", "float"),
+        ("vz", "keep", ""),  # skipped: keep
+        ("m", "downcast", "double"),  # skipped: no double cell in evidence
+    )
+    # float_seed42 has one output (vy) that violates -> the whole
+    # cell counts as violating for ANY downcast-to-float verdict.
+    evidence = _mk_evidence(
+        {
+            "float_seed42": {
+                "x": 1e-9,
+                "vy": 1e-3,
+                "vz": 1e-8,
+            }
+        }
+    )
+    tolerance = {"kind": "sig_figs", "value": 6, "source": "user_cli"}
+
+    violations = check_analyst_verdict_against_probe(
+        verdict, evidence, tolerance
+    )
+
+    # Both downcast-to-float variables are flagged (both would ship
+    # a float type; the cell's worst output determines the verdict).
+    # 'vz' (keep) and 'm' (downcast to precision with no probe cell)
+    # are silent-skip.
+    assert len(violations) == 2
+    assert "'x'" in violations[0]
+    assert "'vy'" in violations[1]
+    # And both cite the same worst output.
+    for msg in violations:
+        assert "vy" in msg  # the offending output name appears
+    joined = "\n".join(violations)
+    assert "'vz'" not in joined
+    assert "'m'" not in joined
+
+
+def test_check_picks_worst_output_when_multiple_outputs_violate():
+    """When several outputs in the same cell exceed threshold, the flag message names the WORST (largest) offender."""
+    verdict = _mk_verdict(("vy", "downcast", "float"))
+    evidence = _mk_evidence(
+        {
+            "float_seed42": {
+                "out_small": 1e-5,  # violates 1e-6 but small
+                "out_worst": 1e-2,  # violates 1e-6 and largest
+                "out_mid": 1e-4,
+            }
+        }
+    )
+    tolerance = {"kind": "sig_figs", "value": 6, "source": "user_cli"}
+
+    violations = check_analyst_verdict_against_probe(
+        verdict, evidence, tolerance
+    )
+    assert len(violations) == 1
+    assert "out_worst" in violations[0]
+    assert "out_small" not in violations[0]
+    assert "out_mid" not in violations[0]

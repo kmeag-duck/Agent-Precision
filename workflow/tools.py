@@ -1629,3 +1629,122 @@ def probe_compare(kernel_stem: str, language_id: str) -> dict:
         "stderr": "",
         "artifacts": [str(evidence_path)],
     }
+
+
+# ---------------------------------------------------------------------------
+# Probe-vs-verdict consistency check (post-analyst safety net)
+# ---------------------------------------------------------------------------
+#
+# See AGENTS.md "Probe pipeline" for the design rationale. Motivating case:
+# the nbody_force N=5 consistency sweep had one run where the analyst
+# returned action='downcast' target_precision='float' for every storage
+# View despite the float probe cell showing max_absrel ~= 0.34 on vy
+# against a sig_figs=6 (~1e-6) tolerance -- five orders of magnitude over.
+# The verifier accepted it, the comparator rejected it, and the
+# orchestrator burned four full rewrite cycles before MAX_TURNS killed
+# the run. This helper catches that class of failure BEFORE spawn_rewriter
+# is even called.
+#
+# Scope in v0 is intentionally narrow (see the emulate/target_precision
+# skip conditions below): the check only flags what the probe pipeline
+# has actual evidence for.
+def check_analyst_verdict_against_probe(
+    verdict: dict,
+    evidence: dict,
+    tolerance: dict,
+) -> list[str]:
+    """Compare an analyst verdict against probe evidence; return violation
+    strings.
+
+    An empty list means "no inconsistency detected" -- either everything
+    checks out, or there was no basis to check (missing evidence,
+    action='keep', action='emulate', target_precision with no matching
+    probe cell, probe cell status != 'ok'). All of those are silent
+    skips by design: absence of evidence is not evidence of a
+    violation, and this check exists to catch analyst verdicts the
+    probe positively contradicts, not to demand universal probe
+    coverage.
+
+    Arithmetic (per the design decisions in the item-#5 clarification
+    round):
+      - For action='downcast', look up the probe cell whose precision
+        matches target_precision at the canonical seed (42 -- the
+        first entry in _PROBE_SEEDS).
+      - Convert the tolerance to a numerical threshold:
+          * kind='sig_figs':      threshold = 10 ** -value  (relative)
+          * kind='decimal_digits': threshold = 10 ** -value  (absolute)
+      - Compare per-output stats:
+          * sig_figs -> max_absrel
+          * decimal_digits -> max_abserror
+        If ANY output in the cell exceeds the threshold, flag the
+        variable. Per-variable precision is coarser than per-output;
+        the worst output is the honest conservative signal.
+
+    Returns a list of one violation string per flagged variable, each
+    naming the variable, the chosen action/target_precision, the
+    probe cell consulted, and the observed vs allowed numbers. This
+    string is what the orchestrator surfaces to the analyst on retry,
+    so it needs to be specific enough that the analyst can actually
+    change its mind about that variable rather than re-emitting the
+    same verdict.
+    """
+    tol_kind = tolerance.get("kind")
+    tol_value = tolerance.get("value")
+    if tol_kind not in ("sig_figs", "decimal_digits"):
+        # Unknown tolerance shape -- silently skip; a malformed
+        # tolerance is not this checker's problem to diagnose.
+        return []
+    if not isinstance(tol_value, int) or tol_value <= 0:
+        return []
+    threshold = 10.0 ** (-tol_value)
+    stat_key = "max_absrel" if tol_kind == "sig_figs" else "max_abserror"
+
+    cells = evidence.get("cells", {})
+    if not cells:
+        return []
+    canonical_seed = _PROBE_SEEDS[0]
+
+    violations: list[str] = []
+    for entry in verdict.get("variables", []):
+        action = entry.get("action")
+        if action != "downcast":
+            # 'keep' has no risk; 'emulate' has no matching probe
+            # cell in v0 (see AGENTS.md). Silent skip.
+            continue
+        target = (entry.get("target_precision") or "").strip()
+        if not target:
+            continue
+        cell_name = f"{target}_seed{canonical_seed}"
+        cell = cells.get(cell_name)
+        if cell is None or cell.get("status") != "ok":
+            # No usable probe evidence for this precision at the
+            # canonical seed. Silent skip -- e.g. downcast to 'half'
+            # when the probe matrix only covered float / mixed_io.
+            continue
+        stats = cell.get("stats") or {}
+        # Find the worst-offending output for this cell. If nothing
+        # in the cell exceeds threshold, no violation.
+        worst_output = ""
+        worst_value = 0.0
+        for output_name, output_stats in stats.items():
+            value = output_stats.get(stat_key)
+            if not isinstance(value, (int, float)):
+                continue
+            if value > threshold and value > worst_value:
+                worst_value = value
+                worst_output = output_name
+        if not worst_output:
+            continue
+        name = entry.get("name", "<unnamed>")
+        violations.append(
+            f"Variable '{name}': analyst said action='downcast' "
+            f"target_precision='{target}', but probe cell "
+            f"'{cell_name}' shows {stat_key}={worst_value:.3e} on "
+            f"output '{worst_output}', which exceeds the "
+            f"{tol_kind}={tol_value} tolerance threshold of "
+            f"{threshold:.1e}. Reconsider this variable: either "
+            f"keep it at original precision, choose a wider target "
+            f"precision, or justify why the probe evidence is "
+            f"misleading for this specific case."
+        )
+    return violations

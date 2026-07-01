@@ -25,6 +25,7 @@ from .aggregator import aggregate_analyst_verdicts
 from .languages import LanguageProfile, detect_language
 from .run_agent import run_agent, run_agent_ensemble
 from .tools import (
+    check_analyst_verdict_against_probe,
     compare_outputs,
     compile_baseline_driver,
     compile_rewritten_driver,
@@ -73,12 +74,12 @@ float-float etc.); a kernel can satisfy a 6-sig-fig tolerance with a
 mix of storage precisions internally.
 
 You are a router and guardrail, not a numerics expert. Do not decide
-per-variable precision yourself — that is the analyst's job. The
-output-precision tolerance is fixed by the user on the command line
-and provided to you verbatim in the initial user message; you do not
-decide it and you cannot change it. Your job is to call the right
-agent at the right time, thread the tolerance and verdicts through
-their task prompts faithfully, and assemble their outputs.
+per-variable precision yourself — that is the analyst's job. Do not
+decide the output-precision tolerance yourself — the user always
+supplies it on the command line and it is threaded to you verbatim.
+Your job is to call the right agent at the right time, thread the
+tolerance and verdicts through their task prompts faithfully, and
+assemble their outputs.
 
 You have access to four specialist agents:
   - analyst: takes the kernel source AND the agreed tolerance, and
@@ -274,15 +275,14 @@ You also have two deterministic (non-LLM) tools:
 You also have a finish tool to emit the final answer.
 
 Tolerance handling:
-- The user message will tell you a concrete tolerance
-  ({kind, value, source='user_cli'}). It is always present; the CLI
-  requires the operator to pass --sig-figs or --decimal-digits and
-  rejects a run with neither.
+- The user message will tell you the concrete tolerance
+  ({kind, value, source='user_cli'}). It is always supplied on the
+  command line; there is no inference path.
 - Thread the tolerance verbatim into the task prompts of analyst,
   rewriter, and verifier. The analyst MUST see {target_kind,
   target_value, source}; the rewriter SHOULD see the tolerance for
-  context; the verifier MUST see the same tolerance the analyst saw
-  so it can audit the precision_budget block.
+  context; the verifier MUST see the same tolerance the analyst saw so
+  it can audit the precision_budget block.
 
 Your job after the tolerance is fixed:
 0. If the user message's BASELINE STEP block invites it (Kokkos C++
@@ -427,7 +427,8 @@ ORCHESTRATOR_TOOLS = [
                         "The agreed output-precision tolerance as a JSON "
                         "string with keys {kind, value, source}, matching "
                         "what the analyst was given. Use kind='sig_figs' "
-                        "or 'decimal_digits'; source is 'user_cli'."
+                        "or 'decimal_digits'; source is currently always "
+                        "'user_cli'."
                     ),
                 },
             },
@@ -858,11 +859,86 @@ def _hitl_pause(tool_name: str, tool_input: dict) -> str:
         print("Please answer y, n, or q.")
 
 
+def _probe_consistency_gate(
+    verdict: dict,
+    kernel_stem: str | None,
+    tolerance: dict | None,
+) -> dict | None:
+    """Post-analyst safety net: return a synthetic error dict when the
+    analyst's verdict positively contradicts the probe evidence, or
+    None when there is no basis to intervene.
+
+    Design (see AGENTS.md "Probe pipeline" and the item-#5 rationale
+    in the file header): motivated by the nbody_force N=5 consistency
+    sweep where run #2's analyst returned action='downcast'
+    target_precision='float' for every storage View despite the float
+    probe cell showing max_absrel ~0.34 on vy against a sig_figs=6
+    (~1e-6) tolerance. The verifier accepted it, the comparator
+    rejected it, and the run burned four full rewrite cycles before
+    MAX_TURNS killed it. This gate catches that failure mode BEFORE
+    spawn_rewriter is even called.
+
+    Silent-skip whenever:
+      - tolerance is None or kernel_stem is None (test-mode calls),
+      - baselines/<kernel_stem>/probe/evidence.json does not exist
+        (probe was disabled or never ran),
+      - the evidence.json is unreadable or unparseable (non-fatal by
+        the same policy that already gates prompt-injection),
+      - the check returns an empty violation list (verdict is
+        consistent with evidence, or there was no basis to flag any
+        variable -- see check_analyst_verdict_against_probe for the
+        full skip matrix).
+
+    When violations are found, returns a dict shaped like the
+    finish-gate's synthetic error: {status:'error', is_error:True,
+    stderr:<one line per violation>, probe_consistency_violations:
+    <the raw list>}. The is_error key propagates to the SDK's
+    tool_result is_error flag (via the same mechanism used elsewhere
+    in _execute_tool), so the orchestrator LLM sees this as a tool
+    failure and retries spawn_analyst rather than forwarding the
+    verdict to the rewriter. There is deliberately no retry counter
+    -- MAX_TURNS is the only backstop, matching the finish-gate
+    convention.
+    """
+    if tolerance is None or kernel_stem is None:
+        return None
+    evidence_path = (
+        Path("baselines") / kernel_stem / "probe" / "evidence.json"
+    )
+    if not evidence_path.is_file():
+        return None
+    try:
+        evidence = json.loads(evidence_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    violations = check_analyst_verdict_against_probe(
+        verdict, evidence, tolerance
+    )
+    if not violations:
+        return None
+    header = (
+        "Probe-consistency gate rejected the analyst verdict: the "
+        "verdict contradicts the empirical probe evidence for one "
+        "or more variables. Re-run spawn_analyst; either revise "
+        "the flagged variables to a wider precision (or 'keep'), or "
+        "justify in the reason field why the probe evidence should "
+        "be overridden for this specific case.\n"
+    )
+    body = "\n".join(f"  - {v}" for v in violations)
+    return {
+        "status": "error",
+        "is_error": True,
+        "stderr": header + body,
+        "probe_consistency_violations": violations,
+    }
+
+
 def _execute_tool(
     tool_name: str,
     tool_input: dict,
     profile: LanguageProfile,
     kernel_stem: str | None = None,
+    tolerance: dict | None = None,
 ) -> dict:
     """Actually run the requested tool. Returns the result to feed back.
 
@@ -885,6 +961,21 @@ def _execute_tool(
     it on the analyst's behalf. None means "no probe evidence
     available" — kept optional for tests that exercise _execute_tool
     in isolation.
+
+    `tolerance` is the {kind, value, source} dict the run was launched
+    with, threaded here so the spawn_analyst branch's post-analyst
+    probe-consistency check has the numerical threshold to compare
+    probe cells against. The check reads the same evidence.json the
+    prompt-injection above uses, calls
+    tools.check_analyst_verdict_against_probe, and if any violations
+    come back it returns a synthetic {status:'error', is_error:true}
+    result naming the offending variables so the orchestrator LLM
+    retries spawn_analyst instead of forwarding a
+    probe-contradicting verdict to the rewriter. Silent-skip whenever
+    tolerance is None, evidence.json is absent/unreadable, or no
+    variable trips the check. Kept optional (None) for the same
+    reason kernel_stem is: unit tests that call _execute_tool in
+    isolation should not have to synthesize a tolerance.
     """
     if tool_name == "spawn_analyst":
         # Probe evidence injection: if a prior probe_compare call wrote
@@ -944,12 +1035,21 @@ def _execute_tool(
                 temperature=temperature,
             )
             aggregated, report = aggregate_analyst_verdicts(verdicts)
+            gate = _probe_consistency_gate(
+                aggregated, kernel_stem, tolerance
+            )
+            if gate is not None:
+                gate["aggregator_metadata"] = report
+                return gate
             return {
                 "status": "ok",
                 "result": aggregated,
                 "aggregator_metadata": report,
             }
         result = run_agent("analyst", analyst_task)
+        gate = _probe_consistency_gate(result, kernel_stem, tolerance)
+        if gate is not None:
+            return gate
         return {"status": "ok", "result": result}
     if tool_name == "spawn_rewriter":
         result = run_agent("rewriter", tool_input["task_prompt"])
@@ -1300,9 +1400,9 @@ def _execute_tool(
 def _format_tolerance_block(tolerance: dict) -> str:
     """Render the tolerance block embedded in the initial user message.
 
-    `tolerance` is a dict with keys {kind, value, source}. It is always
-    present: the CLI requires --sig-figs or --decimal-digits and rejects
-    a run with neither, so run_orchestrator never receives None here.
+    `tolerance` is a dict with keys {kind, value, source}. The CLI
+    requires the operator to pass either --sig-figs or --decimal-digits,
+    so a well-formed tolerance is always available here.
     """
     return (
         "OUTPUT-PRECISION TOLERANCE (user-supplied):\n"
@@ -1599,7 +1699,6 @@ class _FinishGateState:
 def run_orchestrator(
     kernel_path: str,
     kernel_source: str,
-    *,
     tolerance: dict,
     kernel_name: str | None = None,
     max_turns: int = MAX_TURNS,
@@ -1609,11 +1708,12 @@ def run_orchestrator(
 ) -> dict | None:
     """Run the orchestrator loop.
 
-    `tolerance` is a dict {kind, value, source} where kind is one of
-    'sig_figs' or 'decimal_digits', value is a small positive integer,
-    and source is 'user_cli'. It is required — the CLI enforces that
-    the operator passes --sig-figs or --decimal-digits and rejects a
-    run with neither, and there is no in-workflow fallback.
+    `tolerance` is a required dict {kind, value, source} where kind is
+    one of 'sig_figs' or 'decimal_digits', value is a small positive
+    integer, and source is currently always 'user_cli'. The CLI
+    (workflow/run.py) requires the operator to pass either --sig-figs
+    or --decimal-digits, so callers always have a real tolerance to
+    forward here.
 
     `kernel_name` is an optional explicit name of the kernel function
     inside `kernel_source` for the baseline_harness agent to target.
@@ -1674,7 +1774,10 @@ def run_orchestrator(
     profile = detect_language(kernel_path, kernel_source)
     tolerance_block = _format_tolerance_block(tolerance)
     baseline_block = _format_baseline_block(
-        kernel_path, kernel_name, profile, run_probe=run_probe,
+        kernel_path,
+        kernel_name,
+        profile,
+        run_probe=run_probe,
         test_config=test_config,
     )
     user_message = (
@@ -1807,6 +1910,7 @@ def run_orchestrator(
                 dict(tu.input),
                 profile,
                 kernel_stem=Path(kernel_path).stem,
+                tolerance=tolerance,
             )
             gate.observe(tu.name, exec_result)
             _append_trace(

@@ -233,6 +233,182 @@ def test_execute_tool_spawn_analyst_k_gt_one_default_temperature(monkeypatch):
     assert captured["temperature"] == 0.7
 
 
+# ---------- _execute_tool: post-analyst probe-consistency gate ----------
+
+
+def _write_evidence(tmp_path, stem, cell_stats):
+    """Helper: drop a probe evidence.json at baselines/<stem>/probe/ under tmp_path.
+
+    cell_stats is {(precision, seed): {output_name: {stat_key: value}}}; every
+    listed cell is written with status='ok'. Returns nothing; the caller
+    monkeypatch.chdir(tmp_path)s beforehand so the orchestrator resolves the
+    relative baselines/... path here.
+    """
+    probe_dir = tmp_path / "baselines" / stem / "probe"
+    probe_dir.mkdir(parents=True, exist_ok=True)
+    precisions = sorted({p for p, _ in cell_stats})
+    seeds = sorted({s for _, s in cell_stats})
+    cells = {}
+    for (prec, seed), stats in cell_stats.items():
+        cells[f"{prec}_seed{seed}"] = {"status": "ok", "stats": stats}
+    (probe_dir / "evidence.json").write_text(json.dumps({
+        "kernel_stem": stem,
+        "precisions": precisions,
+        "seeds": seeds,
+        "cells": cells,
+    }))
+
+
+def _downcast_verdict(names, target):
+    """Helper: an analyst verdict that downcasts every name in `names` to `target`."""
+    return {
+        "variables": [
+            {
+                "name": n,
+                "action": "downcast",
+                "target_precision": target,
+                "emulation_type": "",
+                "reason": "test",
+            }
+            for n in names
+        ],
+        "rework": {
+            "suggested": False,
+            "transformation": "",
+            "rationale": "",
+            "affected_variables": [],
+        },
+        "precision_budget": {
+            "target_kind": "sig_figs",
+            "target_value": 6,
+            "source": "user_cli",
+            "claimed_output_precision": "~7 sf",
+            "headroom_argument": "ok",
+        },
+        "overall_notes": "test",
+    }
+
+
+def test_execute_tool_spawn_analyst_probe_consistency_gate_flags_violation(
+    monkeypatch, tmp_path
+):
+    """When the analyst's verdict positively contradicts the probe evidence (downcast to float, but float_seed42 cell shows worst-output max_absrel well above the sig_figs tolerance), _execute_tool returns a synthetic {status:'error', is_error:True} tool_result naming the offending variables and citing the concrete probe number, so the orchestrator LLM retries spawn_analyst instead of forwarding the bad verdict to the rewriter. Mirrors the finish-gate's synthetic-error idiom."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("AGENT_PRECISION_ANALYST_K", raising=False)
+    _write_evidence(tmp_path, "kern", {
+        # float cell: worst-output max_absrel 3.4e-4 blows sig_figs=6 (~1e-6)
+        ("float", 42): {"vy": {"max_absrel": 3.4e-4, "max_abserror": 1.0}},
+        # quad ground-truth cell must be present (helper stays minimal)
+        ("quad", 42): {"vy": {"max_absrel": 0.0, "max_abserror": 0.0}},
+    })
+    monkeypatch.setattr(
+        orchestrator,
+        "run_agent",
+        lambda t, task: _downcast_verdict(["vx", "vy"], "float"),
+    )
+
+    result = _execute_tool(
+        "spawn_analyst",
+        {"kernel_source": "SRC"},
+        KOKKOS_PROFILE,
+        kernel_stem="kern",
+        tolerance={"kind": "sig_figs", "value": 6, "source": "user_cli"},
+    )
+
+    assert result["status"] == "error"
+    assert result["is_error"] is True
+    assert "probe_consistency_violations" in result
+    violations = result["probe_consistency_violations"]
+    # Every downcast variable in the verdict should be flagged (cell-level
+    # signal: worst-output in the target cell exceeds tolerance, so every
+    # variable pointed at that cell is suspect).
+    assert len(violations) == 2
+    joined = " ".join(violations)
+    assert "vx" in joined and "vy" in joined
+    # The concrete probe number must appear in the error so the LLM has
+    # something to reason about on retry, not just "probe disagreed".
+    assert "3.4" in joined or "3.400e-04" in joined or "float_seed42" in joined
+    # stderr carries the same info in human-readable form for the trace.
+    assert "spawn_analyst" in result["stderr"]
+
+
+def test_execute_tool_spawn_analyst_probe_consistency_gate_silent_when_no_evidence(
+    monkeypatch, tmp_path
+):
+    """When baselines/<stem>/probe/evidence.json does not exist (probe disabled, or never ran, or --no-probe), the gate is a silent no-op: the analyst's verdict is returned unchanged even if it would otherwise be probe-inconsistent. Same skip policy the prompt-injection path already uses — the gate cannot manufacture evidence."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("AGENT_PRECISION_ANALYST_K", raising=False)
+    # Deliberately do NOT write evidence.json.
+    verdict = _downcast_verdict(["vx"], "float")
+    monkeypatch.setattr(orchestrator, "run_agent", lambda t, task: verdict)
+
+    result = _execute_tool(
+        "spawn_analyst",
+        {"kernel_source": "SRC"},
+        KOKKOS_PROFILE,
+        kernel_stem="kern",
+        tolerance={"kind": "sig_figs", "value": 6, "source": "user_cli"},
+    )
+
+    assert result == {"status": "ok", "result": verdict}
+
+
+def test_execute_tool_spawn_analyst_probe_consistency_gate_silent_when_tolerance_none(
+    monkeypatch, tmp_path
+):
+    """When tolerance is None (run started without --sig-figs/--decimal-digits and either the advisor path is in flight or the caller is a unit test), the gate has no threshold to compare against and is a silent no-op. This preserves the invariant that _execute_tool called in isolation (as most unit tests do) never fails on probe-consistency."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("AGENT_PRECISION_ANALYST_K", raising=False)
+    # Evidence exists AND would trip the check under a strict tolerance.
+    _write_evidence(tmp_path, "kern", {
+        ("float", 42): {"vy": {"max_absrel": 3.4e-4, "max_abserror": 1.0}},
+        ("quad", 42): {"vy": {"max_absrel": 0.0, "max_abserror": 0.0}},
+    })
+    verdict = _downcast_verdict(["vx"], "float")
+    monkeypatch.setattr(orchestrator, "run_agent", lambda t, task: verdict)
+
+    result = _execute_tool(
+        "spawn_analyst",
+        {"kernel_source": "SRC"},
+        KOKKOS_PROFILE,
+        kernel_stem="kern",
+        tolerance=None,
+    )
+
+    assert result == {"status": "ok", "result": verdict}
+
+
+def test_execute_tool_spawn_analyst_probe_consistency_gate_ensemble_preserves_aggregator_metadata(
+    monkeypatch, tmp_path
+):
+    """When K>1 and the AGGREGATED verdict trips the gate, the returned synthetic error still carries the aggregator_metadata under its usual key so the disagreement report reaches the trace even on a rejected ensemble result. The trace is the primary post-hoc debug artifact for ensemble runs; losing aggregator_metadata on rejection would blind us to whether the K analysts disagreed on the probe-inconsistent variables."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("AGENT_PRECISION_ANALYST_K", "3")
+    _write_evidence(tmp_path, "kern", {
+        ("float", 42): {"vy": {"max_absrel": 3.4e-4, "max_abserror": 1.0}},
+        ("quad", 42): {"vy": {"max_absrel": 0.0, "max_abserror": 0.0}},
+    })
+    verdict = _downcast_verdict(["vx"], "float")
+    monkeypatch.setattr(
+        orchestrator,
+        "run_agent_ensemble",
+        lambda type_, task, k, temperature: [verdict, verdict, verdict],
+    )
+
+    result = _execute_tool(
+        "spawn_analyst",
+        {"kernel_source": "SRC"},
+        KOKKOS_PROFILE,
+        kernel_stem="kern",
+        tolerance={"kind": "sig_figs", "value": 6, "source": "user_cli"},
+    )
+
+    assert result["status"] == "error"
+    assert result["is_error"] is True
+    assert "aggregator_metadata" in result
+    assert result["aggregator_metadata"]["k"] == 3
+
+
 def test_execute_tool_dispatches_spawn_rewriter(monkeypatch):
     """_execute_tool routes spawn_rewriter to run_agent('rewriter', task_prompt) and wraps the result."""
     calls = []
@@ -672,7 +848,7 @@ def test_orchestrator_prompt_names_all_three_methods_and_rework():
 
 
 def test_orchestrator_prompt_names_tolerance_kinds():
-    """The orchestrator prompt names sig_figs, decimal_digits, and precision_budget so the LLM knows how to thread the operator-supplied tolerance into downstream task prompts."""
+    """The orchestrator prompt names sig_figs, decimal_digits, and precision_budget so the LLM knows the tolerance vocabulary and how to thread it into downstream task prompts."""
     for token in (
         "sig_figs",
         "decimal_digits",
@@ -699,8 +875,8 @@ def test_orchestrator_prompt_forbids_finish_without_accept():
 # ---------- _format_tolerance_block ----------
 
 
-def test_format_tolerance_block_user_cli_renders_verbatim():
-    """With a user-supplied tolerance, the rendered block contains the kind/value/source verbatim."""
+def test_format_tolerance_block_renders_user_cli_verbatim():
+    """The rendered block contains the kind/value/source verbatim so the orchestrator LLM can thread the tolerance into downstream task prompts."""
     block = _format_tolerance_block(
         {"kind": "sig_figs", "value": 7, "source": "user_cli"}
     )
@@ -1420,9 +1596,7 @@ def test_run_orchestrator_cpp_kernel_invites_baseline_in_first_user_message(
     _scripted_input(monkeypatch, [])
 
     run_orchestrator(
-        "path/to/nbody_force.cpp",
-        "src",
-        tolerance=_DEFAULT_TEST_TOLERANCE,
+        "path/to/nbody_force.cpp", "src", tolerance=_DEFAULT_TEST_TOLERANCE
     )
 
     first_user = fake.messages.calls[0]["messages"][0]["content"]
@@ -1448,8 +1622,8 @@ def test_run_orchestrator_cpp_with_kernel_name_includes_target_kernel_line(
     run_orchestrator(
         "path/to/vector_add.cpp",
         "src",
-        kernel_name="vector_add",
         tolerance=_DEFAULT_TEST_TOLERANCE,
+        kernel_name="vector_add",
     )
 
     first_user = fake.messages.calls[0]["messages"][0]["content"]
@@ -1510,9 +1684,7 @@ def test_run_orchestrator_cu_kernel_invites_baseline_in_first_user_message(
     _scripted_input(monkeypatch, [])
 
     run_orchestrator(
-        "path/to/vector_add.cu",
-        "src",
-        tolerance=_DEFAULT_TEST_TOLERANCE,
+        "path/to/vector_add.cu", "src", tolerance=_DEFAULT_TEST_TOLERANCE
     )
 
     first_user = fake.messages.calls[0]["messages"][0]["content"]

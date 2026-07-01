@@ -43,13 +43,14 @@ vocabulary and plumbing".
 
 What works today:
 
-- Core pipeline `(precision_advisor →)? analyst → rewriter → verifier`. `finish` is gated in **code** (not just in the system prompt) on the most recent `spawn_verifier` returning `verdict='accept'`; on a Kokkos `.cpp` input, `finish` additionally requires the most recent `compare_outputs` to have returned `status='ok'` for the current rewrite cycle. A premature `finish` is turned into a synthetic `{status:'error', is_error:true}` tool result naming what's missing, so the orchestrator can self-correct without exiting.
+- Core pipeline `analyst → rewriter → verifier`. `finish` is gated in **code** (not just in the system prompt) on the most recent `spawn_verifier` returning `verdict='accept'`; on a Kokkos `.cpp` input, `finish` additionally requires the most recent `compare_outputs` to have returned `status='ok'` for the current rewrite cycle. A premature `finish` is turned into a synthetic `{status:'error', is_error:true}` tool result naming what's missing, so the orchestrator can self-correct without exiting.
 - Dynamic verification chain (any profile whose `LanguageProfile.dynamic_verification` is `True` — currently all five): **harness → compile → run → splice → compile_rewritten → run_rewritten → compare_outputs**, ending in a tolerance check that gates `finish`. The five LLM agents are reused as-is; the six deterministic (non-LLM) tools in `workflow/tools.py` (`compile_baseline_driver`, `run_baseline_driver`, `splice_rewritten_kernel`, `compile_rewritten_driver`, `run_rewritten_driver`, `compare_outputs`) all return the uniform `{status, stdout, stderr, artifacts}` shape. `baseline_harness` writes `baselines/<kernel_stem>/<driver_filename>` (`.cpp` for Kokkos/SYCL/OpenMP-offload, `.cu` for CUDA, `.hip` for HIP); the baseline compile/run trio produces `baselines/<kernel_stem>/{driver, reference.json}`; the rewritten chain (splice → compile_rewritten → run_rewritten) produces `baselines/<kernel_stem>/rewritten/{driver.<ext>, driver, reference.json}` from the rewriter's output without ever touching the baseline tree; `compare_outputs` diffs the two `reference.json` files under the same `tolerance_json` that was passed to `spawn_verifier` and writes `baselines/<kernel_stem>/rewritten/comparison.json` on both pass and fail paths. Kokkos is smoke-validated end-to-end; CUDA is smoke-validated through the comparator step (on `vector_add.cu --sig-figs 6 --auto`); HIP, SYCL, and OpenMP-offload ship unit-tested only — no host with the respective toolchain (`hipcc`, `icpx`/`clang++ -fsycl`, `clang++ -fopenmp -fopenmp-targets=...`) was available at implementation time.
 - Probe pipeline (any profile whose `LanguageProfile.probe_precisions` is non-empty — currently Kokkos only): a pre-analyst empirical sweep that runs the kernel under 4 precisions (`quad`, `double`, `float`, `mixed_io`) × 2 RNG seeds (`{42, 43}`) and feeds the per-output statistics into the analyst's task as a descriptive evidence block (no verdict hints — see `_format_probe_evidence_for_analyst` in `orchestrator.py`). Two new deterministic tools in `workflow/tools.py` — `probe_step` (fused compile+run per cell; 8 calls per Kokkos kernel) and `probe_compare` (aggregates the 8 references against `quad_seed42` ground truth) — both return the same `{status, stdout, stderr, artifacts}` shape as the dynamic-verification tools and write under `baselines/<kernel_stem>/probe/`. Probe failures are non-fatal: only a missing `quad_seed42` cell hard-errors; every other per-cell error is reported by `probe_compare` and the analyst still runs. Opt out with `--no-probe`; CUDA / HIP / SYCL / OMP-offload silently skip the probe regardless. See `AGENTS.md` ("Probe pipeline") for the contract.
-- Tolerance from `--sig-figs` / `--decimal-digits`, else inferred by the advisor; advisor may return `kind='unknown'`, which triggers fallback `{sig_figs: 6, source: 'advisor_unknown_defaulted'}`.
+- Tolerance from `--sig-figs` / `--decimal-digits` — exactly one is REQUIRED (argparse rejects a run with neither, exit code 2). The prior optional-flag contract paired with a `precision_advisor` LLM was removed to eliminate silent per-kernel tolerance drift; the dict flowing through the pipeline is now always `{kind, value, source:'user_cli'}`.
 - Tolerance threaded verbatim to analyst, rewriter, and verifier; analyst returns a `precision_budget` block; verifier audits it.
 - Per-variable methods: `downcast` (narrower hardware type — the throughput win), `emulate` (software pair, currently inline float-float / Dekker — throughput-NEGATIVE; only when downcast violates tolerance), or `keep`. Analyst can additionally suggest a kernel-shape `rework` such as Kahan summation.
 - HITL pause before every agent call (`y` / `n` / `q`); rejection feeds `{"status": "rejected_by_user"}` back so the orchestrator can self-correct. `--auto` skips the pause for batch runs and writes a JSONL trace of every executed tool to `baselines/<kernel_stem>/orchestrator_trace.jsonl`.
+- Optional **pinned test inputs** via a sibling `<kernel_file>.testconfig.json` file (freeform JSON object; auto-loaded by `workflow/run.py`, threaded verbatim into the baseline_harness's task as a `TEST CONFIG (JSON):` block). Motivated by consistency sweeps where the harness picked wildly different N / RNG-seed / scalar-parameter combinations across attempts; a malformed or non-object config is a hard CLI error so the operator can't silently drift back to "harness invents inputs". Only the Kokkos harness prompt currently consumes the block in v0. See "Run" for usage.
 - Optional **analyst self-consistency ensemble**: opt-in via `AGENT_PRECISION_ANALYST_K > 1` (with diversity temperature `AGENT_PRECISION_ANALYST_T`, default `0.7`). Runs the analyst K times in parallel and folds the verdicts through `workflow/aggregator.py` — per-variable plurality with `keep > emulate > downcast` conservative tiebreak, strict-majority rework vote, budget+notes from the most-aligned verdict. Default `K=1` preserves the existing single-shot behavior.
 - Optional **verifier perspective-diverse panel**: opt-in via `AGENT_PRECISION_VERIFIER_K > 1` (with `AGENT_PRECISION_VERIFIER_T`, default `0.7`). Runs the verifier K times in parallel under K distinct lenses (faithfulness → budget → edge_cases; defined in `workflow/verifier_panel.py:VERIFIER_LENSES`) and folds the results through `aggregate_verifier_verdicts` — strict-accept (any dissent flips to reject), per-variable owned by the faithfulness lens, concerns unioned and prefixed with `[<lens>]` for richer rewriter-retry feedback. `K` is capped at the number of defined lenses.
 - Registry-driven agent definitions: one entry in `workflow/registry.py` per agent type; the generic runner is untouched.
@@ -72,8 +73,10 @@ pip install -r requirements.txt
 Stdout in every mode is the orchestrator's reasoning, then a HITL prompt
 for each proposed tool call, then the final rewritten kernel and notes.
 
-**Tolerance flags (optional, mutually exclusive).** Both Argo wrapper
-scripts forward all extra arguments to `python -m workflow.run`.
+**Tolerance flags (REQUIRED, mutually exclusive).** Exactly one of
+`--sig-figs` / `--decimal-digits` must be given; running with neither
+is an argparse error (exit 2). Both Argo wrapper scripts forward all
+extra arguments to `python -m workflow.run`.
 
 ```text
 --sig-figs N         relative tolerance: ~N significant figures of agreement
@@ -81,10 +84,6 @@ scripts forward all extra arguments to `python -m workflow.run`.
 --auto               skip the HITL pause; write JSONL trace to
                      baselines/<kernel_stem>/orchestrator_trace.jsonl
 ```
-
-If neither tolerance flag is given, the orchestrator calls the
-`precision_advisor` agent to infer one from the kernel source (see
-"Status" for the `kind='unknown'` fallback).
 
 **Optional ensemble env vars** (default behavior is unchanged when unset):
 
@@ -94,6 +93,29 @@ AGENT_PRECISION_ANALYST_T=F    sampling temperature for the analyst ensemble (de
 AGENT_PRECISION_VERIFIER_K=N   run verifier under N distinct lenses (N <= 3)
 AGENT_PRECISION_VERIFIER_T=F   sampling temperature for the verifier panel (default 0.7)
 ```
+
+**Pinning baseline harness inputs** (`<kernel>.testconfig.json`
+side-channel). By default the baseline_harness agent invents the
+kernel's test inputs — N, RNG seed, scalar parameters, per-array
+distributions / ranges — and inconsistent choices across runs make
+probe evidence and comparator results non-comparable. To pin them,
+drop a `<kernel_file>.testconfig.json` file next to the kernel
+source; `workflow/run.py` auto-loads it and threads the parsed JSON
+into the initial user message as a `TEST CONFIG (JSON):` block that
+the Kokkos harness prompt reads verbatim. No CLI flag governs this
+— the presence of the sibling file is the opt-in. The schema is
+freeform JSON (the harness prompt describes conventional keys per
+kernel) but the top-level value MUST be a JSON object; a list,
+scalar, or malformed JSON is a hard CLI error rather than a silent
+fallback, so the operator can't silently drift into "harness
+invents inputs" territory. Example:
+`test-kernels/kokkos/mixed/nbody_force.cpp.testconfig.json` pins
+`N=1024, seed=42, eps=0.05, dt=0.01` plus uniform position /
+velocity / mass ranges. Only the Kokkos harness prompt documents
+key semantics in v0 — the four other v0 profiles will still receive
+the block if a config file is present, but their harnesses have no
+contract for consuming it, so do not drop `.testconfig.json` files
+next to non-Kokkos kernels yet.
 
 **Direct (Anthropic API).** `.env` is not auto-loaded.
 
@@ -121,111 +143,109 @@ Argo paths exist).
 
 ## Workflow
 
-Intended happy path through the conversation for a Kokkos `.cpp` input
-when no tolerance flag is passed (so the advisor is called once up
-front, and the full dynamic-verification chain runs). The same shape
-applies to CUDA, HIP, SYCL, and OpenMP-offload — only the driver file
-extension (`.cu` / `.hip` / `.cpp`) and the compiler invoked by the
-deterministic tools change; the orchestrator loop, finish-gate, and
-HITL contract are language-agnostic. For the corresponding high-level
-flowchart (HITL branches, tool dispatch, finish-gate), see
-`flowchart.md`.
+Intended happy path through the orchestrator for a Kokkos `.cpp`
+input when no tolerance flag is passed (so the advisor is called once
+up front, and the full dynamic-verification + probe chain runs). The
+same shape applies to CUDA, HIP, SYCL, and OpenMP-offload — only
+steps 5–6 (`probe_step ×8` and `probe_compare`) are skipped on
+profiles with empty `probe_precisions` (currently all non-Kokkos
+profiles), shortening the chain to 12 steps; the
+`spawn_baseline_harness_<id>` agent variant, driver file extension
+(`.cu` / `.hip` / `.cpp`), and compiler invoked in steps 3 / 11 are
+the only other differences. The orchestrator loop, finish-gate, and
+HITL contract are language-agnostic. `flowchart.md` carries the same
+diagram plus prose notes on each deviation branch.
 
 ```mermaid
-sequenceDiagram
-  participant User
-  participant Orch as Orchestrator
-  participant Pa as PrecisionAdvisor
-  participant An as Analyst
-  participant Rw as Rewriter
-  participant Vf as Verifier
-  participant Bh as BaselineHarness
-  participant Det as DeterministicTools
-  User->>Orch: kernel source (no tolerance flag)
-  Orch->>User: HITL: spawn_precision_advisor(kernel_source)?
-  User->>Orch: y
-  Orch->>Pa: kernel_source
-  Pa-->>Orch: {kind, value, rationale, confidence}
-  Note over Orch: agreed tolerance fixed (or default if kind='unknown')
-  Orch->>User: HITL: spawn_baseline_harness(kernel_source, kernel_stem)?
-  User->>Orch: y
-  Orch->>Bh: kernel_source
-  Bh-->>Orch: {driver_source, ...} → baselines/<stem>/driver.cpp
-  Orch->>User: HITL: compile_baseline_driver(kernel_stem)?
-  User->>Orch: y
-  Orch->>Det: g++ baselines/<stem>/driver.cpp
-  Det-->>Orch: {status:'ok', artifacts:[baselines/<stem>/driver]}
-  Orch->>User: HITL: run_baseline_driver(kernel_stem)?
-  User->>Orch: y
-  Orch->>Det: ./driver (cwd=baselines/<stem>)
-  Det-->>Orch: {status:'ok', artifacts:[baselines/<stem>/reference.json]}
-  Note over Orch: Kokkos + no --no-probe: 8× probe_step then 1× probe_compare<br/>(skipped on non-Kokkos / --no-probe)
-  Orch->>User: HITL: probe_step(stem, precision, seed)? ×8
-  User->>Orch: y
-  Orch->>Det: compile+run probe/<precision>_seed<N>/driver
-  Det-->>Orch: {status:'ok', artifacts:[probe/<precision>_seed<N>/reference.json]}
-  Orch->>User: HITL: probe_compare(kernel_stem)?
-  User->>Orch: y
-  Orch->>Det: aggregate 8 references vs quad_seed42
-  Det-->>Orch: {status:'ok', artifacts:[baselines/<stem>/probe/evidence.json]}
-  Orch->>User: HITL: spawn_analyst(kernel_source + tolerance)?
-  User->>Orch: y
-  Orch->>An: kernel_source + tolerance block
-  An-->>Orch: verdict + rework + precision_budget
-  Orch->>User: HITL: spawn_rewriter(task_prompt)?
-  User->>Orch: y
-  Orch->>Rw: task_prompt (source + verdict + rework + tolerance)
-  Rw-->>Orch: rewritten_code
-  Orch->>User: HITL: spawn_verifier(original, rewritten, verdict, tolerance)?
-  User->>Orch: y
-  Orch->>Vf: original + rewritten + verdict_json + tolerance_json
-  Vf-->>Orch: {verdict: accept, per_variable, concerns}
-  Orch->>User: HITL: splice_rewritten_kernel(kernel_stem, rewritten_code)?
-  User->>Orch: y
-  Orch->>Det: replace text between sentinels in baselines/<stem>/driver.cpp
-  Det-->>Orch: {status:'ok', artifacts:[baselines/<stem>/rewritten/driver.cpp]}
-  Orch->>User: HITL: compile_rewritten_driver(kernel_stem)?
-  User->>Orch: y
-  Orch->>Det: g++ baselines/<stem>/rewritten/driver.cpp
-  Det-->>Orch: {status:'ok', artifacts:[baselines/<stem>/rewritten/driver]}
-  Orch->>User: HITL: run_rewritten_driver(kernel_stem)?
-  User->>Orch: y
-  Orch->>Det: ./driver (cwd=baselines/<stem>/rewritten)
-  Det-->>Orch: {status:'ok', artifacts:[baselines/<stem>/rewritten/reference.json]}
-  Orch->>User: HITL: compare_outputs(kernel_stem, tolerance_json)?
-  User->>Orch: y
-  Orch->>Det: diff baseline vs rewritten reference.json under tolerance
-  Det-->>Orch: {status:'ok', artifacts:[baselines/<stem>/rewritten/comparison.json]}
-  Orch->>User: HITL: finish(rewritten_code, notes)?
-  User->>Orch: y
-  Note over Orch: finish-gate: verifier accept ∧ compare ok ✓
-  Orch-->>User: final kernel
+flowchart TD
+  U["python -m workflow.run &lt;kernel&gt;<br/>[--sig-figs N | --decimal-digits N]<br/>[--auto] [--no-probe]"]
+  F(["print final kernel + notes"])
+
+  U ==> Orch
+
+  subgraph Orch ["Orchestrator (Claude conversation loop)<br/>routes every step · gates finish · MAX_TURNS=60"]
+    direction TB
+
+    S1["<b>1. spawn_baseline_harness_&lt;id&gt;</b><br/><i>id ∈ {kokkos, cuda, hip, sycl, omp_offload};<br/>Kokkos emits 4 drivers, others emit 1</i><br/>→ baselines/&lt;stem&gt;/driver.&lt;ext&gt;<br/>(+ probe/&lt;precision&gt;/driver.cpp ×4 on Kokkos)"]:::agent
+    S2["<b>2. compile_baseline_driver</b><br/>per-profile compiler + env vars<br/>(KOKKOS_ROOT / CUDA_ARCH / HIP_ARCH /<br/>SYCL_CXX / OMP_CXX / OMP_TARGET)<br/>→ baselines/&lt;stem&gt;/driver"]:::det
+    S3["<b>3. run_baseline_driver</b><br/>RUN_TIMEOUT_SEC (default 60)<br/>→ baselines/&lt;stem&gt;/reference.json"]:::det
+    S4["<b>4. probe_step ×8</b><br/><i>Kokkos only; 4 precisions × seeds {42, 43};<br/>fused compile+run per cell</i><br/>→ probe/&lt;precision&gt;_seed&lt;N&gt;/reference.json"]:::det
+    S5["<b>5. probe_compare</b><br/><i>Kokkos only; aggregates vs quad_seed42;<br/>then ORACLE PROMOTION:<br/>quad_seed42/reference.json →<br/>baselines/&lt;stem&gt;/reference.json</i><br/>→ probe/evidence.json<br/>(appended to next analyst task)"]:::det
+    S6["<b>6. spawn_analyst</b><br/><i>K-fold ensemble via AGENT_PRECISION_ANALYST_K;<br/>aggregator.aggregate_analyst_verdicts</i><br/>→ {variables, rework, precision_budget,<br/>overall_notes}"]:::agent
+    S7["<b>7. spawn_rewriter</b><br/>→ {rewritten_code, summary_of_changes}"]:::agent
+    S8["<b>8. spawn_verifier</b><br/><i>K-lens panel (faithfulness / budget / edge_cases)<br/>via AGENT_PRECISION_VERIFIER_K;<br/>STRICT accept (all lenses must accept)</i>"]:::agent
+    S9["<b>9. splice_rewritten_kernel</b><br/><i>text I/O: replace between<br/>KERNEL BEGIN / END sentinels</i><br/>→ baselines/&lt;stem&gt;/rewritten/driver.&lt;ext&gt;"]:::det
+    S10["<b>10. compile_rewritten_driver</b><br/>same per-profile compiler as step 2<br/>→ baselines/&lt;stem&gt;/rewritten/driver"]:::det
+    S11["<b>11. run_rewritten_driver</b><br/>→ baselines/&lt;stem&gt;/rewritten/reference.json"]:::det
+    S12["<b>12. compare_outputs</b><br/><i>baseline vs rewritten under tolerance_json;<br/>writes comparison.json on pass AND fail</i>"]:::det
+    S13["<b>13. finish</b><br/><i>code-side finish-gate</i>"]:::gate
+
+    S1 ==> S2;
+    S2 ==> S3;
+    S3 ==> S4;
+    S4 ==> S5;
+    S5 ==> S6;
+    S3 -. "non-Kokkos or --no-probe" .-> S6;
+    S6 ==> S7;
+    S7 ==> S8;
+    S8 == "accept" ==> S9;
+    S9 ==> S10;
+    S10 ==> S11;
+    S11 ==> S12;
+    S12 == "status=ok" ==> S13;
+
+    %% deviations from the happy path, as compact side-loops
+    S8 -. "reject" .-> S7;
+    S12 -. "status=error" .-> S6;
+    S1 -. "malformed payload" .-> S1;
+    S2 -. "compile error (non-fatal)" .-> S2;
+    S3 -. "run error (non-fatal)" .-> S3;
+  end
+
+  S13 == "verifier accept ∧ compare ok" ==> F
+  S13 -. "blocked: synthetic<br/>{status:error,<br/>is_error:true}<br/>tool_result" .-> S6
+
+  classDef agent fill:#dbeafe,stroke:#1e3a8a,stroke-width:1px,color:#0f172a
+  classDef det fill:#dcfce7,stroke:#14532d,stroke-width:1px,color:#0f172a
+  classDef gate fill:#fef3c7,stroke:#78350f,stroke-width:1px,color:#0f172a
 ```
 
-On `verdict='reject'`, the orchestrator either re-spawns the rewriter
-with a task prompt that incorporates the verifier's mismatches and
-concerns, or — if those concerns implicate the analyst's verdict itself
-— re-spawns the analyst. Either way, a fresh `spawn_verifier` must
+Legend: **blue** = LLM agent call (one entry per agent type in
+`workflow/registry.py`); **green** = deterministic non-LLM tool
+defined in `workflow/tools.py`; **yellow** = decision / gate. Solid
+thick arrows (`==>`) are the happy path; dotted thin arrows are the
+documented deviations (verifier reject, comparator mismatch, non-
+fatal compile / run errors on the baseline chain, and the finish-
+gate's synthetic-error retry).
+
+Every solid step in the diagram is preceded by a HITL `y/n/q` pause
+in interactive mode; `--auto` skips that pause and journals each
+executed tool to `baselines/<kernel_stem>/orchestrator_trace.jsonl`
+instead. On `verdict='reject'` at step 8, the orchestrator re-spawns
+the rewriter with the verifier's `concerns` folded into a new task
+prompt, or — if those concerns implicate the analyst's verdict itself
+— re-spawns the analyst; either way, a fresh `spawn_verifier` must
 return `accept` before `finish` is allowed. On a `compare_outputs`
-error, the orchestrator is steered (by both the system prompt and the
-synthetic gate-violation tool result) toward `spawn_analyst` rather
-than `spawn_rewriter`, because a numerical mismatch usually indicates
-the verifier's verdict was wrong rather than just the implementation.
+error at step 12, the orchestrator is steered (by both the system
+prompt and the synthetic gate-violation tool result) toward
+`spawn_analyst` rather than `spawn_rewriter`, because a numerical
+mismatch usually indicates the verifier's verdict was wrong rather
+than just the implementation. See `flowchart.md` for the full prose
+on each deviation branch.
 
 ## Agents
 
 | Agent                | Model             | Input                                                                                       | Output (schema keys)                                                                                                                                                                                                                                            | Defined in                 |
 | -------------------- | ----------------- | ------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------- |
-| `precision_advisor`  | `claude-opus-4-7` | kernel source only                                                                          | `kind` (`sig_figs`/`decimal_digits`/`unknown`), `value`, `rationale`, `confidence` (`high`/`medium`/`low`), `alternative`                                                                                                                                       | `workflow/registry.py`     |
 | `analyst`            | `claude-opus-4-7` | kernel source + tolerance block (`target_kind`, `target_value`, `source`)                   | `variables[{name, action, target_precision, emulation_type, reason}]`, `rework{suggested, transformation, rationale, affected_variables}`, `precision_budget{target_kind, target_value, source, claimed_output_precision, headroom_argument}`, `overall_notes` | `workflow/registry.py`     |
 | `rewriter`           | `claude-opus-4-7` | `task_prompt` (source + verdict + any rework + tolerance, composed by orch.)                | `rewritten_code`, `summary_of_changes`                                                                                                                                                                                                                          | `workflow/registry.py`     |
 | `verifier`           | `claude-opus-4-7` | original source, rewritten source, analyst verdict (JSON string), tolerance (JSON string)   | `verdict` (`accept`/`reject`), `per_variable[{name, expected_action, observed_action, ok}]`, `concerns`                                                                                                                                                         | `workflow/registry.py`     |
 | `baseline_harness_<id>` | `claude-opus-4-7` | original kernel source (one harness agent per language profile; orchestrator dispatches by `LanguageProfile.id` resolved from the file suffix and source content) | `driver_source`, `kernel_function_name`, `inputs_summary`, `output_arrays` | `workflow/registry.py` (auto-registered from `workflow/languages/PROFILES`) |
-| `orchestrator`       | `claude-opus-4-7` | kernel path + source + optional tolerance (from CLI) + optional `kernel_name`               | one `finish(rewritten_code, notes)` call                                                                                                                                                                                                                        | `workflow/orchestrator.py` |
+| `orchestrator`       | `claude-opus-4-7` | kernel path + source + tolerance (from CLI, required) + optional `kernel_name`              | one `finish(rewritten_code, notes)` call                                                                                                                                                                                                                        | `workflow/orchestrator.py` |
 
 The analyst receives the kernel source only — no file path, no orchestrator
 hints — so that ground-truth labels encoded in directory names cannot leak
-into the verdict. The same holds for the precision_advisor.
+into the verdict.
 
 The analyst is told the tolerance is a hard constraint, and that
 `emulate` is throughput-negative and only justified when `downcast` would
@@ -284,7 +304,6 @@ profile contracts (precision aliases, env vars, language probes).
 
 | Tool                       | Purpose                       | Input                                                                                                                          | Returns to orchestrator                                                  |
 | -------------------------- | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------ |
-| `spawn_precision_advisor`  | dispatch to precision_advisor | `kernel_source: string`                                                                                                        | advisor's structured output, or `{"status":"rejected_by_user"}`          |
 | `spawn_analyst`            | dispatch to analyst           | `kernel_source: string` (must contain a labeled tolerance block: `target_kind`, `target_value`, `source`)                      | analyst's structured output, or `{"status":"rejected_by_user"}`          |
 | `spawn_rewriter`           | dispatch to rewriter          | `task_prompt: string`                                                                                                          | rewriter's structured output, or `{"status":"rejected_by_user"}`         |
 | `spawn_verifier`           | dispatch to verifier          | `original_source: string`, `rewritten_source: string`, `analyst_verdict_json: string`, `tolerance_json: string`                | verifier's structured output, or `{"status":"rejected_by_user"}`         |
@@ -299,9 +318,8 @@ profile contracts (precision aliases, env vars, language probes).
 | `probe_compare`            | aggregate the 8 probe references into `evidence.json` for the next `spawn_analyst` (deterministic, non-LLM; no subprocess; Kokkos only in v0; not finish-gating) | `kernel_stem: string`; one call per Kokkos run; only after all 8 `probe_step` calls; `language_id` is injected by `_execute_tool`, never passed by the LLM | `{status, stdout, stderr, artifacts}` (artifacts = `[baselines/<stem>/probe/evidence.json]`; only a missing `quad_seed42` cell hard-errors — every other per-cell problem is reported per-entry in `evidence.json`), or `{"status":"rejected_by_user"}` |
 | `finish`                   | end the workflow              | `rewritten_code`, `notes`                                                                                                      | (terminates; nothing fed back) — but the orchestrator's `_FinishGateState` blocks the call (with a synthetic `is_error` tool result) until the gate is satisfied: verifier `verdict='accept'`, plus `compare_outputs status='ok'` for any profile with `dynamic_verification=True` (currently all five) |
 
-The orchestrator's system prompt enforces that `spawn_precision_advisor`
-is called at most once, only when the CLI passed no tolerance, and only
-before `spawn_analyst`; that exactly one `spawn_baseline_harness_<id>`
+The orchestrator's system prompt enforces that exactly one
+`spawn_baseline_harness_<id>`
 tool exists per run (the one matching the resolved
 `LanguageProfile.id`) and is called at most once; that the
 seven-step deterministic chain — `compile_baseline_driver` →
@@ -378,13 +396,19 @@ exiting.
   - `run.py` — CLI entrypoint
     (`python -m workflow.run <kernel_file> [--sig-figs N | --decimal-digits N] [--auto]`).
     Normalizes tolerance flags into `{kind, value, source='user_cli'}`
-    or `None`, then hands off to the orchestrator.
+    or `None`, and auto-loads a sibling `<kernel_file>.testconfig.json`
+    (if present) via `_load_test_config`, threading the parsed dict
+    to the orchestrator as the `test_config` kwarg. Then hands off to
+    the orchestrator.
 - `test-kernels/` — 17 kernels under
   `{cuda,kokkos}/{lowerable,needs_precision,mixed}/`. Directory name is
   the ground-truth label and is **never** fed into agent prompts. Per-
   variable expected verdicts and test tolerances live in
   `test-kernels/SUMMARY.md` and are used for evaluating orchestrator
-  output, not as input to it.
+  output, not as input to it. A kernel may also carry a sibling
+  `<kernel>.testconfig.json` (freeform JSON object) that pins the
+  baseline_harness's test inputs (N, RNG seed, scalar parameters,
+  per-array ranges); see "Run" for the contract.
 - `baselines/` — generated per-kernel artifacts from the dynamic-verification
   chain. Baseline tree:
   `baselines/<kernel_stem>/{driver.cpp, driver, reference.json}` (from
@@ -410,8 +434,10 @@ exiting.
   and is gitignored. See `AGENTS.md` ("Conventions") for the run / report
   / score module split.
 - `scripts/` — Argo backend wrappers (`run-argoproxy.sh`, `run-argo.sh`).
-- `flowchart.md` — high-level orchestrator flowchart (HITL branches,
-  tool dispatch); a companion to the sequence diagram above.
+- `flowchart.md` — same orchestrator flowchart as the "Workflow"
+  section above, with additional prose on each deviation branch
+  (verifier reject, comparator mismatch, non-fatal compile/run
+  errors, finish-gate retry).
 - `AGENTS.md` — instructions for coding agents working on this repo.
   Contains the gotchas you need before changing anything.
 - `opencode.json` — opencode configuration. Unrelated to the workflow
@@ -424,14 +450,16 @@ judgment, not a numerical one. CLI flags make it explicit and the
 orchestrator threads it through every downstream agent verbatim, so the
 target never silently drifts.
 
-**Why a separate precision_advisor agent.** When the user gives no
-tolerance, a single LLM call that *only* infers one is cleaner than
-folding that inference into the analyst's per-variable verdict. The
-advisor is allowed to return `kind='unknown'`; the orchestrator then
-falls back to a documented default (`{sig_figs: 6,
-source: 'advisor_unknown_defaulted'}`) rather than acting on a
-confident-sounding guess. Fallback rule lives in the orchestrator's
-system prompt, not in Python.
+**Why the tolerance is CLI-only.** An earlier version of this workflow
+accepted no tolerance flag and asked a dedicated `precision_advisor`
+LLM to infer one from the kernel source (with a documented `sig_figs=6`
+fallback when the advisor returned `kind='unknown'`). That agent was
+removed: batch runs and consistency sweeps depended on the numerical
+target being the same across attempts, and a per-kernel LLM inference
+was a whole class of "silent tolerance drift" surprises. The tolerance
+now comes from `--sig-figs` / `--decimal-digits` (one is required;
+argparse rejects a run with neither), and the dict threaded through the
+pipeline is always `{kind, value, source: 'user_cli'}`.
 
 **Why a separate analyst agent (vs a smarter rewriter).** Keeps the
 rewriter mechanical, makes the HITL pause informative (structured
