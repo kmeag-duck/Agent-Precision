@@ -7,7 +7,7 @@ Scope (deliberately limited):
     accepted the rewrite in the same rewrite cycle.
 
 Out of scope for this layer (see AGENTS.md "Planned next steps"):
-  - Per-stage scoring of verifier, rewriter, or precision_advisor.
+  - Per-stage scoring of verifier or rewriter.
   - Rewriter code-quality judgments beyond the comparator's verdict.
   - Closing the loop back into the workflow (strictly read-only).
 """

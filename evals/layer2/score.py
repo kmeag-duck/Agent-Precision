@@ -28,7 +28,6 @@ from .expected import ExpectedKernel
 # typo in a trace (or a workflow version drift) surfaces as an
 # unknown-tool warning rather than silently being ignored.
 _KNOWN_TOOLS = frozenset({
-    "spawn_precision_advisor",
     "spawn_analyst",
     "spawn_rewriter",
     "spawn_verifier",
