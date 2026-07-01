@@ -56,17 +56,6 @@ ORCHESTRATOR_MODEL = "claude-opus-4-7"
 # splice -> compile -> run -> compare).
 MAX_TURNS = 60
 
-# Fallback tolerance applied when the user did not pass --sig-figs or
-# --decimal-digits AND the precision_advisor returned kind='unknown'. 6
-# sig figs is the conventional working precision of single-precision
-# scientific computation and is what most kernels coded in double are
-# actually using in practice.
-DEFAULT_TOLERANCE_ON_ADVISOR_UNKNOWN = {
-    "kind": "sig_figs",
-    "value": 6,
-    "source": "advisor_unknown_defaulted",
-}
-
 ORCHESTRATOR_SYSTEM_PROMPT = """You are the orchestrator of a small
 workflow whose goal is to rewrite a numerical kernel to reduce precision
 cost where safe (typically double -> float, or a software-emulated wider
@@ -83,22 +72,14 @@ float-float etc.); a kernel can satisfy a 6-sig-fig tolerance with a
 mix of storage precisions internally.
 
 You are a router and guardrail, not a numerics expert. Do not decide
-per-variable precision yourself — that is the analyst's job. Do not
-decide the output-precision tolerance yourself — that is the user's job,
-or, when the user did not specify one, the precision_advisor's job.
-Your job is to call the right agent at the right time, thread the
-tolerance and verdicts through their task prompts faithfully, and
-assemble their outputs.
+per-variable precision yourself — that is the analyst's job. The
+output-precision tolerance is fixed by the user on the command line
+and provided to you verbatim in the initial user message; you do not
+decide it and you cannot change it. Your job is to call the right
+agent at the right time, thread the tolerance and verdicts through
+their task prompts faithfully, and assemble their outputs.
 
-You have access to five specialist agents:
-  - precision_advisor: called *only* when the user did not pass an
-    output-precision tolerance on the command line. Takes the kernel
-    source and returns
-      {kind, value, rationale, confidence, alternative}
-    where kind is one of 'sig_figs', 'decimal_digits', or 'unknown'.
-    Call this exactly once and only at the start, before spawn_analyst,
-    and only when the user message tells you no tolerance was provided.
-
+You have access to four specialist agents:
   - analyst: takes the kernel source AND the agreed tolerance, and
     returns a structured per-variable verdict plus an optional
     kernel-shape rework block, a precision_budget block, and overall
@@ -292,19 +273,15 @@ You also have two deterministic (non-LLM) tools:
 You also have a finish tool to emit the final answer.
 
 Tolerance handling:
-- The user message will tell you either a concrete tolerance
-  ({kind, value, source='user_cli'}) or that no tolerance was given.
-- If no tolerance was given: call spawn_precision_advisor first. If the
-  advisor returns kind='sig_figs' or 'decimal_digits', use that value
-  with source='precision_advisor' as the agreed tolerance for the rest
-  of the run. If the advisor returns kind='unknown', fall back to the
-  default {kind:'sig_figs', value:6, source:'advisor_unknown_defaulted'}
-  and use that as the agreed tolerance.
-- Once an agreed tolerance is fixed, thread it verbatim into the
-  task prompts of analyst, rewriter, and verifier. The analyst MUST
-  see {target_kind, target_value, source}; the rewriter SHOULD see the
-  tolerance for context; the verifier MUST see the same tolerance the
-  analyst saw so it can audit the precision_budget block.
+- The user message will tell you a concrete tolerance
+  ({kind, value, source='user_cli'}). It is always present; the CLI
+  requires the operator to pass --sig-figs or --decimal-digits and
+  rejects a run with neither.
+- Thread the tolerance verbatim into the task prompts of analyst,
+  rewriter, and verifier. The analyst MUST see {target_kind,
+  target_value, source}; the rewriter SHOULD see the tolerance for
+  context; the verifier MUST see the same tolerance the analyst saw
+  so it can audit the precision_budget block.
 
 Your job after the tolerance is fixed:
 0. If the user message's BASELINE STEP block invites it (Kokkos C++
@@ -354,38 +331,12 @@ Hard rules:
   orchestrator loop enforces this in code, not just in the prompt,
   and a premature finish call will be turned into a synthetic tool
   error telling you what is missing.
-- You may not call spawn_precision_advisor if the user message
-  provided a tolerance. You may not call spawn_precision_advisor more
-  than once.
 
 Be deliberate. Each spawn_* call costs another model call and the user
 will inspect every prompt before it runs. Prefer one well-crafted prompt
 over several short ones."""
 
 ORCHESTRATOR_TOOLS = [
-    {
-        "name": "spawn_precision_advisor",
-        "description": (
-            "Run the precision_advisor agent on a kernel source to infer "
-            "an output-precision tolerance. Use only when the user did not "
-            "specify a tolerance on the command line. Returns "
-            "{kind, value, rationale, confidence, alternative}."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "kernel_source": {
-                    "type": "string",
-                    "description": (
-                        "The full kernel source. Do not include file paths, "
-                        "framing hints, or any other text — the advisor "
-                        "should see only the source."
-                    ),
-                },
-            },
-            "required": ["kernel_source"],
-        },
-    },
     {
         "name": "spawn_analyst",
         "description": (
@@ -475,8 +426,7 @@ ORCHESTRATOR_TOOLS = [
                         "The agreed output-precision tolerance as a JSON "
                         "string with keys {kind, value, source}, matching "
                         "what the analyst was given. Use kind='sig_figs' "
-                        "or 'decimal_digits'; source is 'user_cli', "
-                        "'precision_advisor', or 'advisor_unknown_defaulted'."
+                        "or 'decimal_digits'; source is 'user_cli'."
                     ),
                 },
             },
@@ -935,9 +885,6 @@ def _execute_tool(
     available" — kept optional for tests that exercise _execute_tool
     in isolation.
     """
-    if tool_name == "spawn_precision_advisor":
-        result = run_agent("precision_advisor", tool_input["kernel_source"])
-        return {"status": "ok", "result": result}
     if tool_name == "spawn_analyst":
         # Probe evidence injection: if a prior probe_compare call wrote
         # baselines/<kernel_stem>/probe/evidence.json, append it to the
@@ -1318,30 +1265,15 @@ def _execute_tool(
     raise ValueError(f"Unknown tool: {tool_name}")
 
 
-def _format_tolerance_block(tolerance: dict | None) -> str:
+def _format_tolerance_block(tolerance: dict) -> str:
     """Render the tolerance block embedded in the initial user message.
 
-    `tolerance` is either None (no user-supplied tolerance; the
-    orchestrator must call spawn_precision_advisor first) or a dict
-    with keys {kind, value, source}.
+    `tolerance` is a dict with keys {kind, value, source}. It is always
+    present: the CLI requires --sig-figs or --decimal-digits and rejects
+    a run with neither, so run_orchestrator never receives None here.
     """
-    if tolerance is None:
-        return (
-            "OUTPUT-PRECISION TOLERANCE: not specified by the user.\n"
-            "You MUST call spawn_precision_advisor first with the kernel "
-            "source. Then:\n"
-            "  - if the advisor returns kind='sig_figs' or "
-            "'decimal_digits', use {kind, value, source='precision_advisor'} "
-            "as the agreed tolerance;\n"
-            "  - if the advisor returns kind='unknown', use the documented "
-            "fallback {kind:'sig_figs', value:6, "
-            "source:'advisor_unknown_defaulted'} as the agreed tolerance.\n"
-            "Thread the agreed tolerance verbatim into the analyst, "
-            "rewriter, and verifier task prompts."
-        )
     return (
-        "OUTPUT-PRECISION TOLERANCE (user-supplied; do NOT call "
-        "spawn_precision_advisor):\n"
+        "OUTPUT-PRECISION TOLERANCE (user-supplied):\n"
         f"  kind:   {tolerance['kind']}\n"
         f"  value:  {tolerance['value']}\n"
         f"  source: {tolerance['source']}\n"
@@ -1556,7 +1488,7 @@ class _FinishGateState:
         if tool_name == "compare_outputs":
             self.last_compare_status = exec_result.get("status")
             return
-        # Other tools (spawn_precision_advisor, spawn_analyst,
+        # Other tools (spawn_analyst,
         # spawn_baseline_harness, compile_baseline_driver,
         # run_baseline_driver, probe_step, probe_compare) do not affect
         # the gate. The probe tools in particular are INFORMATIONAL --
@@ -1602,7 +1534,8 @@ class _FinishGateState:
 def run_orchestrator(
     kernel_path: str,
     kernel_source: str,
-    tolerance: dict | None = None,
+    *,
+    tolerance: dict,
     kernel_name: str | None = None,
     max_turns: int = MAX_TURNS,
     auto: bool = False,
@@ -1610,11 +1543,11 @@ def run_orchestrator(
 ) -> dict | None:
     """Run the orchestrator loop.
 
-    `tolerance` is either None (no user-supplied tolerance; the
-    orchestrator will be instructed to call spawn_precision_advisor
-    first) or a dict {kind, value, source} where kind is one of
+    `tolerance` is a dict {kind, value, source} where kind is one of
     'sig_figs' or 'decimal_digits', value is a small positive integer,
-    and source is 'user_cli'.
+    and source is 'user_cli'. It is required — the CLI enforces that
+    the operator passes --sig-figs or --decimal-digits and rejects a
+    run with neither, and there is no in-workflow fallback.
 
     `kernel_name` is an optional explicit name of the kernel function
     inside `kernel_source` for the baseline_harness agent to target.

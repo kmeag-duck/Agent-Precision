@@ -12,137 +12,12 @@ Output-precision tolerance vocabulary used throughout this file:
                         N sig figs <=> relative error < 10^-N).
   - "decimal_digits"  — required correct *decimal places* after the point
                         (absolute tolerance: N digits <=> abs error < 10^-N).
-  - "unknown"         — the precision_advisor was unable to infer a
-                        tolerance with any confidence and is explicitly
-                        deferring to the caller. The orchestrator falls
-                        back to a hard-coded default in this case.
 These are deliberately distinct from floating-point storage precision
 (float / double / float-float etc.); a kernel may need 6 sig figs of
-output and achieve it with a mix of storage precisions internally.
+output and achieve it with a mix of storage precisions internally. The
+tolerance is always supplied by the operator on the command line
+(--sig-figs or --decimal-digits); there is no inference path.
 """
-
-# ---------------------------------------------------------------------------
-# Precision advisor
-# ---------------------------------------------------------------------------
-#
-# Runs *only* when the user did not pass an output-precision tolerance on
-# the command line. Reads the kernel source and guesses, from domain
-# context (typical scientific use of this kind of computation), how many
-# significant figures or decimal digits of output precision a user of
-# this kernel would reasonably need. May explicitly answer "unknown" with
-# confidence='low' rather than guess blindly; the orchestrator handles
-# that case by falling back to a documented default tolerance.
-#
-# This agent does not look at variables, does not recommend rewrites, and
-# does not see any user-supplied tolerance. Its only job is to translate
-# "no tolerance specified" into a concrete tolerance the analyst and
-# verifier can act on.
-
-PRECISION_ADVISOR_OUTPUT_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "kind": {
-            "type": "string",
-            "enum": ["sig_figs", "decimal_digits", "unknown"],
-            "description": (
-                "'sig_figs' = relative tolerance, expressed as required "
-                "significant figures of the kernel's output. "
-                "'decimal_digits' = absolute tolerance, expressed as "
-                "required correct digits after the decimal point. "
-                "'unknown' = you could not infer a tolerance with any "
-                "confidence from the source alone; the orchestrator will "
-                "fall back to a default. Prefer an honest 'unknown' over "
-                "a blind guess."
-            ),
-        },
-        "value": {
-            "type": "integer",
-            "description": (
-                "The numeric tolerance, interpreted according to `kind`. "
-                "When kind='sig_figs' or 'decimal_digits', a small "
-                "positive integer (typical range 3-12). When "
-                "kind='unknown', set value=0 (the orchestrator ignores "
-                "it)."
-            ),
-        },
-        "rationale": {
-            "type": "string",
-            "description": (
-                "Brief justification grounded in the kernel's apparent "
-                "domain (e.g. 'gravitational N-body force, single-step; "
-                "double-precision baseline is overkill for most "
-                "downstream integrators which only need ~6 sig figs')."
-            ),
-        },
-        "confidence": {
-            "type": "string",
-            "enum": ["high", "medium", "low"],
-            "description": (
-                "How confident you are in the inferred tolerance. Use "
-                "'low' for kind='unknown'."
-            ),
-        },
-        "alternative": {
-            "type": "string",
-            "description": (
-                "One plausible alternative tolerance the caller might "
-                "have intended (e.g. '8 sig figs if this feeds a "
-                "long-time-integration step'). Empty string if none."
-            ),
-        },
-    },
-    "required": ["kind", "value", "rationale", "confidence", "alternative"],
-}
-
-PRECISION_ADVISOR_SYSTEM_PROMPT = """You are the precision-advisor agent.
-
-The caller of this workflow did not specify an output-precision
-tolerance on the command line. Your job is to read the kernel's source
-and, from its apparent scientific domain and typical downstream use,
-infer how many significant figures (relative tolerance) or decimal
-digits after the point (absolute tolerance) of output precision a user
-of this kernel would reasonably need.
-
-You will *not* see a user-supplied tolerance, because there is none.
-You are filling that gap.
-
-Vocabulary:
-- 'sig_figs' = required correct significant figures of the kernel's
-  output values. Relative tolerance: N sig figs corresponds to
-  relative error < 10^-N. Use this when the output magnitudes vary
-  over orders (forces, fluxes, energies, log-likelihoods).
-- 'decimal_digits' = required correct decimal places after the point.
-  Absolute tolerance: N digits corresponds to absolute error < 10^-N.
-  Use this when the output magnitudes are bounded near a known scale
-  (probabilities, normalized fractions, angles in radians).
-- These are *output-precision* tolerances. They are not the same as the
-  storage precision (float / double / float-float) of variables inside
-  the kernel; the analyst will decide storage precisions separately
-  given your tolerance.
-
-How to decide:
-1. Identify what the kernel computes (force, sum, transform, density,
-   integration step, …) and the typical scientific domain that uses
-   such a kernel.
-2. Recall the order of magnitude of output precision that domain
-   typically *uses*, not the precision the kernel happens to be coded
-   in. Most scientific double-precision code is using far fewer sig
-   figs than double provides; pick the realistic working tolerance,
-   not the storage precision.
-3. If the kernel's domain is genuinely unclear from the source, or if
-   you can't bracket a reasonable tolerance to within ~2 sig figs, set
-   kind='unknown', value=0, confidence='low' and explain why in
-   rationale. The orchestrator will fall back to a documented default.
-   An honest 'unknown' is more useful than a confident guess.
-
-Field rules:
-- kind='sig_figs' or 'decimal_digits': value is a small positive
-  integer (typical range 3-12).
-- kind='unknown': value=0.
-- alternative: one plausible alternative tolerance the caller might
-  have intended given a different downstream use; empty string if none.
-
-Return your result by calling the submit_result tool."""
 
 # ---------------------------------------------------------------------------
 # Analyst
@@ -309,8 +184,7 @@ ANALYST_OUTPUT_SCHEMA = {
                     "type": "string",
                     "description": (
                         "Where the tolerance came from, copied from the "
-                        "task (e.g. 'user_cli', 'precision_advisor', "
-                        "'advisor_unknown_defaulted')."
+                        "task (currently always 'user_cli')."
                     ),
                 },
                 "claimed_output_precision": {
@@ -864,12 +738,6 @@ from .languages import PROFILES as _PROFILES  # noqa: E402
 # reduced. See AGENTS.md for the rationale and `run_agent` for the
 # enforcement point.
 AGENTS = {
-    "precision_advisor": {
-        "system_prompt": PRECISION_ADVISOR_SYSTEM_PROMPT,
-        "output_schema": PRECISION_ADVISOR_OUTPUT_SCHEMA,
-        "model": "claude-opus-4-7",
-        "supports_temperature": False,
-    },
     "analyst": {
         "system_prompt": ANALYST_SYSTEM_PROMPT,
         "output_schema": ANALYST_OUTPUT_SCHEMA,

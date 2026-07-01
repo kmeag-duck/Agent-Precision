@@ -18,7 +18,9 @@ def test_main_no_args_returns_2(monkeypatch, capsys):
 def test_main_missing_file_returns_2(monkeypatch, tmp_path, capsys):
     """CLI prints 'File not found' and exits 2 when the kernel path does not exist."""
     missing = tmp_path / "does_not_exist.cpp"
-    monkeypatch.setattr("sys.argv", ["workflow.run", str(missing)])
+    monkeypatch.setattr(
+        "sys.argv", ["workflow.run", str(missing), "--sig-figs", "6"]
+    )
     assert run_module.main() == 2
     err = capsys.readouterr().err
     assert "File not found" in err
@@ -28,41 +30,32 @@ def test_main_orchestrator_quit_returns_1(monkeypatch, tmp_path):
     """CLI exits 1 when run_orchestrator returns None (user quit or no-tool stop)."""
     kernel = tmp_path / "k.cpp"
     kernel.write_text("// fake kernel\n")
-    monkeypatch.setattr("sys.argv", ["workflow.run", str(kernel)])
+    monkeypatch.setattr(
+        "sys.argv", ["workflow.run", str(kernel), "--sig-figs", "6"]
+    )
     monkeypatch.setattr(
         run_module,
         "run_orchestrator",
-        lambda p, s, tolerance=None, **kwargs: None,
+        lambda p, s, tolerance, **kwargs: None,
     )
 
     assert run_module.main() == 1
 
 
-def test_main_happy_path_passes_none_tolerance_when_no_flags(
-    monkeypatch, tmp_path, capsys
-):
-    """With no tolerance flags, CLI calls run_orchestrator with tolerance=None and prints rewritten_code + notes."""
+def test_main_requires_tolerance_flag(monkeypatch, tmp_path, capsys):
+    """After removing the precision_advisor agent, the CLI REQUIRES one of --sig-figs / --decimal-digits; running with neither is an argparse error (exit 2). This test locks the removal — the previous contract silently accepted no tolerance and let the orchestrator call the advisor."""
     kernel = tmp_path / "k.cpp"
     kernel.write_text("// fake kernel\n")
-
-    captured = {}
-
-    def fake_orchestrator(path, source, tolerance=None, auto=False, **kwargs):
-        captured["path"] = path
-        captured["source"] = source
-        captured["tolerance"] = tolerance
-        return {"rewritten_code": "REWRITTEN", "notes": "NOTES"}
-
     monkeypatch.setattr("sys.argv", ["workflow.run", str(kernel)])
-    monkeypatch.setattr(run_module, "run_orchestrator", fake_orchestrator)
-
-    assert run_module.main() == 0
-    out = capsys.readouterr().out
-    assert "REWRITTEN" in out
-    assert "NOTES" in out
-    assert captured["path"] == str(kernel)
-    assert captured["source"] == "// fake kernel\n"
-    assert captured["tolerance"] is None
+    with pytest.raises(SystemExit) as excinfo:
+        run_module.main()
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    # argparse phrases mutually-exclusive-required as
+    # "one of the arguments ... is required".
+    assert "required" in err.lower()
+    assert "--sig-figs" in err
+    assert "--decimal-digits" in err
 
 
 def test_main_sig_figs_flag_normalizes_to_user_cli_tolerance(
@@ -140,23 +133,27 @@ def test_main_mutually_exclusive_tolerance_flags(monkeypatch, tmp_path, capsys):
 
 
 def test_main_auto_flag_passes_auto_true_to_orchestrator(monkeypatch, tmp_path):
-    """--auto causes the CLI to invoke run_orchestrator with auto=True; default invocation passes auto=False."""
+    """--auto causes the CLI to invoke run_orchestrator with auto=True; default invocation passes auto=False. Both invocations pass --sig-figs because the CLI now requires a tolerance flag."""
     kernel = tmp_path / "k.cpp"
     kernel.write_text("// k\n")
 
     captured = {}
 
-    def fake_orchestrator(path, source, tolerance=None, auto=False, **kwargs):
+    def fake_orchestrator(path, source, tolerance, auto=False, **kwargs):
         captured["auto"] = auto
         return {"rewritten_code": "X", "notes": "Y"}
 
     monkeypatch.setattr(run_module, "run_orchestrator", fake_orchestrator)
 
-    monkeypatch.setattr("sys.argv", ["workflow.run", str(kernel), "--auto"])
+    monkeypatch.setattr(
+        "sys.argv", ["workflow.run", str(kernel), "--sig-figs", "6", "--auto"]
+    )
     assert run_module.main() == 0
     assert captured["auto"] is True
 
-    monkeypatch.setattr("sys.argv", ["workflow.run", str(kernel)])
+    monkeypatch.setattr(
+        "sys.argv", ["workflow.run", str(kernel), "--sig-figs", "6"]
+    )
     assert run_module.main() == 0
     assert captured["auto"] is False
 

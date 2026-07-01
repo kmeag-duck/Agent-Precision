@@ -886,7 +886,7 @@ def compare_outputs(
         return _error(
             f"tolerance_json is not valid JSON: {exc}. Expected an "
             f"object like {{'kind': 'sig_figs', 'value': 3, 'source': "
-            f"'precision_advisor'}}."
+            f"'user_cli'}}."
         )
     if not isinstance(tolerance, dict):
         return _error(

@@ -11,7 +11,6 @@ import pytest
 from workflow import orchestrator
 from workflow.languages import CUDA_PROFILE, KOKKOS_PROFILE
 from workflow.orchestrator import (
-    DEFAULT_TOLERANCE_ON_ADVISOR_UNKNOWN,
     ORCHESTRATOR_SYSTEM_PROMPT,
     ORCHESTRATOR_TOOLS,
     _execute_tool,
@@ -22,6 +21,18 @@ from workflow.orchestrator import (
 )
 
 from .conftest import FakeResponse, TextBlock, ToolUseBlock
+
+
+# Canonical user-supplied tolerance for tests that only care about
+# message-shape / dispatch / trace-writing behavior, not the specific
+# numeric threshold. Any well-formed tolerance dict works here because
+# the FakeAnthropic clients in these tests terminate the loop before the
+# tolerance value influences any downstream tool result.
+_DEFAULT_TEST_TOLERANCE = {
+    "kind": "sig_figs",
+    "value": 6,
+    "source": "user_cli",
+}
 
 
 # ---------- _hitl_pause ----------
@@ -262,7 +273,7 @@ def test_run_orchestrator_happy_path(monkeypatch, fake_anthropic, tmp_path):
     monkeypatch.chdir(tmp_path)
     tol_json = (
         '{"kind":"sig_figs","value":6,'
-        '"source":"advisor_unknown_defaulted"}'
+        '"source":"user_cli"}'
     )
     fake = fake_anthropic([
         FakeResponse(
@@ -401,7 +412,11 @@ def test_run_orchestrator_happy_path(monkeypatch, fake_anthropic, tmp_path):
     # Eleven HITL prompts, all approved.
     _scripted_input(monkeypatch, ["y"] * 11)
 
-    result = run_orchestrator("path/to/kernel.cpp", "kernel source body")
+    result = run_orchestrator(
+        "path/to/kernel.cpp",
+        "kernel source body",
+        tolerance=_DEFAULT_TEST_TOLERANCE,
+    )
 
     assert result == {"rewritten_code": "FINAL", "notes": "done"}
     assert len(fake.messages.calls) == 11
@@ -449,7 +464,7 @@ def test_run_orchestrator_rejection_feeds_back_sentinel(
     monkeypatch.chdir(tmp_path)
     tol_json = (
         '{"kind":"sig_figs","value":6,'
-        '"source":"advisor_unknown_defaulted"}'
+        '"source":"user_cli"}'
     )
     fake = fake_anthropic([
         # Turn 1: orchestrator proposes spawn_analyst — user rejects.
@@ -582,7 +597,7 @@ def test_run_orchestrator_rejection_feeds_back_sentinel(
     # 'n' rejects the first call; the remaining nine all approve.
     _scripted_input(monkeypatch, ["n"] + ["y"] * 9)
 
-    result = run_orchestrator("k.cpp", "src")
+    result = run_orchestrator("k.cpp", "src", tolerance=_DEFAULT_TEST_TOLERANCE)
 
     assert result == {"rewritten_code": "X", "notes": "gave up"}
 
@@ -617,7 +632,10 @@ def test_run_orchestrator_quit_returns_none(monkeypatch, fake_anthropic):
     )
     _scripted_input(monkeypatch, ["q"])
 
-    assert run_orchestrator("k.cpp", "src") is None
+    assert (
+        run_orchestrator("k.cpp", "src", tolerance=_DEFAULT_TEST_TOLERANCE)
+        is None
+    )
 
 
 # ---------- run_orchestrator: stop without tool ----------
@@ -636,7 +654,10 @@ def test_run_orchestrator_stop_without_tool_returns_none(
     # No HITL prompts should fire because there's no tool_use block.
     _scripted_input(monkeypatch, [])
 
-    assert run_orchestrator("k.cpp", "src") is None
+    assert (
+        run_orchestrator("k.cpp", "src", tolerance=_DEFAULT_TEST_TOLERANCE)
+        is None
+    )
 
 
 # ---------- Orchestrator prompt: vocabulary matches the agents it routes to ----------
@@ -650,10 +671,9 @@ def test_orchestrator_prompt_names_all_three_methods_and_rework():
         )
 
 
-def test_orchestrator_prompt_names_precision_advisor_and_tolerance_kinds():
-    """The orchestrator prompt names spawn_precision_advisor, sig_figs, decimal_digits, and precision_budget so the LLM knows when to call the advisor and how to thread tolerance into downstream task prompts."""
+def test_orchestrator_prompt_names_tolerance_kinds():
+    """The orchestrator prompt names sig_figs, decimal_digits, and precision_budget so the LLM knows how to thread the operator-supplied tolerance into downstream task prompts."""
     for token in (
-        "spawn_precision_advisor",
         "sig_figs",
         "decimal_digits",
         "precision_budget",
@@ -663,15 +683,10 @@ def test_orchestrator_prompt_names_precision_advisor_and_tolerance_kinds():
         )
 
 
-def test_orchestrator_prompt_states_advisor_unknown_fallback():
-    """The orchestrator prompt documents the fallback to {sig_figs, 6, advisor_unknown_defaulted} when the precision_advisor returns kind='unknown', matching DEFAULT_TOLERANCE_ON_ADVISOR_UNKNOWN."""
-    assert "advisor_unknown_defaulted" in ORCHESTRATOR_SYSTEM_PROMPT
-    # The constant and the prompt must agree on the fallback shape.
-    assert DEFAULT_TOLERANCE_ON_ADVISOR_UNKNOWN == {
-        "kind": "sig_figs",
-        "value": 6,
-        "source": "advisor_unknown_defaulted",
-    }
+def test_orchestrator_prompt_does_not_mention_precision_advisor():
+    """The precision_advisor agent has been removed; the orchestrator prompt must not name it as a callable tool or fallback path."""
+    assert "precision_advisor" not in ORCHESTRATOR_SYSTEM_PROMPT
+    assert "advisor_unknown_defaulted" not in ORCHESTRATOR_SYSTEM_PROMPT
 
 
 def test_orchestrator_prompt_forbids_finish_without_accept():
@@ -684,51 +699,26 @@ def test_orchestrator_prompt_forbids_finish_without_accept():
 # ---------- _format_tolerance_block ----------
 
 
-def test_format_tolerance_block_none_tells_orchestrator_to_call_advisor():
-    """With tolerance=None, the rendered block instructs the orchestrator to call spawn_precision_advisor first and documents both the advisor-returns-tolerance and advisor-unknown-fallback paths."""
-    block = _format_tolerance_block(None)
-    assert "not specified" in block
-    assert "spawn_precision_advisor" in block
-    assert "advisor_unknown_defaulted" in block
-
-
-def test_format_tolerance_block_user_cli_forbids_advisor_call():
-    """With a user-supplied tolerance, the rendered block contains the kind/value/source verbatim and tells the orchestrator NOT to call spawn_precision_advisor."""
+def test_format_tolerance_block_user_cli_renders_verbatim():
+    """With a user-supplied tolerance, the rendered block contains the kind/value/source verbatim."""
     block = _format_tolerance_block(
         {"kind": "sig_figs", "value": 7, "source": "user_cli"}
     )
     assert "sig_figs" in block
     assert "7" in block
     assert "user_cli" in block
-    assert "do NOT call" in block or "do not call" in block.lower()
 
 
-# ---------- _execute_tool: spawn_precision_advisor + spawn_verifier(tolerance_json) ----------
-
-
-def test_execute_tool_dispatches_spawn_precision_advisor(monkeypatch):
-    """_execute_tool routes spawn_precision_advisor to run_agent('precision_advisor', kernel_source) and wraps the result."""
-    calls = []
-
-    def stub_run_agent(type_, task):
-        calls.append((type_, task))
-        return {
-            "kind": "sig_figs",
-            "value": 6,
-            "rationale": "stubbed",
-            "confidence": "medium",
-            "alternative": "",
-        }
-
-    monkeypatch.setattr(orchestrator, "run_agent", stub_run_agent)
-
-    result = _execute_tool(
-        "spawn_precision_advisor", {"kernel_source": "SOURCE"}, KOKKOS_PROFILE
+def test_format_tolerance_block_does_not_mention_advisor():
+    """After removing the precision_advisor agent, the rendered tolerance block must not name it (as a callable, a source enum value, or a fallback path)."""
+    block = _format_tolerance_block(
+        {"kind": "sig_figs", "value": 6, "source": "user_cli"}
     )
+    assert "precision_advisor" not in block
+    assert "advisor_unknown_defaulted" not in block
 
-    assert result["status"] == "ok"
-    assert result["result"]["kind"] == "sig_figs"
-    assert calls == [("precision_advisor", "SOURCE")]
+
+# ---------- _execute_tool: spawn_verifier(tolerance_json) ----------
 
 
 def test_execute_tool_spawn_verifier_includes_tolerance_in_task(monkeypatch):
@@ -927,7 +917,7 @@ def test_execute_tool_spawn_verifier_k_exceeds_lenses_raises(monkeypatch):
 def test_run_orchestrator_user_cli_tolerance_appears_in_first_user_message(
     monkeypatch, fake_anthropic
 ):
-    """When a user-supplied tolerance is passed, the first user message embeds it verbatim and the orchestrator is told NOT to call spawn_precision_advisor."""
+    """The user-supplied tolerance is embedded verbatim into the first user message so the orchestrator LLM can thread it into every downstream task prompt."""
     # First-user-message-only test: short-circuit by returning text + end_turn
     # on turn 1 so the loop exits with None before engaging the finish gate.
     fake = fake_anthropic([
@@ -952,29 +942,9 @@ def test_run_orchestrator_user_cli_tolerance_appears_in_first_user_message(
     assert "decimal_digits" in first_user
     assert "4" in first_user
     assert "user_cli" in first_user
-    # advisor must NOT be invited when tolerance is user-supplied
-    assert "do NOT call" in first_user or "do not call" in first_user.lower()
-
-
-def test_run_orchestrator_no_tolerance_invites_advisor_in_first_user_message(
-    monkeypatch, fake_anthropic
-):
-    """When tolerance=None, the first user message instructs the orchestrator to call spawn_precision_advisor first."""
-    # First-user-message-only test: short-circuit on turn 1 with a
-    # text+end_turn response so the loop exits before engaging the gate.
-    fake = fake_anthropic([
-        FakeResponse(
-            content=[TextBlock(text="(test stop)")],
-            stop_reason="end_turn",
-        ),
-    ])
-    _scripted_input(monkeypatch, [])
-
-    run_orchestrator("k.cpp", "src", tolerance=None)
-
-    first_user = fake.messages.calls[0]["messages"][0]["content"]
-    assert "spawn_precision_advisor" in first_user
-    assert "not specified" in first_user
+    # The removed precision_advisor agent must not be advertised anywhere
+    # in the initial user message.
+    assert "precision_advisor" not in first_user
 
 
 # ---------- Baseline harness: tool schema + prompt + dispatch + user message ----------
@@ -1236,7 +1206,11 @@ def test_run_orchestrator_cpp_kernel_invites_baseline_in_first_user_message(
     ])
     _scripted_input(monkeypatch, [])
 
-    run_orchestrator("path/to/nbody_force.cpp", "src")
+    run_orchestrator(
+        "path/to/nbody_force.cpp",
+        "src",
+        tolerance=_DEFAULT_TEST_TOLERANCE,
+    )
 
     first_user = fake.messages.calls[0]["messages"][0]["content"]
     assert "BASELINE STEP" in first_user
@@ -1259,7 +1233,10 @@ def test_run_orchestrator_cpp_with_kernel_name_includes_target_kernel_line(
     _scripted_input(monkeypatch, [])
 
     run_orchestrator(
-        "path/to/vector_add.cpp", "src", kernel_name="vector_add"
+        "path/to/vector_add.cpp",
+        "src",
+        kernel_name="vector_add",
+        tolerance=_DEFAULT_TEST_TOLERANCE,
     )
 
     first_user = fake.messages.calls[0]["messages"][0]["content"]
@@ -1281,7 +1258,11 @@ def test_run_orchestrator_cu_kernel_invites_baseline_in_first_user_message(
     ])
     _scripted_input(monkeypatch, [])
 
-    run_orchestrator("path/to/vector_add.cu", "src")
+    run_orchestrator(
+        "path/to/vector_add.cu",
+        "src",
+        tolerance=_DEFAULT_TEST_TOLERANCE,
+    )
 
     first_user = fake.messages.calls[0]["messages"][0]["content"]
     assert "BASELINE STEP" in first_user
@@ -2033,7 +2014,9 @@ def test_finish_gate_cpp_verifier_accept_and_compare_ok_allows_finish(
     )
     _scripted_input(monkeypatch, ["y", "y", "y"])
 
-    result = run_orchestrator("path/to/kstem.cpp", "src")
+    result = run_orchestrator(
+        "path/to/kstem.cpp", "src", tolerance=_DEFAULT_TEST_TOLERANCE
+    )
     assert result == {"rewritten_code": "FINAL", "notes": "done"}
     assert len(fake.messages.calls) == 3
 
@@ -2076,7 +2059,9 @@ def test_finish_gate_cpp_verifier_accept_but_compare_error_blocks_finish(
     )
     _scripted_input(monkeypatch, ["y", "y", "y"])  # all three approved
 
-    result = run_orchestrator("path/to/kstem.cpp", "src")
+    result = run_orchestrator(
+        "path/to/kstem.cpp", "src", tolerance=_DEFAULT_TEST_TOLERANCE
+    )
     # Finish was blocked -> loop continued and then ran out at turn 4
     # via the text+end_turn response, returning None.
     assert result is None
@@ -2118,7 +2103,9 @@ def test_finish_gate_cpp_compare_never_called_blocks_finish(
     )
     _scripted_input(monkeypatch, ["y", "y"])
 
-    result = run_orchestrator("path/to/kstem.cpp", "src")
+    result = run_orchestrator(
+        "path/to/kstem.cpp", "src", tolerance=_DEFAULT_TEST_TOLERANCE
+    )
     assert result is None
 
     # The blocked-finish tool_result must mention that compare_outputs
@@ -2159,7 +2146,9 @@ def test_finish_gate_cu_verifier_accept_alone_blocks_finish_post_phase_b(
     )
     _scripted_input(monkeypatch, ["y", "y"])
 
-    result = run_orchestrator("path/to/vector_add.cu", "src")
+    result = run_orchestrator(
+        "path/to/vector_add.cu", "src", tolerance=_DEFAULT_TEST_TOLERANCE
+    )
     # Finish was blocked -> loop continued and hit the text+end_turn
     # response at turn 3, returning None.
     assert result is None

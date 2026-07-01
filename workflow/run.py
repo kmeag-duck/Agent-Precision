@@ -1,13 +1,14 @@
 """CLI entrypoint: python -m workflow.run <kernel_file> [tolerance flags]
 
-Tolerance flags (mutually exclusive, both optional):
+Tolerance flags (mutually exclusive, exactly one required):
   --sig-figs N         Output-precision tolerance as N significant figures
                        (relative tolerance: relative error < 10^-N).
   --decimal-digits N   Output-precision tolerance as N decimal digits
                        after the point (absolute tolerance: abs error < 10^-N).
 
-If neither flag is given, the orchestrator will call the
-precision_advisor agent to infer a tolerance from the kernel source.
+A run without either flag is rejected by argparse at exit code 2. There
+is no in-workflow fallback: the operator must supply an explicit
+numerical target so batch runs stay comparable across invocations.
 """
 
 import argparse
@@ -58,7 +59,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
             "this flag — they never had a probe step to skip."
         ),
     )
-    tol_group = parser.add_mutually_exclusive_group()
+    tol_group = parser.add_mutually_exclusive_group(required=True)
     tol_group.add_argument(
         "--sig-figs",
         type=int,
@@ -66,7 +67,8 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         default=None,
         help=(
             "Required correct significant figures of the kernel's output "
-            "(relative tolerance). Mutually exclusive with --decimal-digits."
+            "(relative tolerance). Mutually exclusive with --decimal-digits. "
+            "Exactly one of --sig-figs / --decimal-digits is required."
         ),
     )
     tol_group.add_argument(
@@ -77,27 +79,31 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         help=(
             "Required correct decimal digits after the point of the "
             "kernel's output (absolute tolerance). Mutually exclusive "
-            "with --sig-figs."
+            "with --sig-figs. Exactly one of --sig-figs / "
+            "--decimal-digits is required."
         ),
     )
     return parser.parse_args(argv)
 
 
-def _normalize_tolerance(args: argparse.Namespace) -> dict | None:
-    """Turn parsed CLI args into the {kind, value, source} dict or None."""
+def _normalize_tolerance(args: argparse.Namespace) -> dict:
+    """Turn parsed CLI args into the {kind, value, source} dict.
+
+    Argparse guarantees exactly one of --sig-figs / --decimal-digits
+    was passed (the tol_group is required=True), so this function
+    always returns a dict; there is no None fallback.
+    """
     if args.sig_figs is not None:
         if args.sig_figs <= 0:
             raise SystemExit("--sig-figs must be a positive integer")
         return {"kind": "sig_figs", "value": args.sig_figs, "source": "user_cli"}
-    if args.decimal_digits is not None:
-        if args.decimal_digits <= 0:
-            raise SystemExit("--decimal-digits must be a positive integer")
-        return {
-            "kind": "decimal_digits",
-            "value": args.decimal_digits,
-            "source": "user_cli",
-        }
-    return None
+    if args.decimal_digits <= 0:
+        raise SystemExit("--decimal-digits must be a positive integer")
+    return {
+        "kind": "decimal_digits",
+        "value": args.decimal_digits,
+        "source": "user_cli",
+    }
 
 
 def main(argv: list[str] | None = None) -> int:

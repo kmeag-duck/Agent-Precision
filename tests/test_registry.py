@@ -4,7 +4,6 @@ from workflow.registry import (
     AGENTS,
     ANALYST_OUTPUT_SCHEMA,
     BASELINE_HARNESS_OUTPUT_SCHEMA,
-    PRECISION_ADVISOR_OUTPUT_SCHEMA,
     VERIFIER_OUTPUT_SCHEMA,
 )
 
@@ -12,7 +11,6 @@ from workflow.registry import (
 def test_known_agent_types():
     """AGENTS exposes the core agent types plus one baseline_harness_<lang> per registered language profile, with `baseline_harness` aliased to the Kokkos entry."""
     core_types = {
-        "precision_advisor",
         "analyst",
         "rewriter",
         "verifier",
@@ -160,44 +158,12 @@ def test_verifier_prompt_mentions_rework_check():
     assert "rework" in prompt.lower()
 
 
-# ---------- Precision advisor: schema + prompt ----------
+# ---------- Precision advisor was removed: guard against re-introduction ----------
 
 
-def test_precision_advisor_kind_enum_is_three_values():
-    """The precision_advisor's kind enum is exactly {sig_figs, decimal_digits, unknown}, so 'unknown' is a first-class output the orchestrator can branch on."""
-    kind = PRECISION_ADVISOR_OUTPUT_SCHEMA["properties"]["kind"]
-    assert set(kind["enum"]) == {"sig_figs", "decimal_digits", "unknown"}
-
-
-def test_precision_advisor_required_fields():
-    """The precision_advisor schema requires kind, value, rationale, confidence, alternative — the full record the orchestrator quotes when threading the tolerance into downstream prompts."""
-    required = set(PRECISION_ADVISOR_OUTPUT_SCHEMA["required"])
-    assert required == {
-        "kind",
-        "value",
-        "rationale",
-        "confidence",
-        "alternative",
-    }
-
-
-def test_precision_advisor_confidence_enum():
-    """The precision_advisor's confidence enum is {high, medium, low} so the orchestrator/user can react to low-confidence guesses."""
-    confidence = PRECISION_ADVISOR_OUTPUT_SCHEMA["properties"]["confidence"]
-    assert set(confidence["enum"]) == {"high", "medium", "low"}
-
-
-def test_precision_advisor_prompt_distinguishes_sig_figs_and_decimal_digits():
-    """The precision_advisor prompt names both sig_figs and decimal_digits explicitly so the model knows the difference between relative and absolute tolerance."""
-    prompt = AGENTS["precision_advisor"]["system_prompt"]
-    for token in ("sig_figs", "decimal_digits", "unknown"):
-        assert token in prompt, f"advisor prompt missing {token!r}"
-
-
-def test_precision_advisor_prompt_authorizes_unknown_answer():
-    """The precision_advisor prompt explicitly authorizes returning kind='unknown' instead of guessing blindly, so the agent does not feel forced to invent a tolerance."""
-    prompt = AGENTS["precision_advisor"]["system_prompt"].lower()
-    assert "unknown" in prompt and "guess" in prompt
+def test_precision_advisor_agent_is_not_registered():
+    """After removing the precision_advisor agent, AGENTS must not carry an entry for it. This test locks the removal so a future revert would fail loudly here rather than only surface as a runtime tool-dispatch error."""
+    assert "precision_advisor" not in AGENTS
 
 
 # ---------- Analyst: precision_budget block ----------
