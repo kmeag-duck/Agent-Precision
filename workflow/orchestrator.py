@@ -1319,6 +1319,7 @@ def _format_baseline_block(
     kernel_name: str | None,
     profile: LanguageProfile,
     run_probe: bool = True,
+    test_config: dict | None = None,
 ) -> str:
     """Render the BASELINE STEP block embedded in the initial user message.
 
@@ -1351,6 +1352,35 @@ def _format_baseline_block(
     target_line = (
         f"TARGET KERNEL: {kernel_name}\n" if kernel_name else ""
     )
+    # TEST CONFIG side-channel. When the operator supplied a
+    # `<kernel>.testconfig.json` sibling file, workflow.run.py loads
+    # it and passes the parsed dict through as `test_config`. We
+    # render it as a JSON block inside the BASELINE STEP so the
+    # baseline_harness agent uses the operator's test parameters
+    # (N, seed, eps, dt, per-array distribution / ranges, etc.)
+    # verbatim instead of inventing values — the latter was the
+    # single biggest driver of run-to-run inconsistency in the N=5
+    # nbody_force consistency sweep (runs picked wildly different N
+    # / eps / dt combinations across attempts, making probe
+    # evidence and comparator results non-comparable across runs).
+    # The schema is freeform on purpose (per-kernel; not every kernel
+    # has an N); the per-language harness system prompt (currently
+    # only Kokkos in registry.py) is responsible for describing the
+    # conventional keys and the consumption contract. None means the
+    # operator did not supply a sibling file — we omit the block and
+    # the harness reverts to inferring inputs from the kernel source.
+    if test_config is not None:
+        test_config_block = (
+            "TEST CONFIG (JSON): the operator supplied the following "
+            "test-config dict via a sibling `<kernel>.testconfig.json` "
+            "file. Pass it verbatim to spawn_baseline_harness as the "
+            "`test_config` field of the kernel_source block (or as a "
+            "separate labeled block prepended to kernel_source) — the "
+            "harness system prompt describes how to consume each key.\n"
+            f"{json.dumps(test_config, indent=2)}\n"
+        )
+    else:
+        test_config_block = ""
     # Probe matrix is silently omitted on profiles whose
     # probe_precisions tuple is empty (every profile other than
     # Kokkos in v1). The two probe tools still exist in
@@ -1404,9 +1434,12 @@ def _format_baseline_block(
         "IS a precondition for finish on this kernel's language profile.\n"
         f"KERNEL STEM: {stem}\n"
         f"{target_line}"
+        f"{test_config_block}"
         "When you call spawn_baseline_harness, pass the original kernel "
         "source as kernel_source (no tolerance block; you MAY prepend a "
-        "single TARGET KERNEL: line if one is given above) and the "
+        "single TARGET KERNEL: line if one is given above; if a TEST "
+        "CONFIG (JSON) block was given above, prepend it verbatim to "
+        "kernel_source too, on its own labeled block) and the "
         "KERNEL STEM verbatim as kernel_stem. If (and only if) "
         "spawn_baseline_harness succeeds, follow it immediately with a "
         "single call to compile_baseline_driver using the same "
@@ -1572,6 +1605,7 @@ def run_orchestrator(
     max_turns: int = MAX_TURNS,
     auto: bool = False,
     run_probe: bool = True,
+    test_config: dict | None = None,
 ) -> dict | None:
     """Run the orchestrator loop.
 
@@ -1608,6 +1642,24 @@ def run_orchestrator(
     other than Kokkos in v1) ignore this flag — they never had probe
     instructions in their BASELINE STEP block to begin with.
 
+    `test_config` (default None) is an optional freeform JSON dict of
+    per-kernel test parameters (N, seed, eps, dt, per-array
+    distribution / ranges, etc.) supplied by the operator via a
+    sibling `<kernel>.testconfig.json` file (auto-loaded by
+    workflow/run.py). When non-None, it is rendered as a labeled
+    TEST CONFIG (JSON) block inside the BASELINE STEP portion of the
+    initial user message so the baseline_harness agent uses those
+    values verbatim instead of inventing test inputs. When None (the
+    default), the block is omitted and the harness reverts to
+    inferring inputs from the kernel source. The schema is freeform
+    because per-kernel needs differ (nbody wants N/eps/dt; stencil
+    wants grid dims; matmul wants M/N/K); the per-language harness
+    system prompt describes the conventional keys. This is
+    orthogonal to `tolerance` (tolerance is threaded to analyst /
+    rewriter / verifier and gates finish via the comparator;
+    test_config is threaded to the harness only and never leaves
+    the baseline chain).
+
     Returns the final finish() arguments dict, or None if the user quit,
     the orchestrator stopped without finishing, or max_turns was exhausted.
     """
@@ -1622,7 +1674,8 @@ def run_orchestrator(
     profile = detect_language(kernel_path, kernel_source)
     tolerance_block = _format_tolerance_block(tolerance)
     baseline_block = _format_baseline_block(
-        kernel_path, kernel_name, profile, run_probe=run_probe
+        kernel_path, kernel_name, profile, run_probe=run_probe,
+        test_config=test_config,
     )
     user_message = (
         f"Kernel file: {kernel_path}\n\n"

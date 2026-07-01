@@ -1,5 +1,7 @@
 """Tests for the CLI entrypoint workflow.run.main."""
 
+import json
+
 import pytest
 
 from workflow import run as run_module
@@ -167,3 +169,83 @@ def test_main_rejects_nonpositive_sig_figs(monkeypatch, tmp_path):
     )
     with pytest.raises(SystemExit):
         run_module.main()
+
+
+# ---------- _load_test_config sibling-file plumbing ----------
+
+
+def test_load_test_config_returns_none_when_sibling_missing(tmp_path):
+    """When no sibling `<kernel>.testconfig.json` exists, _load_test_config returns None so the orchestrator falls back to letting the harness invent inputs."""
+    kernel = tmp_path / "k.cpp"
+    kernel.write_text("// k\n")
+    assert run_module._load_test_config(kernel) is None
+
+
+def test_load_test_config_parses_sibling_json(tmp_path):
+    """A well-formed sibling `<kernel>.testconfig.json` is parsed into a dict that _load_test_config returns verbatim (round-trip preserves keys / values / nesting)."""
+    kernel = tmp_path / "nbody_force.cpp"
+    kernel.write_text("// kernel\n")
+    config_path = tmp_path / "nbody_force.cpp.testconfig.json"
+    config = {
+        "N": 1024,
+        "seed": 42,
+        "eps": 0.05,
+        "dt": 0.01,
+        "arrays": {"x": {"distribution": "uniform", "low": -1.0, "high": 1.0}},
+    }
+    config_path.write_text(json.dumps(config))
+    loaded = run_module._load_test_config(kernel)
+    assert loaded == config
+
+
+def test_load_test_config_raises_systemexit_on_malformed_json(tmp_path):
+    """A syntactically invalid sibling JSON file is a hard error (SystemExit) — the operator explicitly opted in, so a silent fallback would defeat the point."""
+    kernel = tmp_path / "k.cpp"
+    kernel.write_text("// k\n")
+    config_path = tmp_path / "k.cpp.testconfig.json"
+    config_path.write_text("{not valid json")
+    with pytest.raises(SystemExit) as excinfo:
+        run_module._load_test_config(kernel)
+    assert "testconfig.json" in str(excinfo.value)
+
+
+def test_load_test_config_raises_systemexit_on_non_object_toplevel(tmp_path):
+    """A JSON file whose top-level value is not an object (list, scalar, string) is a hard error — the schema is a dict and the harness would silently ignore an unexpected shape otherwise."""
+    kernel = tmp_path / "k.cpp"
+    kernel.write_text("// k\n")
+    config_path = tmp_path / "k.cpp.testconfig.json"
+    config_path.write_text("[1, 2, 3]")
+    with pytest.raises(SystemExit) as excinfo:
+        run_module._load_test_config(kernel)
+    assert "JSON object" in str(excinfo.value)
+
+
+def test_main_forwards_loaded_test_config_to_orchestrator(monkeypatch, tmp_path):
+    """When a sibling testconfig file exists, main() loads it and forwards the parsed dict to run_orchestrator as the `test_config` kwarg; when absent, `test_config` is None."""
+    kernel = tmp_path / "k.cpp"
+    kernel.write_text("// k\n")
+    config_path = tmp_path / "k.cpp.testconfig.json"
+    config_path.write_text('{"N": 4096, "seed": 7}')
+
+    captured = {}
+
+    def fake_orchestrator(path, source, tolerance, auto=False, **kwargs):
+        captured["test_config"] = kwargs.get("test_config")
+        return {"rewritten_code": "X", "notes": "Y"}
+
+    monkeypatch.setattr(run_module, "run_orchestrator", fake_orchestrator)
+
+    monkeypatch.setattr(
+        "sys.argv", ["workflow.run", str(kernel), "--sig-figs", "6"]
+    )
+    assert run_module.main() == 0
+    assert captured["test_config"] == {"N": 4096, "seed": 7}
+
+    # And with the sibling file removed, test_config is None.
+    config_path.unlink()
+    captured.clear()
+    monkeypatch.setattr(
+        "sys.argv", ["workflow.run", str(kernel), "--sig-figs", "6"]
+    )
+    assert run_module.main() == 0
+    assert captured["test_config"] is None

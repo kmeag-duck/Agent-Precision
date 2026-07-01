@@ -1,0 +1,19 @@
+{
+  "_comment": "Test-config for nbody_force.cpp, consumed by the Kokkos baseline_harness agent. Auto-loaded by workflow/run.py when this file sits next to the kernel. Freeform schema — the harness system prompt describes the conventional keys.",
+  "N": 1024,
+  "seed": 42,
+  "scalars": {
+    "G": 1.0,
+    "eps": 0.05,
+    "dt": 0.01
+  },
+  "arrays": {
+    "x":  {"distribution": "uniform", "low": -1.0, "high": 1.0},
+    "y":  {"distribution": "uniform", "low": -1.0, "high": 1.0},
+    "z":  {"distribution": "uniform", "low": -1.0, "high": 1.0},
+    "vx": {"distribution": "uniform", "low": -0.1, "high": 0.1},
+    "vy": {"distribution": "uniform", "low": -0.1, "high": 0.1},
+    "vz": {"distribution": "uniform", "low": -0.1, "high": 0.1},
+    "m":  {"distribution": "uniform", "low":  0.5, "high": 1.5}
+  }
+}

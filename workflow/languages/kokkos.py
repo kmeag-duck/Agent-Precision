@@ -457,21 +457,34 @@ Hard requirements on the driver:
 
        static constexpr int RNG_SEED = 42;
 
-   Use `42` unless the kernel's apparent domain demands otherwise. The
-   declaration line must match this shape exactly (the tokens
-   `static`, `constexpr`, `int`, `RNG_SEED`, `=`, the integer literal,
-   `;`, in that order, separated by single spaces, no trailing
-   comment) so a later probe-pipeline tool can deterministically find
-   and replace the integer literal to re-run the driver at a different
-   seed without touching the kernel body. Every other reference to the
-   seed in the driver (RNG construction, the JSON 'seed' field) MUST
-   read `RNG_SEED` rather than re-typing the integer.
+   Use `42` unless the task message's TEST CONFIG (JSON) block
+   provides an explicit `seed` field (in which case use that
+   integer verbatim) or the kernel's apparent domain demands
+   otherwise. The declaration line must match this shape exactly
+   (the tokens `static`, `constexpr`, `int`, `RNG_SEED`, `=`, the
+   integer literal, `;`, in that order, separated by single spaces,
+   no trailing comment) so a later probe-pipeline tool can
+   deterministically find and replace the integer literal to re-run
+   the driver at a different seed without touching the kernel body.
+   Every other reference to the seed in the driver (RNG
+   construction, the JSON 'seed' field) MUST read `RNG_SEED` rather
+   than re-typing the integer.
 
-4. Choose modest input sizes and distributions appropriate to the
-   kernel from its signature and apparent scientific domain. Aim for a
-   driver that runs in a few seconds, not hours. Typical N is in the
-   1e4 to 1e6 range depending on per-element cost. Document the inputs
-   you chose in inputs_summary.
+4. Input sizes and distributions. If the task message includes a
+   TEST CONFIG (JSON) block, use its values verbatim for the fields
+   it specifies — typically `N` (problem size), scalar parameters
+   (`eps`, `dt`, `alpha`, etc.), and per-array specifications
+   (`distribution`, `low`, `high`, `mean`, `stddev`). Fields not
+   listed in TEST CONFIG remain your call to choose from the
+   kernel's signature and apparent scientific domain. If NO TEST
+   CONFIG block was given, choose all inputs yourself: modest sizes
+   appropriate to the kernel (aim for a driver that runs in a few
+   seconds, not hours; typical N is in the 1e4 to 1e6 range
+   depending on per-element cost). In either case, document the
+   inputs you actually chose in `inputs_summary` — including which
+   values came from TEST CONFIG and which were harness-defaulted —
+   so a downstream operator inspecting the trace can reproduce the
+   run exactly.
 
 5. If the task message names a TARGET KERNEL, call exactly that
    function. Otherwise, infer the kernel function from the source —

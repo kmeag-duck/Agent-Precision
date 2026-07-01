@@ -1359,6 +1359,34 @@ def test_format_baseline_block_cpp_with_kernel_name_includes_target_line():
     assert "TARGET KERNEL: vector_add" in block
 
 
+def test_format_baseline_block_test_config_none_omits_block():
+    """When test_config is None (default), no `TEST CONFIG (JSON):` value-line block appears in the BASELINE STEP portion of the initial user message — the harness reverts to inferring inputs. Note the trailing colon: the boilerplate hint text may reference the phrase 'TEST CONFIG (JSON) block' without a colon, so the emitted block is distinguished by the `TEST CONFIG (JSON):` marker (same idiom as `TARGET KERNEL:`)."""
+    block = _format_baseline_block(
+        "test-kernels/kokkos/mixed/nbody_force.cpp", None, KOKKOS_PROFILE
+    )
+    assert "TEST CONFIG (JSON):" not in block
+
+
+def test_format_baseline_block_test_config_dict_emits_json_block():
+    """When test_config is a non-None dict, the BASELINE STEP block includes a `TEST CONFIG (JSON):` subsection whose payload is the dict rendered as pretty JSON — every key from the input must appear verbatim in the rendered block."""
+    config = {"N": 1024, "seed": 42, "eps": 0.05, "dt": 0.01}
+    block = _format_baseline_block(
+        "test-kernels/kokkos/mixed/nbody_force.cpp",
+        None,
+        KOKKOS_PROFILE,
+        test_config=config,
+    )
+    assert "TEST CONFIG (JSON):" in block
+    # Every top-level key must appear verbatim; json.dumps(..., indent=2)
+    # renders them as `"key":` lines.
+    for key in config:
+        assert f'"{key}"' in block
+    # Value fidelity: an integer and a float from the config must both
+    # be present in the rendered block.
+    assert "1024" in block
+    assert "0.05" in block
+
+
 def test_format_baseline_block_cu_invites_baseline_under_cuda_profile():
     """For a CUDA .cu kernel under CUDA_PROFILE (dynamic_verification=True), the block INVITES spawn_baseline_harness and surfaces the KERNEL STEM and the CUDA driver filename (driver.cu). Phase B inverted the old 'skipped' assertion because CUDA_PROFILE now ships its own baseline harness and is part of the dynamic-verification chain."""
     block = _format_baseline_block(
@@ -1427,6 +1455,44 @@ def test_run_orchestrator_cpp_with_kernel_name_includes_target_kernel_line(
     first_user = fake.messages.calls[0]["messages"][0]["content"]
     assert "TARGET KERNEL: vector_add" in first_user
     assert "KERNEL STEM: vector_add" in first_user
+
+
+def test_run_orchestrator_forwards_test_config_into_first_user_message(
+    monkeypatch, fake_anthropic
+):
+    """When run_orchestrator is called with a non-None test_config dict, its JSON payload appears in the first user message under a `TEST CONFIG (JSON):` block; passing test_config=None (the default) omits the block entirely so the harness reverts to inferring inputs. Note the trailing colon: the boilerplate hint text may reference the phrase 'TEST CONFIG (JSON) block' without a colon, so the emitted block is distinguished by the `TEST CONFIG (JSON):` marker."""
+    # Two independent short-circuit runs: one with a config, one without.
+    fake_with = fake_anthropic([
+        FakeResponse(
+            content=[TextBlock(text="(test stop)")],
+            stop_reason="end_turn",
+        ),
+    ])
+    _scripted_input(monkeypatch, [])
+    run_orchestrator(
+        "path/to/nbody_force.cpp",
+        "src",
+        tolerance=_DEFAULT_TEST_TOLERANCE,
+        test_config={"N": 1024, "seed": 42, "eps": 0.05},
+    )
+    first_user_with = fake_with.messages.calls[0]["messages"][0]["content"]
+    assert "TEST CONFIG (JSON):" in first_user_with
+    assert '"N"' in first_user_with
+    assert "1024" in first_user_with
+    assert '"eps"' in first_user_with
+
+    fake_without = fake_anthropic([
+        FakeResponse(
+            content=[TextBlock(text="(test stop)")],
+            stop_reason="end_turn",
+        ),
+    ])
+    _scripted_input(monkeypatch, [])
+    run_orchestrator(
+        "path/to/nbody_force.cpp", "src", tolerance=_DEFAULT_TEST_TOLERANCE
+    )
+    first_user_without = fake_without.messages.calls[0]["messages"][0]["content"]
+    assert "TEST CONFIG (JSON):" not in first_user_without
 
 
 def test_run_orchestrator_cu_kernel_invites_baseline_in_first_user_message(

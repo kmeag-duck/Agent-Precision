@@ -9,13 +9,54 @@ Tolerance flags (mutually exclusive, exactly one required):
 A run without either flag is rejected by argparse at exit code 2. There
 is no in-workflow fallback: the operator must supply an explicit
 numerical target so batch runs stay comparable across invocations.
+
+Test-config side-channel: if a file named `<kernel_file>.testconfig.json`
+exists next to the kernel source, it is auto-loaded and its parsed JSON
+is threaded into the baseline_harness agent's BASELINE STEP block so the
+harness uses the operator-supplied test parameters (N, seed, eps, dt,
+per-array distribution / ranges, etc.) verbatim instead of inventing
+them. The schema is freeform JSON — the harness system prompt describes
+the conventional keys — but a malformed JSON file is a hard CLI error
+so the operator can't silently drift into "harness-invented" territory.
 """
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
 from .orchestrator import run_orchestrator
+
+
+def _load_test_config(kernel_path: Path) -> dict | None:
+    """Auto-load the sibling `<kernel>.testconfig.json` file, if it exists.
+
+    Returns the parsed dict, or None when no sibling file is present.
+    Raises SystemExit on a JSON parse error, on a non-object top-level
+    value (test-config must be a JSON object, not a list / scalar), or
+    on an IOError reading the file — the operator explicitly opted into
+    a config by dropping the file next to the kernel, so silent fallback
+    to "harness invents inputs" would defeat the whole point.
+    """
+    config_path = kernel_path.with_suffix(kernel_path.suffix + ".testconfig.json")
+    if not config_path.exists():
+        return None
+    try:
+        text = config_path.read_text()
+    except OSError as exc:
+        raise SystemExit(f"Failed to read {config_path}: {exc}")
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise SystemExit(
+            f"Failed to parse {config_path} as JSON: {exc}"
+        )
+    if not isinstance(parsed, dict):
+        raise SystemExit(
+            f"{config_path} must contain a JSON object at the top "
+            f"level (got {type(parsed).__name__})"
+        )
+    return parsed
 
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
@@ -115,6 +156,7 @@ def main(argv: list[str] | None = None) -> int:
 
     kernel_source = args.kernel_file.read_text()
     tolerance = _normalize_tolerance(args)
+    test_config = _load_test_config(args.kernel_file)
 
     result = run_orchestrator(
         str(args.kernel_file),
@@ -122,6 +164,7 @@ def main(argv: list[str] | None = None) -> int:
         tolerance=tolerance,
         auto=args.auto,
         run_probe=not args.no_probe,
+        test_config=test_config,
     )
 
     if result is None:
