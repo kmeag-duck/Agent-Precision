@@ -1943,6 +1943,317 @@ def _splice_singleton_alias(
     return ("\n".join(new_lines) + trailing_newline, None)
 
 
+# Regex that matches a single-line local declaration of the form
+#     [<indent>][const ]<fptype> <name> = <RHS>;
+# inside the kernel body. Used as a fallback splicer for variables
+# that are NOT kernel parameters (locals like `eps2`, `r2`, `inv_r`
+# in nbody-shaped kernels) and therefore have no `using <Name>Type`
+# alias to mutate.
+#
+# Deliberately narrow safe subset (per AGENTS.md's per-variable
+# pipeline section):
+#   - matches only `double` or `float` as the type token (word-
+#     bounded so `long double` is rejected -- \b before/after)
+#   - allows an optional `const ` qualifier before the type
+#   - requires exactly one identifier immediately after the type;
+#     multi-var-per-line (`double a, b, c;`) does not match because
+#     the pattern requires `= <RHS>;` on the same line
+#   - requires an initializer (`= <RHS>`) so pure declarations
+#     (`double x;`) do not match -- those are almost always followed
+#     by an assignment on a later line, which is a semantically
+#     different pattern this splicer is not designed for
+#   - rejects `auto` at the type slot (see AGENTS.md for the
+#     semantic argument -- `auto` mutations are storage-only vs
+#     compute-precision and are semantically incoherent as a
+#     'downcast')
+#   - rejects arrays (`double x[N]`) because the regex requires
+#     `<name> =` immediately with no `[` between
+#   - single-line only (the RHS regex forbids `;` and `\n`, so
+#     multi-line initializers fall through)
+#   - line-anchored with optional leading whitespace, so inline
+#     comments after the semicolon do not confuse it, but a fully-
+#     commented-out declaration (`// double x = ...;`) does not
+#     match because `//` is not `[const ]<fptype>`
+#
+# The captured groups (in order) are:
+#   1. leading whitespace (may be empty)
+#   2. optional `const ` (may be empty)
+#   3. the fp type token (`double` or `float`)
+# The RHS is not captured because the mutation only rewrites the
+# type token, not the initializer.
+_LOCAL_DECL_RE_TEMPLATE = (
+    r"^(\s*)(const\s+)?\b(double|float)\b\s+{var}\s*=\s*[^;\n]+;\s*$"
+)
+
+# Prefix of the error message _splice_singleton_alias returns when
+# the alias line is absent (as opposed to non-unique or RHS-non-
+# downcastable). The dispatcher below uses this prefix to decide
+# whether to fall back to the local-body splicer. This is a
+# stability-critical string -- if you change the error message in
+# _splice_singleton_alias, keep this prefix aligned or the fallback
+# stops firing (and locals silently stop getting tested).
+_ALIAS_NOT_FOUND_ERR_PREFIX = "No `using "
+
+
+def _mutate_local_decl(
+    matched_line: str, target_cxx: str, variable_name: str
+) -> tuple[str | None, str | None]:
+    """Rewrite a matched local declaration line by replacing its fp
+    type token (`double` or `float`) with `target_cxx`, preserving
+    the leading whitespace, the optional `const ` qualifier, the
+    variable name, the initializer, and any trailing whitespace.
+
+    Returns `(new_line, None)` on success or `(None, error_msg)` when
+    the mutation would be a no-op (the type token already equals
+    target_cxx -- the caller should not have asked to downcast this
+    variable, since it is already at the target precision).
+
+    The whole re-parse-and-rebuild sequence is done in this helper
+    rather than as an in-place regex substitution so the leading
+    whitespace, const prefix, and trailing whitespace are all
+    preserved verbatim -- a naive `re.sub(r'\\bdouble\\b', ...)` on
+    the whole line would also touch `double` occurrences inside the
+    RHS (e.g. `double eps2 = (double)eps * eps;`), which would
+    silently change the initializer's computation precision on top
+    of the intended storage change. Confining the mutation to the
+    matched type slot is what makes this a 'storage-only' downcast.
+    """
+    m = re.match(
+        _LOCAL_DECL_RE_TEMPLATE.format(var=re.escape(variable_name)),
+        matched_line,
+    )
+    if m is None:
+        # Defensive: caller should have matched already.
+        return (None, (
+            f"_mutate_local_decl called with a line that does not "
+            f"match the local-decl regex for {variable_name!r}. This "
+            f"is a caller bug; please report."
+        ))
+    indent, const_prefix, old_type = m.group(1), m.group(2) or "", m.group(3)
+    if old_type == target_cxx:
+        return (None, (
+            f"Local declaration of {variable_name!r} already uses "
+            f"type {target_cxx!r}; there is nothing to downcast."
+        ))
+    # Rebuild the line: preserve indent, const-prefix, and everything
+    # after the type token (which lives verbatim in the original
+    # line after the type slot).
+    #
+    # We locate the type token by span and replace only that slice,
+    # so the RHS (which may itself contain `double` casts or
+    # literals) is untouched.
+    type_start, type_end = m.span(3)
+    new_line = matched_line[:type_start] + target_cxx + matched_line[type_end:]
+    del indent, const_prefix  # only needed above for regex clarity
+    return (new_line, None)
+
+
+def _has_top_level_comma(text: str) -> bool:
+    """Return True iff `text` contains a `,` at paren/bracket/brace
+    depth 0. Used by _splice_singleton_local to reject multi-var-
+    per-line declarations after the initial regex match, without
+    also rejecting legitimate initializers whose RHS calls a
+    multi-argument function (e.g. `pow(x, 2.0)`) or references a
+    braced initializer list. Character-level scan is sufficient for
+    the safe subset -- we do not attempt to parse comments or string
+    literals because the harness contract forbids them on a decl
+    line inside the kernel body.
+    """
+    depth = 0
+    for ch in text:
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            if depth > 0:
+                depth -= 1
+        elif ch == "," and depth == 0:
+            return True
+    return False
+
+
+def _splice_singleton_local(
+    driver_text: str,
+    profile: LanguageProfile,
+    variable_name: str,
+    target_cxx: str,
+) -> tuple[str | None, str | None]:
+    """Rewrite the unique local declaration line
+        `[const ]<fptype> <variable_name> = <RHS>;`
+    inside the kernel sentinels of `driver_text`, retargeting its
+    type token from `double`/`float` to `target_cxx`.
+
+    Mirror of `_splice_singleton_alias` for kernel LOCAL variables
+    (non-parameters). Returns `(new_source, None)` on success or
+    `(None, error_msg)` on any contract violation (missing
+    sentinels, wrong ordering, local decl absent, local decl non-
+    unique, decl outside the safe subset). All error paths carry a
+    message that names the specific violation so the caller (and,
+    transitively, the orchestrator) can retry with a different
+    variable / target / fallback to `keep`.
+
+    The mutation is scoped strictly BETWEEN the sentinel lines, same
+    as `_splice_singleton_alias` -- locals live in the kernel body,
+    which is entirely inside the sentinels. Unlike a parameter
+    downcast (which requires the alias contract because main()
+    outside the sentinels constructs the parameter), a local
+    downcast can be applied entirely inside the sentinels without
+    any main()-side ripple.
+
+    v0 scope: single-line `[const ] <double|float> <name> = <RHS>;`
+    declarations. `auto` locals, arrays, multi-var-per-line
+    declarations, and pure declarations without initializers all
+    return `(None, "no declaration line found")` and get demoted to
+    `keep` by the orchestrator. See AGENTS.md for the semantic
+    argument -- `auto` in particular is intentionally out of scope
+    because a storage-only downcast on an `auto` is semantically
+    incoherent (the type is deduced from the initializer, so
+    changing storage alone means the RHS is computed at one
+    precision and rounded to another at exactly the assignment
+    point, which is not what the analyst usually means by
+    'downcast').
+    """
+    lines = driver_text.splitlines()
+
+    begin_idx = _find_unique_sentinel_line(lines, profile.sentinel_begin)
+    if begin_idx is None:
+        return (None, (
+            f"Baseline driver does not contain exactly one "
+            f"{profile.sentinel_begin!r} line on its own (no "
+            f"surrounding indentation or whitespace)."
+        ))
+    end_idx = _find_unique_sentinel_line(lines, profile.sentinel_end)
+    if end_idx is None:
+        return (None, (
+            f"Baseline driver does not contain exactly one "
+            f"{profile.sentinel_end!r} line on its own (no "
+            f"surrounding indentation or whitespace)."
+        ))
+    if begin_idx >= end_idx:
+        return (None, (
+            f"Baseline driver has {profile.sentinel_end!r} at or before "
+            f"{profile.sentinel_begin!r} (line {end_idx + 1} vs line "
+            f"{begin_idx + 1}); cannot splice."
+        ))
+
+    # Search ONLY the region strictly between the sentinels.
+    kernel_region_start = begin_idx + 1
+    kernel_region_end = end_idx  # exclusive
+    kernel_region_lines = lines[kernel_region_start:kernel_region_end]
+
+    pattern = re.compile(
+        _LOCAL_DECL_RE_TEMPLATE.format(var=re.escape(variable_name))
+    )
+    matches: list[tuple[int, str]] = []
+    for offset, line in enumerate(kernel_region_lines):
+        if pattern.match(line) is None:
+            continue
+        # Post-filter: reject multi-variable-per-line declarations like
+        # `double a = 0.0, b = 0.0;` where the RHS regex greedily
+        # consumes across a comma. We can't ban `,` outright in the
+        # RHS because legitimate initializers may contain function
+        # calls with multiple arguments (e.g. `pow(x, 2.0)`), so we
+        # count top-level commas -- ones that appear at paren depth
+        # 0. Any top-level comma means the "decl" is actually a
+        # multi-var decl and belongs to the safe-subset reject list.
+        rhs = line.split("=", 1)[1]
+        if _has_top_level_comma(rhs):
+            continue
+        matches.append((offset, line))
+    if not matches:
+        return (None, (
+            f"No `[const] <double|float> {variable_name} = <RHS>;` "
+            f"local declaration line found between the kernel sentinels. "
+            f"Either the variable is not a local in this kernel, its "
+            f"declaration is outside the safe subset the singleton "
+            f"splicer supports (auto-typed, multi-variable-per-line, "
+            f"array-typed, or split across multiple lines), or it is "
+            f"actually a kernel parameter -- parameters use the "
+            f"`using <Name>Type = ...;` alias contract instead, see the "
+            f"precision-alias contract in the harness prompt."
+        ))
+    if len(matches) > 1:
+        return (None, (
+            f"Found {len(matches)} `[const] <double|float> "
+            f"{variable_name} = <RHS>;` local declaration lines between "
+            f"the kernel sentinels; the singleton splice requires "
+            f"exactly one so the mutation is unambiguous. Shadowing a "
+            f"local across scopes inside the same kernel is unusual "
+            f"enough that the tool refuses to guess which one to "
+            f"downcast."
+        ))
+    line_offset, matched_line = matches[0]
+
+    new_line, err = _mutate_local_decl(matched_line, target_cxx, variable_name)
+    if err is not None:
+        return (None, err)
+    absolute_line_idx = kernel_region_start + line_offset
+    new_lines = list(lines)
+    new_lines[absolute_line_idx] = new_line
+
+    trailing_newline = "\n" if driver_text.endswith("\n") else ""
+    return ("\n".join(new_lines) + trailing_newline, None)
+
+
+def _splice_singleton_variable(
+    driver_text: str,
+    profile: LanguageProfile,
+    variable_name: str,
+    target_cxx: str,
+) -> tuple[str | None, str | None]:
+    """Dispatch wrapper that tries the alias splicer first and, on
+    a specifically alias-not-found error, falls through to the
+    local-body splicer.
+
+    Returns `(new_source, None)` on success or `(None, error_msg)`
+    on failure. The error message names both attempts so the
+    orchestrator (and human operator reading the trace) can tell
+    the variable was tried as a parameter AND as a local before
+    the tool gave up.
+
+    Fallback trigger is specifically the "alias line absent" error
+    from `_splice_singleton_alias`. Other alias errors (multi-match,
+    RHS-not-downcastable, sentinel violations) are NOT fallback
+    triggers -- those are real contract violations on the parameter
+    path and would still be violations on the local path (same
+    sentinels; a variable that has 2 alias lines but also matches
+    a local decl is a harness bug, not a legitimate 'try locals').
+    The rationale: only 'alias absent' is the neutral signal that
+    'this variable is not a parameter, maybe it's a local'; every
+    other alias error means 'this variable IS a parameter, but
+    something is wrong with its alias'.
+
+    This wrapper is the ONE call site both test_variable_downcast
+    and _splice_union_aliases use; adding a third splicer in the
+    future (e.g. for return types or template parameters) is a
+    one-branch extension here plus a new `_splice_singleton_<kind>`
+    helper.
+    """
+    alias_result, alias_err = _splice_singleton_alias(
+        driver_text, profile, variable_name, target_cxx
+    )
+    if alias_err is None:
+        return (alias_result, None)
+    # Only fall through on the specific 'alias line absent' error.
+    # See _ALIAS_NOT_FOUND_ERR_PREFIX for the coupling to the
+    # error-message text produced by _splice_singleton_alias.
+    if not alias_err.startswith(_ALIAS_NOT_FOUND_ERR_PREFIX):
+        return (None, alias_err)
+
+    local_result, local_err = _splice_singleton_local(
+        driver_text, profile, variable_name, target_cxx
+    )
+    if local_err is None:
+        return (local_result, None)
+    # Both attempts failed. Return a combined message so the trace
+    # and stderr show what was tried and why each failed.
+    return (None, (
+        f"variable {variable_name!r} matched neither the parameter "
+        f"nor the local-declaration splicer. "
+        f"Parameter attempt: {alias_err} "
+        f"Local attempt: {local_err}"
+    ))
+
+
 def _compare_singleton_vs_oracle(
     oracle_path: Path,
     candidate_path: Path,
@@ -2128,7 +2439,7 @@ def test_variable_downcast(
             f"Failed to read {baseline_driver_path}: {exc}"
         )
 
-    new_source, err = _splice_singleton_alias(
+    new_source, err = _splice_singleton_variable(
         baseline_text, profile, variable_name, target_cxx
     )
     if err is not None:
@@ -2262,21 +2573,25 @@ def _splice_union_aliases(
     variable_names: list[str],
     target_cxxs: list[str],
 ) -> tuple[str | None, str | None]:
-    """Apply N single-alias splices to `driver_text` in sequence.
+    """Apply N single-variable splices to `driver_text` in sequence.
 
     Each (variable_name, target_cxx) pair is passed through
-    `_splice_singleton_alias` in list order, using the result of
-    iteration i as the input to iteration i+1. This composes
-    trivially because each alias line is edited in place (its
-    position in the file does not shift) and the splicer's
-    scope-check finds sentinels by position, not by pattern.
+    `_splice_singleton_variable` in list order (which dispatches
+    between the parameter/alias splicer and the local-decl
+    splicer), using the result of iteration i as the input to
+    iteration i+1. This composes trivially because BOTH underlying
+    splicers edit a single line in place (positions do not shift
+    and the sentinels are found by position, not by pattern), and
+    each per-variable regex is name-specific so mutating variable
+    A never invalidates the match for variable B.
 
     Returns `(new_source, None)` on success or `(None, error_msg)`
     on the first splice failure. The error message names the
     offending variable and forwards the underlying splice error
-    verbatim, so the caller (and, transitively, the orchestrator)
-    can tell exactly which of the N variables the union is stuck
-    on.
+    verbatim (which itself names both the parameter and local
+    attempts when the dispatcher fell through), so the caller
+    (and, transitively, the orchestrator) can tell exactly which
+    of the N variables the union is stuck on and why.
     """
     if len(variable_names) != len(target_cxxs):
         return (None, (
@@ -2286,7 +2601,7 @@ def _splice_union_aliases(
         ))
     current = driver_text
     for name, cxx in zip(variable_names, target_cxxs):
-        new_source, err = _splice_singleton_alias(
+        new_source, err = _splice_singleton_variable(
             current, profile, name, cxx
         )
         if err is not None:

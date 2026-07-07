@@ -232,10 +232,24 @@ You also have two deterministic (non-LLM) tools:
 
   - test_variable_downcast: takes a kernel_stem, a variable_name, a
     target_precision, and a tolerance_json. Mutates the baseline driver
-    at baselines/<kernel_stem>/<profile driver filename> so only the
-    'using <variable_name>Type = ...;' alias line inside the kernel
-    sentinels is retargeted to `target_precision`, writes the mutated
-    driver under baselines/<kernel_stem>/varprobe/singleton_<variable_name>/,
+    at baselines/<kernel_stem>/<profile driver filename> so a single
+    variable's type is retargeted to `target_precision` inside the
+    kernel sentinels; the tool tries two mutation strategies and uses
+    the first that matches. Strategy 1 (kernel parameters): rewrites
+    the 'using <variable_name>Type = ...;' alias line — this is the
+    happy path for View parameters and scalar parameters emitted by
+    the baseline_harness. Strategy 2 (simple local declarations): if
+    no matching alias exists, rewrites the unique local declaration
+    line of the form `[const ]<double|float> <variable_name> = <RHS>;`
+    inside the kernel sentinels — this covers common intermediates
+    like `inv_r`, `eps2`, `ax` in nbody-shaped kernels that the
+    harness does NOT emit aliases for because they are not kernel
+    parameters. The safe-subset for strategy 2 excludes `auto`,
+    arrays, multi-variable-per-line decls, no-initializer decls, and
+    `long double`; a variable that fits neither strategy returns
+    status='error' with a combined message naming both attempts.
+    Writes the mutated driver under
+    baselines/<kernel_stem>/varprobe/singleton_<variable_name>/,
     compiles and runs it, and compares its reference.json against the
     canonical oracle at baselines/<kernel_stem>/reference.json under
     the supplied tolerance. Returns {status, stdout, stderr, artifacts}.

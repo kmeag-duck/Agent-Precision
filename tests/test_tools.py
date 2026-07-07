@@ -5382,3 +5382,397 @@ def test_bisect_variable_downcast_summary_json_shape(monkeypatch, tmp_path):
     assert isinstance(summary["dropped"], list)
     assert isinstance(summary["iterations"], int)
     assert isinstance(summary["union_stdout_last"], str)
+
+
+# ---------- local-declaration splicer (Step 3 fallback) ----------
+#
+# The alias-based singleton splicer only matches kernel PARAMETERS
+# (the harness emits `using <ParamName>Type = ...;` aliases for
+# those). Kernel LOCALS (e.g. `const double inv_r = ...;` inside a
+# for-loop body) have no alias line and would otherwise be
+# uneconomically demoted to `keep`. The local-decl splicer + the
+# _splice_singleton_variable dispatcher extend empirical singleton
+# testing to the safe subset of local declarations. See AGENTS.md's
+# "The per-variable analyst pipeline" section for the safe-subset
+# contract these tests pin.
+#
+# Regex-only tests use _LOCAL_DECL_RE_TEMPLATE directly to keep
+# fast unit coverage on the accept/reject cases; splicer- and
+# dispatcher-level tests pin the composed behavior; the last
+# end-to-end test exercises the whole tool via
+# test_variable_downcast on a driver whose target variable is a
+# local, proving the fallback wires through without touching the
+# tool's contract shape.
+
+import re as _re  # local import so we don't disturb the earlier import ordering
+
+
+def _local_decl_pattern(var_name):
+    """Compile the local-decl regex template for `var_name`."""
+    return _re.compile(
+        tools._LOCAL_DECL_RE_TEMPLATE.format(var=_re.escape(var_name))
+    )
+
+
+def test_local_decl_regex_accepts_plain_double_initializer():
+    """The safe-subset regex accepts a plain `double <name> = <RHS>;` line with no leading whitespace. This is the minimal accept case and pins the base grammar. Failing this would mean the regex is fundamentally miscompiled."""
+    pat = _local_decl_pattern("inv_r")
+    m = pat.match("double inv_r = 1.0 / sqrt(r2);")
+    assert m is not None
+    assert m.group(3) == "double"
+
+
+def test_local_decl_regex_accepts_const_double_with_indent():
+    """The regex tolerates the two most common cosmetic variations that appear inside real Kokkos kernel bodies: leading indentation (kernel bodies are always inside a `parallel_for` lambda, so 4-8 spaces of indent is typical) and a `const` qualifier. Both must pass so real-world kernels are actually reachable, not just synthetic no-indent examples."""
+    pat = _local_decl_pattern("eps2")
+    m = pat.match("    const double eps2 = eps * eps;")
+    assert m is not None
+    assert m.group(2).strip() == "const"
+    assert m.group(3) == "double"
+
+
+def test_local_decl_regex_accepts_float_type_token():
+    """The regex accepts `float` as the type token (in addition to `double`). This is required for the union splicer: if an earlier iteration of _splice_union_aliases has already mutated a local to `float`, the second iteration (mutating a DIFFERENT variable) must not choke when it walks past the already-mutated line. It also supports the case where the harness emits a `float` local by design."""
+    pat = _local_decl_pattern("x")
+    m = pat.match("float x = 0.5f;")
+    assert m is not None
+    assert m.group(3) == "float"
+
+
+def test_local_decl_regex_rejects_auto():
+    """`auto` locals are OUT OF SCOPE for singleton downcasting (see the semantic argument in AGENTS.md). A storage-only downcast on an `auto` variable is incoherent because the storage type is deduced from the initializer's precision; changing storage without also casting the RHS produces a value that is computed at one precision and rounded to another at exactly the assignment point, which is not what the analyst usually means by 'downcast'. The regex must reject `auto` so the tool cleanly errors and the orchestrator demotes to `keep`."""
+    pat = _local_decl_pattern("v")
+    assert pat.match("auto v = a + b;") is None
+    assert pat.match("const auto v = a + b;") is None
+
+
+def test_local_decl_regex_rejects_arrays():
+    """Array declarations (`double x[4] = {...}`) are OUT OF SCOPE. The regex requires `<name> =` with no `[` between name and `=`. Even if we could rewrite the type, per-element downcast semantics for a fixed-size array is a different feature from scalar downcast and would need its own test coverage."""
+    pat = _local_decl_pattern("x")
+    assert pat.match("double x[4] = {0.0, 0.0, 0.0, 0.0};") is None
+
+
+def test_local_decl_regex_rejects_multi_variable_declarations_without_initializer():
+    """Multi-variable-per-line declarations WITHOUT initializers (`double a, b, c;`) are rejected at the REGEX level: the pattern requires `\\s*=\\s*<RHS>;` immediately after the variable name, so a `,` (not `=`) after `a` fails the match. Multi-variable declarations WITH initializers (`double a = 0.0, b = 0.0;`) require a second-stage filter (see `test_splice_singleton_local_rejects_multi_variable_with_initializers` below) because the RHS regex `[^;\\n]+` intentionally allows commas so legitimate initializers like `pow(x, 2.0)` still match. This split (regex catches the easy case, splicer catches the hard case) keeps the regex simple and the RHS-comma discrimination in one place."""
+    pat = _local_decl_pattern("a")
+    assert pat.match("double a, b, c;") is None
+    assert pat.match("const double a, b, c;") is None
+
+
+def test_local_decl_regex_rejects_pure_declaration_without_initializer():
+    """`double x;` (no initializer) is OUT OF SCOPE. Almost every real kernel pattern that uses this form is followed by an assignment on a later line, which is a semantically different pattern the singleton splicer is not designed for. The regex requires `= <RHS>` before the semicolon."""
+    pat = _local_decl_pattern("x")
+    assert pat.match("double x;") is None
+
+
+def test_local_decl_regex_rejects_commented_out_declaration():
+    """A fully commented-out declaration (`// double x = ...;`) must not match. The regex is line-anchored with only optional leading whitespace before the (optional `const `) type token, so `//` characters do not satisfy the type-slot requirement. This protects against a plausible false positive on kernels where a debugging line was left commented in the source."""
+    pat = _local_decl_pattern("x")
+    assert pat.match("// double x = 1.0;") is None
+    assert pat.match("    // double x = 1.0;") is None
+
+
+def test_local_decl_regex_rejects_alias_line():
+    """The alias-contract line `using xType = double;` must NOT be matched by the local-decl regex. The two splicers have DISJOINT domains — the dispatcher first tries the alias splicer, and only falls through to the local splicer when the alias is genuinely absent. If the local regex matched alias lines, a request to downcast a parameter with a valid alias would double-match (alias mutates the RHS; local would want to mutate the alias line as if it were a decl) and confuse the union splicer that walks post-mutation text. The regex requires the type token IMMEDIATELY before the variable name (`double x = ...`), so `using xType = double;` fails at the very first token."""
+    pat = _local_decl_pattern("x")
+    assert pat.match("using xType = double;") is None
+
+
+def test_local_decl_regex_rejects_long_double():
+    """`long double` is a different C++ type from `double` and is not a valid downcast source (there is no smaller-than-`float` target in the v0 support set to justify mutating it). The regex uses word boundaries around `double`, so `long double x = 1.0;` should not match at the `double` slot — the preceding `long ` breaks the leading-whitespace-or-const-only pattern. This protects against silently rewriting `long double` locals to `float` and changing kernel numerics unexpectedly."""
+    pat = _local_decl_pattern("x")
+    assert pat.match("long double x = 1.0;") is None
+
+
+def test_mutate_local_decl_replaces_only_type_token():
+    """_mutate_local_decl mutates ONLY the type-slot token, leaving the leading indent, optional `const`, variable name, initializer, and any trailing whitespace verbatim. This is the load-bearing property that makes the local splicer 'storage-only': the RHS may itself contain the token `double` (e.g. `(double)eps * eps` or `1.0 / (double)N`), and mutating those would silently change the initializer's computation precision on top of the intended storage change. Fix the mutation to the matched span so RHS-side `double` occurrences are untouched."""
+    old = "    const double eps2 = (double)eps * eps;"
+    new_line, err = tools._mutate_local_decl(old, "float", "eps2")
+    assert err is None
+    # Type slot became float; RHS `(double)` is preserved verbatim.
+    assert new_line == "    const float eps2 = (double)eps * eps;"
+
+
+def test_mutate_local_decl_rejects_noop_mutation():
+    """A request to downcast a local that is ALREADY at the target precision (e.g. `float x = 0.5f;` -> float) returns an error rather than silently succeeding. Rationale: a no-op success would deceive the orchestrator into thinking the variable had been downcast, and the empirical driver would pass by definition (identical bits), producing a false-positive singleton VERDICT: pass that the union step would then propagate. Erroring here forces the orchestrator to notice and either pick a different target or demote to `keep`."""
+    old = "float x = 0.5f;"
+    new_line, err = tools._mutate_local_decl(old, "float", "x")
+    assert new_line is None
+    assert err is not None
+    assert "already" in err.lower()
+
+
+def test_splice_singleton_local_happy_path_mutates_unique_local():
+    """_splice_singleton_local finds the unique matching local decl inside the kernel sentinels and rewrites its type token, leaving everything outside the sentinels (and other lines inside the sentinels) byte-for-byte unchanged. This is the local-side analogue of the existing alias splicer's happy-path guarantee."""
+    src = f"""\
+int main() {{
+{KERNEL_BEGIN_SENTINEL}
+using aType = Kokkos::View<double*>;
+void run(aType a) {{
+  double inv_r = 1.0 / a(0);
+  (void)inv_r;
+}}
+{KERNEL_END_SENTINEL}
+  double outside = 1.0;
+  (void)outside;
+  return 0;
+}}
+"""
+    from workflow.languages import kokkos as kokkos_profile
+    new_src, err = tools._splice_singleton_local(
+        src, kokkos_profile.KOKKOS_PROFILE, "inv_r", "float"
+    )
+    assert err is None, err
+    assert "float inv_r = 1.0 / a(0);" in new_src
+    # Alias line untouched.
+    assert "using aType = Kokkos::View<double*>;" in new_src
+    # Line outside the sentinels untouched.
+    assert "double outside = 1.0;" in new_src
+
+
+def test_splice_singleton_local_rejects_multi_variable_with_initializers():
+    """Multi-variable-per-line declarations WITH initializers (`double a = 0.0, b = 0.0;`) are the case the regex CANNOT reject on its own: the RHS slot `[^;\\n]+` is deliberately permissive so legitimate initializers like `pow(x, 2.0)` still match. The splicer's `_has_top_level_comma` post-filter is what catches this shape, by scanning the RHS for a `,` at paren depth 0. This test pins that behavior: a decl of the multi-var-with-init shape must produce an 'absent' error (as if no matching decl were found), not a silent partial mutation of just the first variable's type token."""
+    src = f"""\
+int main() {{
+{KERNEL_BEGIN_SENTINEL}
+void run() {{
+  double a = 0.0, b = 0.0;
+  (void)a; (void)b;
+}}
+{KERNEL_END_SENTINEL}
+  return 0;
+}}
+"""
+    from workflow.languages import kokkos as kokkos_profile
+    new_src, err = tools._splice_singleton_local(
+        src, kokkos_profile.KOKKOS_PROFILE, "a", "float"
+    )
+    assert new_src is None
+    assert err is not None
+    assert "a" in err
+
+
+def test_has_top_level_comma_helper_distinguishes_multi_var_from_function_call():
+    """`_has_top_level_comma` is the discrimination point between 'multi-var decl' (top-level `,`) and 'single-var decl whose initializer happens to contain a comma inside parens/brackets/braces' (function call, subscript with comma operator, brace-init list). This test locks the helper's semantics directly so future edits to `_splice_singleton_local` can rely on the shape."""
+    # top-level commas -> True
+    assert tools._has_top_level_comma("0.0, b = 0.0") is True
+    assert tools._has_top_level_comma("a, b, c") is True
+    # commas nested inside () / [] / {} -> False
+    assert tools._has_top_level_comma("pow(x, 2.0)") is False
+    assert tools._has_top_level_comma("arr[i, j]") is False
+    assert tools._has_top_level_comma("{1, 2, 3}") is False
+    # nested inside nested parens still False
+    assert tools._has_top_level_comma("max(pow(x, 2.0), y)") is False
+    # empty and no-comma are False
+    assert tools._has_top_level_comma("") is False
+    assert tools._has_top_level_comma("sqrt(x)") is False
+
+
+def test_splice_singleton_local_errors_when_decl_absent():
+    """If no matching local decl exists between the sentinels for the requested variable, the splicer returns an error whose message names the variable and explains the safe-subset restriction. This is the signal the dispatcher uses to combine with the alias-attempt error into a "matched neither" message; the human operator reading a trace should be able to tell WHY the fallback also failed (variable not present, or present but outside the safe subset)."""
+    src = f"""\
+int main() {{
+{KERNEL_BEGIN_SENTINEL}
+void run() {{
+  double other = 1.0;
+  (void)other;
+}}
+{KERNEL_END_SENTINEL}
+  return 0;
+}}
+"""
+    from workflow.languages import kokkos as kokkos_profile
+    new_src, err = tools._splice_singleton_local(
+        src, kokkos_profile.KOKKOS_PROFILE, "missing", "float"
+    )
+    assert new_src is None
+    assert err is not None
+    assert "missing" in err
+
+
+def test_splice_singleton_local_errors_when_decl_duplicated():
+    """If two matching local decls exist between the sentinels for the same variable name (shadowing across nested scopes inside the same kernel), the splicer refuses rather than picking one non-deterministically. Rationale mirrors the alias splicer: shadowing is unusual, ambiguous, and the tool should force the orchestrator to notice rather than silently pick 'the first one' or 'the last one'."""
+    src = f"""\
+int main() {{
+{KERNEL_BEGIN_SENTINEL}
+void run() {{
+  double s = 1.0;
+  {{
+    double s = 2.0;
+    (void)s;
+  }}
+  (void)s;
+}}
+{KERNEL_END_SENTINEL}
+  return 0;
+}}
+"""
+    from workflow.languages import kokkos as kokkos_profile
+    new_src, err = tools._splice_singleton_local(
+        src, kokkos_profile.KOKKOS_PROFILE, "s", "float"
+    )
+    assert new_src is None
+    assert err is not None
+    assert "2" in err
+
+
+def test_splice_singleton_local_ignores_matching_decl_outside_sentinels():
+    """A `double x = ...;` line OUTSIDE the sentinels must not be considered. The kernel sentinels define the splice scope; text outside them (e.g. main()'s own locals used for kernel-argument construction) is intentionally out of reach. If this test regressed, mutating a variable's local decl in the kernel could accidentally also rewrite an identically-named `main()` local, breaking the caller code."""
+    src = f"""\
+int main() {{
+  double x = 1.0;  // this is OUTSIDE the sentinels; must not be touched
+{KERNEL_BEGIN_SENTINEL}
+void run() {{
+  (void)0;
+}}
+{KERNEL_END_SENTINEL}
+  (void)x;
+  return 0;
+}}
+"""
+    from workflow.languages import kokkos as kokkos_profile
+    new_src, err = tools._splice_singleton_local(
+        src, kokkos_profile.KOKKOS_PROFILE, "x", "float"
+    )
+    # No decl inside sentinels -> error, and the outside line stays double.
+    assert new_src is None
+    assert err is not None
+
+
+def test_splice_singleton_variable_dispatches_to_alias_first():
+    """The dispatcher prefers the alias splicer when an alias for the variable exists. This preserves the existing parameter-downcast behavior byte-for-byte and confirms the fallback only activates when the alias splicer specifically returns 'alias line absent'. If dispatch order were swapped, a parameter that happens to also have a same-named local (rare but possible when the local shadows the parameter for clarity) would get the wrong splice."""
+    src = f"""\
+int main() {{
+{KERNEL_BEGIN_SENTINEL}
+using xType = double;
+void run(xType x) {{
+  (void)x;
+}}
+{KERNEL_END_SENTINEL}
+  return 0;
+}}
+"""
+    from workflow.languages import kokkos as kokkos_profile
+    new_src, err = tools._splice_singleton_variable(
+        src, kokkos_profile.KOKKOS_PROFILE, "x", "float"
+    )
+    assert err is None, err
+    # Alias mutation happened (RHS became float); no local-decl edit needed.
+    assert "using xType = float;" in new_src
+
+
+def test_splice_singleton_variable_falls_through_on_alias_absent():
+    """When the alias splicer returns specifically the 'alias line absent' error, the dispatcher falls through to the local splicer and mutates the local decl. This is the whole point of the fallback: locals like `inv_r`, `eps2`, `ax`, `ay`, `az` in nbody-shaped kernels can now be singleton-tested empirically instead of getting rubber-stamped as `keep`."""
+    src = f"""\
+int main() {{
+{KERNEL_BEGIN_SENTINEL}
+using aType = Kokkos::View<double*>;
+void run(aType a) {{
+  double inv_r = 1.0 / a(0);
+  (void)inv_r;
+}}
+{KERNEL_END_SENTINEL}
+  return 0;
+}}
+"""
+    from workflow.languages import kokkos as kokkos_profile
+    new_src, err = tools._splice_singleton_variable(
+        src, kokkos_profile.KOKKOS_PROFILE, "inv_r", "float"
+    )
+    assert err is None, err
+    assert "float inv_r = 1.0 / a(0);" in new_src
+
+
+def test_splice_singleton_variable_does_not_fall_through_on_non_absent_alias_error():
+    """When the alias splicer returns a NON-absent error (e.g. duplicate alias, or RHS-not-downcastable), the dispatcher does NOT fall through — the variable IS a parameter and something is wrong with its alias contract, so masking that with a local-body edit would hide a real harness bug. The combined error message should propagate the alias error verbatim without a 'Local attempt:' suffix, so the operator sees the actual parameter-side problem."""
+    src = f"""\
+int main() {{
+{KERNEL_BEGIN_SENTINEL}
+using xType = Kokkos::View<float*>;
+void run(xType x) {{
+  (void)x;
+}}
+{KERNEL_END_SENTINEL}
+  return 0;
+}}
+"""
+    from workflow.languages import kokkos as kokkos_profile
+    new_src, err = tools._splice_singleton_variable(
+        src, kokkos_profile.KOKKOS_PROFILE, "x", "float"
+    )
+    assert new_src is None
+    assert err is not None
+    # Error mentions `double` (the RHS-has-no-double alias error), and does
+    # NOT mention "Local attempt:" — i.e. we did not fall through.
+    assert "double" in err
+    assert "Local attempt" not in err
+
+
+def test_splice_singleton_variable_combined_error_when_neither_matches():
+    """When BOTH the alias attempt (absent) AND the local attempt fail, the dispatcher returns a single combined error naming both attempts and their respective failure reasons. This is the signal the orchestrator surfaces to the LLM: 'we tried the variable both ways and neither worked, demote to keep'. The message must name both attempts so an operator can distinguish 'not a parameter and not a local' from 'not a parameter and its local decl is outside the safe subset (auto/array/multi-decl)'."""
+    src = f"""\
+int main() {{
+{KERNEL_BEGIN_SENTINEL}
+void run() {{
+  auto v = 1.0;
+  (void)v;
+}}
+{KERNEL_END_SENTINEL}
+  return 0;
+}}
+"""
+    from workflow.languages import kokkos as kokkos_profile
+    new_src, err = tools._splice_singleton_variable(
+        src, kokkos_profile.KOKKOS_PROFILE, "v", "float"
+    )
+    assert new_src is None
+    assert err is not None
+    assert "Parameter attempt" in err
+    assert "Local attempt" in err
+
+
+def test_variable_downcast_end_to_end_on_local_variable(monkeypatch, tmp_path):
+    """End-to-end: test_variable_downcast on a variable that is a LOCAL (not a kernel parameter) walks through the dispatcher, hits the local splicer, produces a mutated driver at baselines/<stem>/varprobe/singleton_<var>/driver.cpp with `float` in the local decl slot, and returns status='ok' with a VERDICT line — same contract as the alias-based happy path. This is the load-bearing integration test: if any of the four call-site changes regressed (dispatcher wiring, test_variable_downcast switch, _splice_union_aliases switch, error-message text coupling), this test fails."""
+    monkeypatch.chdir(tmp_path)
+
+    # Custom driver source with a LOCAL `double inv_r = ...;` inside the
+    # sentinels and no alias for `inv_r` (there IS an alias for `a`, which
+    # is a real kernel parameter, but that's irrelevant to this test).
+    src = f"""\
+#include <Kokkos_Core.hpp>
+#include <fstream>
+
+int main() {{
+  Kokkos::initialize();
+{KERNEL_BEGIN_SENTINEL}
+using aType = Kokkos::View<double*>;
+void run(aType a) {{
+  double inv_r = 1.0 / a(0);
+  (void)inv_r;
+}}
+{KERNEL_END_SENTINEL}
+  std::ofstream("reference.json") << "{{}}";
+  Kokkos::finalize();
+  return 0;
+}}
+"""
+    oracle = {"kernel": "k", "seed": 42, "inputs": {}, "outputs": {"y": [1.0]}}
+    _stage_baseline_for_singleton(
+        tmp_path, "k", oracle_payload=oracle, driver_source=src
+    )
+    _install_fake_compile_and_run(
+        monkeypatch, tmp_path, candidate_payload=oracle
+    )
+
+    result = tools.test_variable_downcast(
+        "k", "inv_r", "float", _TOL_SIG_FIGS_3, "kokkos"
+    )
+
+    assert result["status"] == "ok", result["stderr"]
+    singleton_src = (
+        tmp_path / "baselines" / "k" / "varprobe" / "singleton_inv_r"
+        / "driver.cpp"
+    ).read_text()
+    # The LOCAL was mutated, and the alias (a real parameter) was NOT touched.
+    assert "float inv_r = 1.0 / a(0);" in singleton_src
+    assert "using aType = Kokkos::View<double*>;" in singleton_src
