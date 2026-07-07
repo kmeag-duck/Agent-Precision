@@ -134,7 +134,49 @@ class, not every possible retry path. The full rules:
 
 ## The per-variable analyst pipeline (step 6)
 
-Step 6 collapses a six-stage subgraph. In order:
+Step 6 collapses a six-stage subgraph — three LLM agents and three
+deterministic tools, interleaved so every LLM verdict on a downcast
+candidate is empirically gated against the compiled driver before
+the finalizer synthesizes the full `ANALYST_OUTPUT_SCHEMA` object
+the rewriter and verifier consume.
+
+```mermaid
+flowchart TD
+  IN["from step 5 (probe_compare)<br/>or step 3 (run_baseline_driver on non-Kokkos)<br/>· probe evidence.json auto-attached below"]
+  OUT["to step 7 (spawn_rewriter)"]
+
+  IN ==> P1
+
+  subgraph PVA ["Per-variable analyst pipeline"]
+    direction TB
+
+    P1["<b>6.1 spawn_candidate_finder</b><br/>1 LLM call<br/>→ variables[{name, downcast_candidate,<br/>rank, rationale}], overall_notes"]:::agent
+    P2["<b>6.2 spawn_variable_analyst ×N</b><br/><i>N = number of downcast_candidate=true entries<br/>in finder rank order; non-candidates skip this call</i><br/>→ {variable{name, action, target_precision,<br/>emulation_type, reason}, notes}"]:::agent
+    P3["<b>6.3 test_variable_downcast ×N</b><br/><i>once per per-variable action='downcast' verdict;<br/>splice singleton + compile + run + diff vs oracle</i><br/>→ VERDICT: pass or VERDICT: fail per candidate<br/>(failures demoted to 'keep' in finalizer input)"]:::det
+    P4["<b>6.4 test_variable_union_downcast</b><br/><i>1 call; splices ALL step-6.3-passing variables<br/>simultaneously and diffs (catches interactions)</i>"]:::det
+    P5["<b>6.5 bisect_variable_downcast</b><br/><i>only on 6.4 failure; drops candidates in<br/>finder rank order until subset passes<br/>(empty subset = valid outcome, status='ok')</i>"]:::det
+    P6["<b>6.6 spawn_analyst_finalizer</b><br/>1 LLM call · synthesis-only<br/><i>orchestrator hands it ASSEMBLED VERDICT (JSON);<br/>finalizer echoes per-variable name/action/<br/>target_precision/emulation_type verbatim,<br/>adds precision_budget + rework + overall_notes</i><br/>→ ANALYST_OUTPUT_SCHEMA"]:::agent
+
+    P1 ==> P2;
+    P2 ==> P3;
+    P3 ==> P4;
+    P4 == "union pass" ==> P6;
+    P4 == "union fail" ==> P5;
+    P5 ==> P6;
+    P1 -. "downcast_candidate=false<br/>(skip 6.2–6.5, fixed 'keep')" .-> P6;
+  end
+
+  P6 ==> OUT
+
+  classDef agent fill:#dbeafe,stroke:#1e3a8a,stroke-width:1px,color:#0f172a
+  classDef det fill:#dcfce7,stroke:#14532d,stroke-width:1px,color:#0f172a
+```
+
+Same legend as the top-level diagram: **blue** = LLM agent call,
+**green** = deterministic tool. Solid thick arrows are the happy
+path; dotted thin arrows are documented deviations.
+
+In order:
 
 1. **`spawn_candidate_finder`** (LLM, once) — triage: returns a ranked
    `{name, downcast_candidate, rank, rationale}` list covering every

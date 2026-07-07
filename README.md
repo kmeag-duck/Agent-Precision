@@ -374,6 +374,102 @@ misleadingly-stale reference in place; and (3) the **finish-gate** in
 orchestrator can self-correct on its next turn rather than silently
 exiting.
 
+## The per-variable analyst pipeline
+
+Step 6 in the Workflow diagram is a six-stage subgraph that replaced
+the monolithic `spawn_analyst` agent. The stages are three LLM calls
+interleaved with three deterministic tools, all producing a single
+`ANALYST_OUTPUT_SCHEMA`-conformant verdict for the rewriter and
+verifier.
+
+Rationale in one sentence: give the analyst an *algorithm* to follow
+(triage → per-variable verdict → empirical singleton check → union
+check → bisect on interactions → synthesis) instead of asking one
+LLM to reason about a whole kernel at once, and gate every LLM
+verdict against the compiled driver before it can influence the
+final answer.
+
+The stages, in order:
+
+1. **`spawn_candidate_finder`** — one LLM call. Enumerates every
+   named floating-point variable and marks each with
+   `downcast_candidate: bool` plus a rank and short rationale.
+   Non-candidates skip the empirical stages and pass straight
+   through to the finalizer as fixed `action='keep'`.
+2. **`spawn_variable_analyst` (× N)** — one LLM call per
+   `downcast_candidate=true` entry, in rank order. Reads only the
+   target variable name plus the kernel source (and the probe
+   evidence, auto-attached by the orchestrator); produces a full
+   `variables[]` entry for that one variable.
+3. **`test_variable_downcast` (× N)** — deterministic. For each
+   per-variable `action='downcast'` verdict from step 2, splice
+   just that variable at its requested target precision into a
+   copy of the baseline driver at
+   `baselines/<stem>/varprobe/singleton_<var>/`, compile, run,
+   diff against the quad oracle under the operator-supplied
+   tolerance. Numerical mismatch is a normal outcome
+   (`status='ok'` with `VERDICT: fail` in stdout, not an error);
+   infra failures (compile, timeout, missing artifact) get
+   `status='error'`.
+4. **`test_variable_union_downcast`** — deterministic, once.
+   Splices *every* step-3-passing variable simultaneously and
+   diffs. Catches interactions the singleton tests can't see
+   (e.g. two accumulators that individually preserve precision
+   but jointly drift). If this passes, its passing set is the
+   final downcast set.
+5. **`bisect_variable_downcast`** — deterministic, conditional on
+   step 4 failure. Drops candidates in candidate-finder rank
+   order until the remaining subset passes. Empty-passed-subset
+   (all downcasts dropped) is a valid outcome, not an error.
+6. **`spawn_analyst_finalizer`** — one LLM call, synthesis-only.
+   The orchestrator has by this point mechanically composed the
+   `variables[]` list from steps 1–5: non-candidates as fixed
+   `keep`, step-3-failing candidates demoted to `keep` with a
+   distinct reason, step-5-dropped candidates demoted to `keep`
+   with a different distinct reason, and the survivors carried
+   through verbatim. The finalizer is handed this assembled list
+   as `ASSEMBLED VERDICT (JSON)` and asked to fill in *only* the
+   wrapper blocks (`precision_budget`, `rework`, `overall_notes`).
+   It MUST echo per-variable
+   `name/action/target_precision/emulation_type` verbatim; any
+   change would defeat the empirical gating above. Output
+   conforms to `ANALYST_OUTPUT_SCHEMA` — the rewriter and
+   verifier don't need to know the pipeline replaced a single
+   call.
+
+**Why empirical gating replaces the ensemble aggregator.** The
+pre-Step-2 monolithic analyst supported a K-fold ensemble
+(`AGENT_PRECISION_ANALYST_K`) whose K verdicts were folded through
+per-variable plurality vote to catch over-aggressive LLM verdicts.
+The pipeline replaces that with a direct empirical check: for each
+downcast the analyst proposes, actually compile and run the kernel
+with that downcast applied and measure whether it meets the
+operator's tolerance. False-conservative errors (a candidate
+incorrectly demoted to `keep`) are recoverable through the verifier
+and comparator downstream; false-aggressive errors are what the
+singleton, union, and bisect steps catch. `AGENT_PRECISION_ANALYST_K`
+and `AGENT_PRECISION_ANALYST_T` are inert on the production path.
+
+**Language coverage.** Empirical stages 3 / 4 / 5 depend on a
+compilable baseline driver and the precision-alias contract, both of
+which are Kokkos-only in v0. On non-Kokkos profiles (CUDA, HIP,
+SYCL, OpenMP-offload) the orchestrator still runs stages 1 / 2 / 6
+and the pipeline degenerates to
+`candidate_finder → variable_analyst (× N) → analyst_finalizer`
+reasoning purely from source — no empirical check. Extending the
+empirical stages to the other profiles is the same work as
+extending the probe pipeline to them.
+
+**Cost.** For a kernel with ~10 downcast candidates the pipeline
+adds ~22 tool calls to a run vs. the old monolithic analyst (1
+finder + 10 variable_analyst + 10 test_variable_downcast + 1 union
++ 1 finalizer, minus 1 old `spawn_analyst`), plus 8× `probe_step`
++ 1× `probe_compare` on Kokkos. `MAX_TURNS` was raised from 60 to
+150 to leave ~3× headroom above the happy-path estimate. See
+`flowchart.md` for the full step-6 subgraph diagram and
+per-deviation prose; see `AGENTS.md` under "The per-variable
+analyst pipeline" for change-coupling rules.
+
 ## Repo layout
 
 - `workflow/`
