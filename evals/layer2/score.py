@@ -29,6 +29,8 @@ from .expected import ExpectedKernel
 # unknown-tool warning rather than silently being ignored.
 _KNOWN_TOOLS = frozenset({
     "spawn_analyst",
+    "spawn_candidate_finder",
+    "spawn_variable_analyst",
     "spawn_rewriter",
     "spawn_verifier",
     "spawn_baseline_harness",
@@ -40,6 +42,7 @@ _KNOWN_TOOLS = frozenset({
     "compare_outputs",
     "probe_step",
     "probe_compare",
+    "test_variable_downcast",
     "finish",
 })
 

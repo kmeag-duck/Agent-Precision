@@ -3289,7 +3289,7 @@ def test_finish_gate_state_treats_probe_tools_as_explicit_no_ops():
 
 
 def test_layer2_score_known_tools_includes_probe_step_and_probe_compare():
-    """evals.layer2.score._KNOWN_TOOLS must enumerate probe_step and probe_compare so a trace containing them does not produce 'unknown tool' warnings in the Layer-2 grader. Adding a new spawn/probe tool without updating this frozenset is a known failure mode the closed-set design exists to catch."""
+    """evals.layer2.score._KNOWN_TOOLS must enumerate probe_step and probe_compare so a trace containing them does not produce 'unknown tool' warnings in the Layer-2 grader. Adding a new spawn/probe tool without updating this frozenset is a known failure mode the closed-set design exists to catch. Also cross-checks the per-variable pipeline tools (spawn_candidate_finder, spawn_variable_analyst, test_variable_downcast) — each of these was added in a separate step and every one is a candidate for slipping past the closed-set grader if the frozenset isn't kept in sync."""
     from evals.layer2.score import _KNOWN_TOOLS
 
     assert "probe_step" in _KNOWN_TOOLS
@@ -3298,6 +3298,11 @@ def test_layer2_score_known_tools_includes_probe_step_and_probe_compare():
     assert "spawn_baseline_harness" in _KNOWN_TOOLS
     assert "compare_outputs" in _KNOWN_TOOLS
     assert "finish" in _KNOWN_TOOLS
+    # Per-variable pipeline tools (Steps 1-3): finder + variable_analyst
+    # + the empirical singleton test that gates downcast verdicts.
+    assert "spawn_candidate_finder" in _KNOWN_TOOLS
+    assert "spawn_variable_analyst" in _KNOWN_TOOLS
+    assert "test_variable_downcast" in _KNOWN_TOOLS
 
 
 def test_run_cli_no_probe_flag_threads_run_probe_false(monkeypatch, tmp_path):
@@ -3315,3 +3320,112 @@ def test_run_cli_no_probe_flag_threads_run_probe_false(monkeypatch, tmp_path):
     )
     assert completed.returncode == 0, completed.stderr
     assert "--no-probe" in completed.stdout
+
+
+# ---------- test_variable_downcast (Step 3 wiring) ----------
+
+
+def test_orchestrator_tools_include_test_variable_downcast_with_required_args():
+    """ORCHESTRATOR_TOOLS exposes test_variable_downcast to the LLM with exactly {kernel_stem, variable_name, target_precision, tolerance_json} as required inputs. language_id is NOT in the schema — _execute_tool injects profile.id, the same dispatch pattern as probe_step / probe_compare / compare_outputs so the LLM never has to know which language it's working in. The schema pins the contract that (a) the LLM is responsible for threading the operator's tolerance_json through unchanged (same shape it already passes to spawn_verifier and compare_outputs), and (b) target_precision is a per-variable decision the LLM lifts from the spawn_variable_analyst verdict, not something the tool infers."""
+    by_name = {t["name"]: t for t in ORCHESTRATOR_TOOLS}
+    assert "test_variable_downcast" in by_name
+
+    schema = by_name["test_variable_downcast"]["input_schema"]
+    props = schema["properties"]
+    assert set(props.keys()) == {
+        "kernel_stem",
+        "variable_name",
+        "target_precision",
+        "tolerance_json",
+    }
+    assert set(schema["required"]) == {
+        "kernel_stem",
+        "variable_name",
+        "target_precision",
+        "tolerance_json",
+    }
+    assert "language_id" not in props
+
+
+def test_execute_tool_dispatches_test_variable_downcast(monkeypatch):
+    """_execute_tool routes test_variable_downcast to workflow.tools.test_variable_downcast, forwards kernel_stem / variable_name / target_precision / tolerance_json verbatim, and injects profile.id as language_id (mirrors the probe_step dispatch contract). Returns the deterministic tool's {status, stdout, stderr, artifacts} dict unchanged — no wrapping, no VERDICT-parsing, no status-massaging. The orchestrator LLM is the entity that reads 'VERDICT: pass' / 'VERDICT: fail' out of stdout and decides whether to demote the assembled verdict to action='keep'; the dispatch layer stays contract-thin."""
+    captured = {}
+
+    def stub_test_variable_downcast(
+        kernel_stem, variable_name, target_precision, tolerance_json, language_id
+    ):
+        captured["kernel_stem"] = kernel_stem
+        captured["variable_name"] = variable_name
+        captured["target_precision"] = target_precision
+        captured["tolerance_json"] = tolerance_json
+        captured["language_id"] = language_id
+        return {
+            "status": "ok",
+            "stdout": "VERDICT: pass\nmax_absrel=1.2e-07",
+            "stderr": "",
+            "artifacts": [
+                "baselines/nbody_force/varprobe/singleton_x/reference.json"
+            ],
+        }
+
+    monkeypatch.setattr(
+        orchestrator, "test_variable_downcast", stub_test_variable_downcast
+    )
+
+    result = _execute_tool(
+        "test_variable_downcast",
+        {
+            "kernel_stem": "nbody_force",
+            "variable_name": "x",
+            "target_precision": "float",
+            "tolerance_json": '{"kind": "sig_figs", "value": 6, "source": "user_cli"}',
+        },
+        KOKKOS_PROFILE,
+    )
+
+    assert captured == {
+        "kernel_stem": "nbody_force",
+        "variable_name": "x",
+        "target_precision": "float",
+        "tolerance_json": '{"kind": "sig_figs", "value": 6, "source": "user_cli"}',
+        "language_id": "kokkos",
+    }
+    assert result["status"] == "ok"
+    assert "VERDICT: pass" in result["stdout"]
+    assert result["artifacts"] == [
+        "baselines/nbody_force/varprobe/singleton_x/reference.json"
+    ]
+
+
+def test_execute_tool_test_variable_downcast_under_cuda_profile_injects_cuda_language_id(
+    monkeypatch,
+):
+    """_execute_tool's language_id injection for test_variable_downcast is per-profile, not Kokkos-hardcoded: under CUDA_PROFILE the tool receives language_id='cuda'. The CUDA baseline harness doesn't emit the precision-alias pattern in v0 (only Kokkos does), so the tool would cleanly error on a real call — but the dispatch contract itself must remain profile-driven so that when a future profile adopts the alias pattern the wiring 'just works' without a router edit. Same principle as test_execute_tool_probe_step_under_cuda_profile_injects_cuda_language_id."""
+    captured = {}
+
+    def stub_test_variable_downcast(
+        kernel_stem, variable_name, target_precision, tolerance_json, language_id
+    ):
+        captured["language_id"] = language_id
+        return {
+            "status": "error",
+            "stdout": "",
+            "stderr": "no alias block for variable 'x' in baseline driver",
+            "artifacts": [],
+        }
+
+    monkeypatch.setattr(
+        orchestrator, "test_variable_downcast", stub_test_variable_downcast
+    )
+
+    _execute_tool(
+        "test_variable_downcast",
+        {
+            "kernel_stem": "vector_add",
+            "variable_name": "x",
+            "target_precision": "float",
+            "tolerance_json": '{"kind": "sig_figs", "value": 6, "source": "user_cli"}',
+        },
+        CUDA_PROFILE,
+    )
+    assert captured == {"language_id": "cuda"}

@@ -1748,3 +1748,474 @@ def check_analyst_verdict_against_probe(
             f"misleading for this specific case."
         )
     return violations
+
+
+# ---------- test_variable_downcast: per-variable singleton empirical test ----------
+#
+# Step 3 of the per-variable analyst pipeline (see AGENTS.md "Planned
+# next steps" and the Step 3 design confirmed via HITL Q&A). After the
+# candidate_finder + variable_analyst loop produces N per-variable
+# verdicts, the orchestrator empirically validates each `action='downcast'`
+# verdict in isolation by:
+#
+#   1. mutating the canonical baseline driver at
+#      baselines/<stem>/<profile.driver_filename> so ONLY the one alias
+#      line `using <VarName>Type = <old_type>;` is retargeted to the
+#      requested precision;
+#   2. writing the mutated driver to
+#      baselines/<stem>/varprobe/singleton_<varname>/<driver_filename>;
+#   3. compiling and running it under the same _compile_driver / _run_driver
+#      machinery every other driver uses; and
+#   4. comparing the resulting reference.json against the canonical
+#      quad oracle at baselines/<stem>/reference.json under the operator's
+#      tolerance.
+#
+# Design decisions (locked in HITL Q&A):
+#   - Explicit `tolerance_json` arg (Option A). Same tolerance the
+#     finish-gate comparator applies, so a singleton pass directly
+#     predicts finish-gate survival for that variable in isolation.
+#   - `emulate` verdicts are OUT OF SCOPE for Step 3; the orchestrator
+#     is instructed to skip this tool for them (pass through unchanged
+#     like 'keep'). This tool errors if the caller nonetheless passes a
+#     non-'float' target_precision, so a bug in the caller is loud.
+#   - Numerical tolerance mismatch = status='ok' with the verdict and
+#     mismatch summary in stdout. The tool answers the question "does
+#     this singleton downcast survive the tolerance yardstick?" and
+#     that question having answer 'no' is a normal outcome, not a
+#     tool-level error. status='error' is reserved for infrastructure
+#     failures (missing baseline driver / oracle, malformed alias
+#     block, compile failure, run failure, malformed tolerance).
+#
+# Artifacts land under baselines/<stem>/varprobe/singleton_<varname>/ so
+# they never collide with the rewritten-tree (Step 4+ union / bisection
+# artifacts will land under baselines/<stem>/varprobe/{union,bisect_...}
+# alongside).
+
+# Regex that matches a single alias line `using <VarName>Type = <RHS>;`
+# on its own line (no leading/trailing whitespace). The <VarName> is
+# injected per-call via re.escape so a variable named e.g. `a` cannot
+# accidentally match `alphaType`. Multiline-anchored so we can search
+# the full driver source at once. The captured group is the RHS
+# (everything up to but not including the semicolon) which we mutate
+# to swap `double` for the target precision's C++ type token.
+_ALIAS_LINE_RE_TEMPLATE = r"^using {var}Type = ([^;\n]+);$"
+
+# Set of target_precision tokens this tool knows how to splice for.
+# Deliberately narrow in v0: 'float' is the only precision the probe
+# pipeline empirically validates (probe_precisions = quad/double/float/
+# mixed_io on Kokkos), so it's the only precision we've smoke-tested
+# end to end. 'half' is advertised in ANALYST_OUTPUT_SCHEMA but has
+# never been compiled in this repo; adding it here without a smoke
+# test on real hardware would be a silent contract expansion. The
+# orchestrator's per-variable pipeline is expected to fall back to
+# `keep` for a variable it wanted to downcast to a precision this tool
+# doesn't support -- the tool returns a clear status='error' so that
+# fallback is explicit, not silent.
+_SUPPORTED_TARGET_PRECISIONS = frozenset({"float"})
+
+# Map from analyst target_precision token to the C++ type token that
+# replaces `double` in the alias RHS. Kept alongside
+# _SUPPORTED_TARGET_PRECISIONS so extending the set is a one-line change
+# in each place.
+_TARGET_PRECISION_TO_CXX = {
+    "float": "float",
+}
+
+
+def _mutate_alias_rhs(old_rhs: str, target_cxx: str) -> tuple[str | None, str | None]:
+    """Rewrite an alias RHS by replacing every `double` token with `target_cxx`.
+
+    Returns `(new_rhs, None)` on success or `(None, error_msg)` when
+    the RHS contains no `double` token (nothing to downcast; the alias
+    is probably already float or references a non-floating type -- either
+    way the caller shouldn't be asking to downcast this variable).
+
+    Token matching uses a word-boundary regex so `double` is replaced
+    but a hypothetical `MyDoubleThing` typedef is left alone. All
+    occurrences are replaced (a `Kokkos::View<const double*>` alias
+    stays consistent when it becomes `Kokkos::View<const float*>`).
+    """
+    pattern = re.compile(r"\bdouble\b")
+    if not pattern.search(old_rhs):
+        return (None, (
+            f"Alias RHS {old_rhs!r} contains no `double` token; there "
+            f"is nothing to downcast. Either the variable is already at "
+            f"the target precision, or its alias references a non-"
+            f"floating-point type (in which case the analyst should not "
+            f"have chosen action='downcast' for it)."
+        ))
+    new_rhs = pattern.sub(target_cxx, old_rhs)
+    return (new_rhs, None)
+
+
+def _splice_singleton_alias(
+    driver_text: str,
+    profile: LanguageProfile,
+    variable_name: str,
+    target_cxx: str,
+) -> tuple[str | None, str | None]:
+    """Rewrite the unique `using <VarName>Type = ...;` alias line inside
+    the kernel sentinels of `driver_text`, retargeting its RHS from
+    `double` to `target_cxx`.
+
+    Returns `(new_source, None)` on success or `(None, error_msg)` on
+    any contract violation (missing sentinels, wrong ordering, alias
+    line absent, alias line non-unique, alias RHS not downcastable).
+    All error paths carry a message that names the specific violation
+    so the orchestrator can retry with a different variable / target /
+    fallback to `keep`.
+
+    The mutation is scoped strictly BETWEEN the sentinel lines: this
+    tool is a singleton splice, so touching main() or the kernel body
+    would either duplicate the rewriter's job or (worse) desync from
+    the alias contract. The alias line contract (per BASELINE_HARNESS_
+    SYSTEM_PROMPT in workflow/registry.py and per language) is exactly
+    what makes this splice safe: a single alias redefinition
+    propagates through the kernel signature (which uses the alias
+    names) and through main() (which constructs kernel arguments
+    through the same aliases) without any signature-touching edit.
+    """
+    lines = driver_text.splitlines()
+
+    begin_idx = _find_unique_sentinel_line(lines, profile.sentinel_begin)
+    if begin_idx is None:
+        return (None, (
+            f"Baseline driver does not contain exactly one "
+            f"{profile.sentinel_begin!r} line on its own (no "
+            f"surrounding indentation or whitespace)."
+        ))
+    end_idx = _find_unique_sentinel_line(lines, profile.sentinel_end)
+    if end_idx is None:
+        return (None, (
+            f"Baseline driver does not contain exactly one "
+            f"{profile.sentinel_end!r} line on its own (no "
+            f"surrounding indentation or whitespace)."
+        ))
+    if begin_idx >= end_idx:
+        return (None, (
+            f"Baseline driver has {profile.sentinel_end!r} at or before "
+            f"{profile.sentinel_begin!r} (line {end_idx + 1} vs line "
+            f"{begin_idx + 1}); cannot splice."
+        ))
+
+    # Search ONLY the region strictly between the sentinels (exclusive
+    # on both ends). The alias contract puts alias lines here.
+    kernel_region_start = begin_idx + 1
+    kernel_region_end = end_idx  # exclusive
+    kernel_region_lines = lines[kernel_region_start:kernel_region_end]
+
+    pattern = re.compile(
+        _ALIAS_LINE_RE_TEMPLATE.format(var=re.escape(variable_name))
+    )
+    matches: list[tuple[int, str]] = []
+    for offset, line in enumerate(kernel_region_lines):
+        m = pattern.match(line)
+        if m is not None:
+            matches.append((offset, m.group(1)))
+    if not matches:
+        return (None, (
+            f"No `using {variable_name}Type = <type>;` alias line found "
+            f"between the kernel sentinels. Either the variable name "
+            f"does not match a kernel parameter, the baseline_harness "
+            f"emitted a non-standard alias line (indented, split across "
+            f"lines, wrong suffix), or the variable's alias is not "
+            f"floating-point (integer parameters do not get aliases -- "
+            f"see the precision-alias contract in the harness prompt)."
+        ))
+    if len(matches) > 1:
+        return (None, (
+            f"Found {len(matches)} `using {variable_name}Type = "
+            f"<type>;` alias lines between the kernel sentinels; the "
+            f"alias contract requires exactly one per kernel parameter "
+            f"so the singleton splice is unambiguous."
+        ))
+    alias_offset, old_rhs = matches[0]
+
+    new_rhs, err = _mutate_alias_rhs(old_rhs, target_cxx)
+    if err is not None:
+        return (None, err)
+    absolute_line_idx = kernel_region_start + alias_offset
+    new_line = f"using {variable_name}Type = {new_rhs};"
+    new_lines = list(lines)
+    new_lines[absolute_line_idx] = new_line
+
+    trailing_newline = "\n" if driver_text.endswith("\n") else ""
+    return ("\n".join(new_lines) + trailing_newline, None)
+
+
+def _compare_singleton_vs_oracle(
+    oracle_path: Path,
+    candidate_path: Path,
+    tolerance_kind: str,
+    tolerance_value: int,
+) -> tuple[bool, int, list[dict], str | None]:
+    """Compare two reference.json files under the given tolerance.
+
+    Returns `(passed, total_compared, mismatches, shape_error)`.
+    `shape_error` is non-None only when the shape check itself
+    fails (top-level keys, output-array names, per-array lengths);
+    that's an infrastructure error the caller surfaces as
+    status='error'. Numerical mismatches populate `mismatches`
+    (already truncated at _MAX_REPORTED_MISMATCHES) and set
+    `passed=False`, but are NOT an infrastructure error: the caller
+    reports them as status='ok' + verdict=fail in stdout.
+
+    Reuses _load_reference / _shape_error / _iter_leaf_pairs /
+    _value_within_tolerance from compare_outputs so the numerical
+    yardstick is bit-for-bit identical to what the finish-gate
+    comparator applies.
+    """
+    baseline = _load_reference(oracle_path)
+    rewritten = _load_reference(candidate_path)
+    shape_err = _shape_error(baseline, rewritten)
+    if shape_err is not None:
+        return (False, 0, [], shape_err)
+
+    total = 0
+    mismatches: list[dict] = []
+    for name, idx, va, vb in _iter_leaf_pairs(baseline, rewritten):
+        total += 1
+        try:
+            fa = float(va)
+            fb = float(vb)
+        except (TypeError, ValueError):
+            mismatches.append({
+                "name": name, "index": idx, "a": va, "b": vb,
+                "abs_err": None, "threshold": None,
+            })
+            continue
+        passed, abs_err, threshold = _value_within_tolerance(
+            fa, fb, tolerance_kind, tolerance_value
+        )
+        if not passed:
+            mismatches.append({
+                "name": name, "index": idx, "a": fa, "b": fb,
+                "abs_err": abs_err, "threshold": threshold,
+            })
+
+    truncated = mismatches[:_MAX_REPORTED_MISMATCHES]
+    return (not mismatches, total, truncated, None)
+
+
+def test_variable_downcast(
+    kernel_stem: str,
+    variable_name: str,
+    target_precision: str,
+    tolerance_json: str,
+    language_id: str,
+) -> dict:
+    """Empirically test a single-variable downcast in isolation.
+
+    Mutates the baseline driver at
+    baselines/<kernel_stem>/<profile.driver_filename> so only the alias
+    line `using <variable_name>Type = <old_type>;` inside the kernel
+    sentinels is retargeted from `double` to `target_precision`,
+    writes the mutated driver to baselines/<kernel_stem>/varprobe/
+    singleton_<variable_name>/<driver_filename>, then compiles and
+    runs it via _compile_driver + _run_driver against that directory,
+    and finally compares its reference.json against the canonical
+    quad oracle at baselines/<kernel_stem>/reference.json under the
+    operator-supplied tolerance.
+
+    `tolerance_json` is a JSON string with keys {kind, value, source}
+    matching the tolerance dict the orchestrator threads through the
+    rest of the pipeline. `kind` is 'sig_figs' or 'decimal_digits',
+    `value` is a positive integer.
+
+    Result shape: uniform {status, stdout, stderr, artifacts}. Semantic
+    contract for `status`:
+
+      - 'ok' means the tool ran end-to-end without infrastructure
+        failure. The tool's VERDICT (does this singleton downcast meet
+        tolerance?) is in stdout as either "VERDICT: pass" or
+        "VERDICT: fail" followed by a mismatch summary; the caller
+        parses stdout, not status. A tolerance-mismatch is a normal
+        outcome, not an error.
+      - 'error' means infrastructure failed: missing baseline driver,
+        missing oracle, malformed alias block, unsupported
+        target_precision, unsupported language_id, compile failure,
+        run failure, or malformed tolerance_json. The caller cannot
+        derive a verdict from an error result and should either retry
+        with different args or fall back to `keep` for that variable.
+
+    Artifacts on success: the mutated driver source, the compiled
+    driver binary, and the produced reference.json under baselines/
+    <kernel_stem>/varprobe/singleton_<variable_name>/. The singleton_
+    prefix reserves the directory namespace for Step 4's union/bisect
+    artifacts alongside.
+
+    v0 scope (see the module-level comment): only Kokkos and only
+    target_precision='float'. Emulate verdicts are out of scope; the
+    orchestrator prompt is expected to skip this tool for them.
+    """
+    profile = _resolve_profile(language_id)
+
+    if not variable_name or not isinstance(variable_name, str):
+        return _error(
+            f"variable_name must be a non-empty string; got "
+            f"{variable_name!r}."
+        )
+    # Guard against accidental empty / whitespace-only inputs that
+    # would make the alias regex trivially match too much.
+    if variable_name.strip() != variable_name or not variable_name.strip():
+        return _error(
+            f"variable_name must not contain leading/trailing whitespace "
+            f"or be blank; got {variable_name!r}."
+        )
+
+    if target_precision not in _SUPPORTED_TARGET_PRECISIONS:
+        return _error(
+            f"target_precision={target_precision!r} is not supported by "
+            f"test_variable_downcast in v0. Supported precisions: "
+            f"{sorted(_SUPPORTED_TARGET_PRECISIONS)}. The orchestrator "
+            f"should fall back to action='keep' for this variable, or "
+            f"choose a supported target_precision."
+        )
+    target_cxx = _TARGET_PRECISION_TO_CXX[target_precision]
+
+    try:
+        tolerance = json.loads(tolerance_json)
+    except json.JSONDecodeError as exc:
+        return _error(
+            f"tolerance_json is not valid JSON: {exc}. Expected an "
+            f"object like {{'kind': 'sig_figs', 'value': 3, 'source': "
+            f"'user_cli'}}."
+        )
+    if not isinstance(tolerance, dict):
+        return _error(
+            f"tolerance_json must be a JSON object; got "
+            f"{type(tolerance).__name__}."
+        )
+    tol_kind = tolerance.get("kind")
+    tol_value = tolerance.get("value")
+    if tol_kind not in {"sig_figs", "decimal_digits"}:
+        return _error(
+            f"Unsupported tolerance kind: {tol_kind!r}. Expected "
+            f"'sig_figs' or 'decimal_digits'."
+        )
+    if (
+        not isinstance(tol_value, int)
+        or isinstance(tol_value, bool)
+        or tol_value < 1
+    ):
+        return _error(
+            f"Invalid tolerance value: {tol_value!r}. Expected a "
+            f"positive integer."
+        )
+
+    baseline_dir = Path("baselines") / kernel_stem
+    baseline_driver_path = baseline_dir / profile.driver_filename
+    oracle_path = baseline_dir / "reference.json"
+
+    if not baseline_driver_path.is_file():
+        return _error(
+            f"Baseline driver source not found at "
+            f"{baseline_driver_path}. Did spawn_baseline_harness run "
+            f"and get approved for this kernel_stem?"
+        )
+    if not oracle_path.is_file():
+        return _error(
+            f"Oracle reference.json not found at {oracle_path}. Did "
+            f"run_baseline_driver (and, on Kokkos, the probe pipeline's "
+            f"oracle promotion in probe_compare) run and succeed for "
+            f"this kernel_stem?"
+        )
+
+    try:
+        baseline_text = baseline_driver_path.read_text()
+    except OSError as exc:
+        return _error(
+            f"Failed to read {baseline_driver_path}: {exc}"
+        )
+
+    new_source, err = _splice_singleton_alias(
+        baseline_text, profile, variable_name, target_cxx
+    )
+    if err is not None:
+        return _error(f"In {baseline_driver_path}: {err}")
+
+    singleton_dir = (
+        baseline_dir / "varprobe" / f"singleton_{variable_name}"
+    )
+    singleton_src = singleton_dir / profile.driver_filename
+    try:
+        singleton_dir.mkdir(parents=True, exist_ok=True)
+        singleton_src.write_text(new_source)
+    except OSError as exc:
+        return _error(f"Failed to write {singleton_src}: {exc}")
+
+    compile_result = _compile_driver(
+        singleton_dir,
+        profile,
+        missing_source_hint=(
+            "test_variable_downcast just wrote the driver source; this "
+            f"should not happen. Check filesystem permissions on "
+            f"{singleton_dir}."
+        ),
+    )
+    if compile_result["status"] != "ok":
+        return compile_result
+
+    run_result = _run_driver(
+        singleton_dir,
+        missing_binary_hint=(
+            "test_variable_downcast just compiled the driver; this "
+            f"should not happen. Check filesystem permissions on "
+            f"{singleton_dir}."
+        ),
+    )
+    if run_result["status"] != "ok":
+        return run_result
+
+    candidate_path = singleton_dir / "reference.json"
+    try:
+        passed, total, mismatches, shape_err = (
+            _compare_singleton_vs_oracle(
+                oracle_path, candidate_path, tol_kind, tol_value
+            )
+        )
+    except json.JSONDecodeError as exc:
+        return _error(
+            f"reference.json parse failure while comparing "
+            f"{candidate_path} against {oracle_path}: {exc}"
+        )
+    except OSError as exc:
+        return _error(
+            f"OS error while comparing {candidate_path} against "
+            f"{oracle_path}: {exc}"
+        )
+    if shape_err is not None:
+        return _error(
+            f"Shape mismatch between singleton output and oracle: "
+            f"{shape_err}"
+        )
+
+    verdict_header = (
+        f"VERDICT: pass -- variable {variable_name!r} tolerates "
+        f"downcast to {target_precision!r} in isolation under "
+        f"{tol_kind}={tol_value} ({total} values compared)."
+        if passed else
+        f"VERDICT: fail -- variable {variable_name!r} does NOT "
+        f"tolerate downcast to {target_precision!r} in isolation "
+        f"under {tol_kind}={tol_value} "
+        f"({len(mismatches)}/{total} values disagree, first "
+        f"{len(mismatches)} shown)."
+    )
+    stdout_lines = [verdict_header]
+    for m in mismatches:
+        stdout_lines.append(
+            f"  ({m['name']!r}, idx={m['index']}, a={m['a']}, "
+            f"b={m['b']}, abs_err={m['abs_err']}, "
+            f"threshold={m['threshold']})"
+        )
+
+    return {
+        "status": "ok",
+        "stdout": "\n".join(stdout_lines),
+        "stderr": "",
+        "artifacts": [
+            str(singleton_src),
+            str(singleton_dir / "driver"),
+            str(candidate_path),
+        ],
+    }

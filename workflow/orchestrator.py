@@ -40,6 +40,7 @@ from .tools import (
     run_rewritten_driver,
     splice_rewritten_kernel,
     syntax_check_driver_source,
+    test_variable_downcast,
 )
 from .verifier_panel import (
     VERIFIER_LENSES,
@@ -218,6 +219,43 @@ You also have two deterministic (non-LLM) tools:
     matrix lists have been attempted (succeed or fail), and before
     spawn_candidate_finder.
 
+  - test_variable_downcast: takes a kernel_stem, a variable_name, a
+    target_precision, and a tolerance_json. Mutates the baseline driver
+    at baselines/<kernel_stem>/<profile driver filename> so only the
+    'using <variable_name>Type = ...;' alias line inside the kernel
+    sentinels is retargeted to `target_precision`, writes the mutated
+    driver under baselines/<kernel_stem>/varprobe/singleton_<variable_name>/,
+    compiles and runs it, and compares its reference.json against the
+    canonical oracle at baselines/<kernel_stem>/reference.json under
+    the supplied tolerance. Returns {status, stdout, stderr, artifacts}.
+    IMPORTANT semantic contract: status='ok' means the tool ran
+    end-to-end without infrastructure failure — the VERDICT is in
+    stdout as either 'VERDICT: pass' or 'VERDICT: fail'. A tolerance-
+    mismatch is a NORMAL outcome and returns status='ok' with
+    'VERDICT: fail' in stdout; you MUST parse stdout, not just
+    status, to know the empirical result. status='error' is reserved
+    for infrastructure failures (missing baseline driver, missing
+    oracle, malformed alias block, unsupported target_precision — v0
+    only supports target_precision='float' — compile or run failure,
+    malformed tolerance_json). Call this ONCE PER
+    spawn_variable_analyst verdict whose action='downcast' AND whose
+    target_precision is supported, AFTER the spawn_variable_analyst
+    loop and BEFORE building the rewriter's task_prompt in step 2.
+    Skip for action='keep' entries (there is nothing to test) and for
+    action='emulate' entries (v0 has no singleton test for emulate).
+    If the tool returns status='ok' with 'VERDICT: fail', OR returns
+    status='error' (for example because the analyst chose an
+    unsupported target_precision like 'half'), the orchestrator MUST
+    demote that variable's assembled verdict to
+    {action:'keep', target_precision:'', emulation_type:'',
+     reason:'singleton downcast to <target_precision> did not meet
+     tolerance: <one-line stdout excerpt>'} before threading the
+    concatenated verdict list into spawn_rewriter. This gate is what
+    turns the analysts' a-priori reasoning into an empirically-verified
+    per-variable decision. Failures here are NOT finish-gating on their
+    own — the finish-gate remains compare_outputs on the assembled
+    rewrite — but they change WHICH variables land in that rewrite.
+
   - splice_rewritten_kernel: takes a kernel_stem and the rewriter's
     rewritten kernel source. Reads the baseline driver source under
     baselines/<kernel_stem>/ (written by spawn_baseline_harness),
@@ -332,14 +370,38 @@ Your job after the tolerance is fixed:
    The orchestrator auto-attaches the probe evidence to each call's
    task; you do not need to thread it through yourself. Collect all
    N per-variable results in order.
+1.5. For EACH spawn_variable_analyst verdict from step 1 whose
+   action='downcast', call test_variable_downcast ONCE with the same
+   kernel_stem, the variable's name, the variable's target_precision,
+   and the agreed tolerance serialized as a JSON string. Skip verdicts
+   whose action is 'keep' (nothing to test) or 'emulate' (v0 has no
+   singleton test for emulate). Track the empirical outcome per
+   variable: 'pass' if the tool returned status='ok' AND its stdout
+   contains 'VERDICT: pass'; 'fail' if the tool returned status='ok'
+   AND its stdout contains 'VERDICT: fail'; 'fail' if the tool
+   returned status='error' (e.g. because the analyst chose an
+   unsupported target_precision like 'half', or the compile / run
+   failed). This step is REQUIRED — step 2's assembly recipe uses its
+   outcomes to decide which downcast verdicts survive into the
+   rewriter's task_prompt.
 2. Assemble a self-contained task_prompt for the rewriter. The prompt
    must include:
      - the full kernel source,
      - the agreed tolerance,
      - a per-variable verdict list built by concatenating:
-       (a) the `variable` object from each spawn_variable_analyst
-           call for candidate_finder entries with
-           downcast_candidate=true, AND
+       (a) for each candidate_finder entry with downcast_candidate=true:
+           * if the spawn_variable_analyst verdict had action='keep' or
+             action='emulate', echo it verbatim;
+           * if the spawn_variable_analyst verdict had action='downcast'
+             AND the corresponding test_variable_downcast outcome from
+             step 1.5 was 'pass', echo it verbatim;
+           * if the spawn_variable_analyst verdict had action='downcast'
+             AND the corresponding test_variable_downcast outcome from
+             step 1.5 was 'fail', DEMOTE it to
+             {name, action:'keep', target_precision:'',
+              emulation_type:'',
+              reason:'singleton downcast to <target_precision> did not
+              meet tolerance: <one-line stdout excerpt>'};
        (b) a fixed `{name, action:'keep', target_precision:'',
            emulation_type:'', reason:'not a downcast candidate per
            finder: <finder rationale>'}` entry for each
@@ -347,8 +409,8 @@ Your job after the tolerance is fixed:
    The concatenated list MUST cover every finder entry — coverage is
    the invariant that keeps the downstream verifier / rewriter
    contracts intact. Do not editorialize — faithfully convey the
-   per-variable analysts' calls and do not choose a method they did
-   not ask for.
+   per-variable analysts' calls (as gated by step 1.5) and do not
+   choose a method they did not ask for.
 3. Call spawn_rewriter with that task_prompt.
 4. Call spawn_verifier with (original_source, rewritten_source from the
    rewriter, analyst_verdict_json, tolerance_json). The
@@ -849,6 +911,89 @@ ORCHESTRATOR_TOOLS = [
                 },
             },
             "required": ["kernel_stem"],
+        },
+    },
+    {
+        "name": "test_variable_downcast",
+        "description": (
+            "Deterministic (non-LLM) tool. Empirically tests whether a "
+            "single-variable downcast (target_precision, currently only "
+            "'float' in v0) meets the operator-supplied tolerance, in "
+            "isolation. Mutates baselines/<kernel_stem>/driver.cpp so "
+            "only the alias line `using <variable_name>Type = ...;` "
+            "inside the kernel sentinels is retargeted, writes the "
+            "mutated driver to baselines/<kernel_stem>/varprobe/"
+            "singleton_<variable_name>/, compiles and runs it, and "
+            "compares its reference.json against the canonical oracle at "
+            "baselines/<kernel_stem>/reference.json. Returns "
+            "{status, stdout, stderr, artifacts}. Semantic contract: "
+            "status='ok' means the tool ran end-to-end without "
+            "infrastructure failure — the VERDICT ('pass' or 'fail') is "
+            "in stdout as 'VERDICT: pass' or 'VERDICT: fail'. A "
+            "tolerance-mismatch is a normal outcome, NOT status='error'. "
+            "status='error' is reserved for infrastructure failures "
+            "(missing baseline driver, missing oracle, malformed alias "
+            "block, unsupported target_precision, compile/run failure, "
+            "malformed tolerance_json). Call this ONCE PER variable "
+            "whose spawn_variable_analyst verdict was action='downcast' "
+            "with a supported target_precision, AFTER the "
+            "spawn_variable_analyst loop and BEFORE spawn_rewriter. "
+            "Skip for action='keep' and action='emulate' verdicts (v0 "
+            "has no singleton test for emulate). If the tool returns "
+            "status='ok' with 'VERDICT: fail', or returns status='error' "
+            "(e.g. unsupported target_precision like 'half'), the "
+            "orchestrator MUST demote that variable's assembled verdict "
+            "to action='keep' before building the rewriter's task_prompt."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "kernel_stem": {
+                    "type": "string",
+                    "description": (
+                        "Filesystem-safe short name for this kernel; "
+                        "MUST match the kernel_stem passed to the "
+                        "preceding spawn_baseline_harness call."
+                    ),
+                },
+                "variable_name": {
+                    "type": "string",
+                    "description": (
+                        "The name of the single variable to test. Must "
+                        "match a `name` in the spawn_variable_analyst "
+                        "output AND correspond to a "
+                        "`using <variable_name>Type = ...;` alias line "
+                        "the baseline harness emitted between the "
+                        "kernel sentinels."
+                    ),
+                },
+                "target_precision": {
+                    "type": "string",
+                    "description": (
+                        "The precision to retarget this variable's "
+                        "alias to. Currently only 'float' is supported "
+                        "in v0; other values (e.g. 'half') return "
+                        "status='error' and the orchestrator should "
+                        "fall back to action='keep' for this variable."
+                    ),
+                },
+                "tolerance_json": {
+                    "type": "string",
+                    "description": (
+                        "The same {kind, value, source} JSON string "
+                        "the orchestrator threads through the rest of "
+                        "the pipeline. The tool parses it and applies "
+                        "the same per-value pass/fail threshold as "
+                        "compare_outputs."
+                    ),
+                },
+            },
+            "required": [
+                "kernel_stem",
+                "variable_name",
+                "target_precision",
+                "tolerance_json",
+            ],
         },
     },
     {
@@ -1592,6 +1737,30 @@ def _execute_tool(
                     file=sys.stderr,
                 )
         return compare_result
+    if tool_name == "test_variable_downcast":
+        # Deterministic tool (no LLM call): mutates the baseline driver's
+        # `using <variable_name>Type = ...;` alias line inside the kernel
+        # sentinels to retarget it to `target_precision`, then compiles,
+        # runs, and compares the result against the canonical oracle at
+        # baselines/<stem>/reference.json under the operator-supplied
+        # tolerance. Called once per candidate downcast variable, AFTER
+        # spawn_variable_analyst and BEFORE spawn_rewriter, to gate
+        # whether the assembled analyst verdict for that variable
+        # survives as action='downcast' or gets demoted to action='keep'.
+        # `profile.id` is injected here so the LLM never has to pass it
+        # (mirrors the probe_step / probe_compare / compare_outputs
+        # dispatch pattern). Returns the same {status, stdout, stderr,
+        # artifacts} shape verbatim; the tool's VERDICT (pass or fail)
+        # is a substring of stdout, NOT the status field. A tolerance-
+        # mismatch is a normal 'ok' outcome; 'error' is reserved for
+        # infrastructure failures.
+        return test_variable_downcast(
+            tool_input["kernel_stem"],
+            tool_input["variable_name"],
+            tool_input["target_precision"],
+            tool_input["tolerance_json"],
+            profile.id,
+        )
     raise ValueError(f"Unknown tool: {tool_name}")
 
 

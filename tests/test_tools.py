@@ -37,6 +37,7 @@ import json
 import os
 import stat
 import subprocess
+from pathlib import Path
 
 from workflow import tools
 from workflow.languages import cuda as cuda_profile
@@ -4285,3 +4286,549 @@ def test_check_picks_worst_output_when_multiple_outputs_violate():
     assert "out_worst" in violations[0]
     assert "out_small" not in violations[0]
     assert "out_mid" not in violations[0]
+
+
+# ---------- test_variable_downcast ----------
+#
+# Tests the per-variable singleton empirical test tool used in step 1.5
+# of the per-variable analyst pipeline. The tool mutates one alias
+# line inside the kernel sentinels of the baseline driver, writes the
+# mutated driver to baselines/<stem>/varprobe/singleton_<var>/, compiles
+# and runs it, and compares the resulting reference.json against the
+# canonical oracle at baselines/<stem>/reference.json under the
+# operator's tolerance.
+#
+# NOTE: workflow.tools.test_variable_downcast has a `test_` prefix by
+# domain convention (it is the empirical-*test* step of the pipeline).
+# Pytest would auto-collect it as a test case if imported by name, so
+# these tests reach it via the module attribute `tools.test_variable_
+# downcast` instead of importing it directly.
+
+_SINGLETON_BASELINE_TEMPLATE = """\
+#include <Kokkos_Core.hpp>
+#include <fstream>
+
+int main() {{
+  Kokkos::initialize();
+{sentinel_begin}
+using aType = Kokkos::View<double*>;
+using bType = Kokkos::View<const double*>;
+using alphaType = double;
+void run(aType a, bType b, alphaType alpha) {{
+  (void)a; (void)b; (void)alpha;
+}}
+{sentinel_end}
+  std::ofstream("reference.json") << "{{}}";
+  Kokkos::finalize();
+  return 0;
+}}
+"""
+
+
+def _stage_baseline_for_singleton(
+    tmp_path,
+    stem,
+    oracle_payload=None,
+    driver_source=None,
+):
+    """Stage baselines/<stem>/{driver.cpp, reference.json} with the
+    kokkos alias-based driver template and an oracle payload.
+
+    Mirrors _stage_driver / _stage_driver_binary from earlier in the
+    file but bundles both the source and the oracle since the
+    singleton tool needs both to succeed.
+    """
+    driver_dir = tmp_path / "baselines" / stem
+    driver_dir.mkdir(parents=True, exist_ok=True)
+    if driver_source is None:
+        driver_source = _SINGLETON_BASELINE_TEMPLATE.format(
+            sentinel_begin=KERNEL_BEGIN_SENTINEL,
+            sentinel_end=KERNEL_END_SENTINEL,
+        )
+    (driver_dir / "driver.cpp").write_text(driver_source)
+    if oracle_payload is not None:
+        (driver_dir / "reference.json").write_text(
+            json.dumps(oracle_payload)
+        )
+    return driver_dir
+
+
+def _install_fake_compile_and_run(
+    monkeypatch, tmp_path, candidate_payload, compile_ok=True, run_ok=True
+):
+    """Monkeypatch subprocess.run to (1) succeed the compile step,
+    creating a fake ./driver binary in the target dir, and (2) succeed
+    the run step, writing `candidate_payload` as reference.json in the
+    target dir.
+
+    The compile and run are distinguished by inspecting `cmd[0]` and
+    the presence of an `-o` argument (compile) versus a bare `./driver`
+    (run). Returns the list of captured invocations for optional
+    assertions.
+    """
+    monkeypatch.setenv(KOKKOS_ROOT_ENV, str(_make_fake_kokkos_root(tmp_path)))
+    invocations = []
+
+    class OkProc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    class FailProc:
+        returncode = 1
+        stdout = ""
+        stderr = "boom"
+
+    def fake_run(cmd, **kw):
+        invocations.append({"cmd": list(cmd), "kwargs": dict(kw)})
+        is_run_step = (
+            len(cmd) >= 1 and str(cmd[0]).endswith("driver")
+            and "-o" not in cmd
+        )
+        if is_run_step:
+            if not run_ok:
+                return FailProc()
+            cwd = kw.get("cwd")
+            if cwd is not None:
+                (Path(cwd) / "reference.json").write_text(
+                    json.dumps(candidate_payload)
+                )
+            return OkProc()
+        # Compile step: fabricate the output binary named after `-o`.
+        if not compile_ok:
+            return FailProc()
+        if "-o" in cmd:
+            out_idx = cmd.index("-o") + 1
+            out_path = Path(cmd[out_idx])
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text("#!/bin/sh\nexit 0\n")
+            out_path.chmod(out_path.stat().st_mode | stat.S_IXUSR)
+        return OkProc()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    return invocations
+
+
+_TOL_SIG_FIGS_3 = json.dumps({"kind": "sig_figs", "value": 3, "source": "user_cli"})
+
+
+def test_variable_downcast_errors_when_baseline_driver_missing(
+    monkeypatch, tmp_path
+):
+    """test_variable_downcast returns status='error' (no subprocess call) when baselines/<stem>/driver.cpp is missing. Prevents burning a compile cycle on a nonexistent target and gives the orchestrator a clear signal that spawn_baseline_harness needs to run first."""
+    monkeypatch.chdir(tmp_path)
+    # No _stage_baseline_for_singleton call: driver.cpp does not exist.
+
+    def fail_run(*a, **kw):
+        raise AssertionError(
+            "subprocess.run must not be called when baseline driver is missing"
+        )
+
+    monkeypatch.setattr(subprocess, "run", fail_run)
+
+    result = tools.test_variable_downcast(
+        "nbody_force", "a", "float", _TOL_SIG_FIGS_3, "kokkos"
+    )
+
+    assert result["status"] == "error"
+    assert "driver.cpp" in result["stderr"]
+    assert result["artifacts"] == []
+
+
+def test_variable_downcast_errors_when_oracle_missing(monkeypatch, tmp_path):
+    """test_variable_downcast returns status='error' (no subprocess call) when the oracle reference.json is missing. The tool cannot compute a verdict without ground truth, so it fails loudly rather than silently running compile+run and then blowing up at the comparator."""
+    monkeypatch.chdir(tmp_path)
+    _stage_baseline_for_singleton(tmp_path, "nbody_force")  # no oracle_payload
+
+    def fail_run(*a, **kw):
+        raise AssertionError(
+            "subprocess.run must not be called when oracle is missing"
+        )
+
+    monkeypatch.setattr(subprocess, "run", fail_run)
+
+    result = tools.test_variable_downcast(
+        "nbody_force", "a", "float", _TOL_SIG_FIGS_3, "kokkos"
+    )
+
+    assert result["status"] == "error"
+    assert "reference.json" in result["stderr"]
+    assert result["artifacts"] == []
+
+
+def test_variable_downcast_errors_on_unsupported_target_precision(
+    monkeypatch, tmp_path
+):
+    """target_precision='half' (or any value outside the v0 support set) is rejected pre-splice with status='error'. v0 has never smoke-tested half-precision compilation, so a request for it must fail loudly instead of silently mis-splicing."""
+    monkeypatch.chdir(tmp_path)
+    _stage_baseline_for_singleton(
+        tmp_path, "k",
+        oracle_payload={"kernel": "k", "seed": 42, "inputs": {}, "outputs": {}},
+    )
+
+    def fail_run(*a, **kw):
+        raise AssertionError("subprocess.run must not be called on unsupported target")
+
+    monkeypatch.setattr(subprocess, "run", fail_run)
+
+    result = tools.test_variable_downcast(
+        "k", "a", "half", _TOL_SIG_FIGS_3, "kokkos"
+    )
+
+    assert result["status"] == "error"
+    assert "half" in result["stderr"]
+    assert "not supported" in result["stderr"] or "supported" in result["stderr"]
+
+
+def test_variable_downcast_errors_on_malformed_tolerance_json(
+    monkeypatch, tmp_path
+):
+    """A tolerance_json string that is not valid JSON returns status='error' before any subprocess call. This is a caller-contract violation, not an infrastructure failure downstream of a good-faith attempt."""
+    monkeypatch.chdir(tmp_path)
+    _stage_baseline_for_singleton(
+        tmp_path, "k",
+        oracle_payload={"kernel": "k", "seed": 42, "inputs": {}, "outputs": {}},
+    )
+
+    def fail_run(*a, **kw):
+        raise AssertionError("subprocess.run must not be called on bad JSON")
+
+    monkeypatch.setattr(subprocess, "run", fail_run)
+
+    result = tools.test_variable_downcast(
+        "k", "a", "float", "not-json", "kokkos"
+    )
+
+    assert result["status"] == "error"
+    assert "JSON" in result["stderr"] or "json" in result["stderr"]
+
+
+def test_variable_downcast_errors_on_bad_tolerance_shape(monkeypatch, tmp_path):
+    """A tolerance_json object with an unknown `kind` or a non-positive `value` returns status='error' before any subprocess call. Guards against silently applying a nonsense yardstick."""
+    monkeypatch.chdir(tmp_path)
+    _stage_baseline_for_singleton(
+        tmp_path, "k",
+        oracle_payload={"kernel": "k", "seed": 42, "inputs": {}, "outputs": {}},
+    )
+
+    def fail_run(*a, **kw):
+        raise AssertionError("subprocess.run must not be called on bad tolerance")
+
+    monkeypatch.setattr(subprocess, "run", fail_run)
+
+    # Bad kind.
+    bad_kind = json.dumps({"kind": "ulps", "value": 3, "source": "user_cli"})
+    r1 = tools.test_variable_downcast("k", "a", "float", bad_kind, "kokkos")
+    assert r1["status"] == "error"
+    assert "ulps" in r1["stderr"] or "kind" in r1["stderr"]
+
+    # Bad value (zero).
+    bad_val = json.dumps({"kind": "sig_figs", "value": 0, "source": "user_cli"})
+    r2 = tools.test_variable_downcast("k", "a", "float", bad_val, "kokkos")
+    assert r2["status"] == "error"
+
+
+def test_variable_downcast_errors_when_alias_line_missing(
+    monkeypatch, tmp_path
+):
+    """When the baseline driver has kernel sentinels but no `using <VarName>Type = ...;` line for the requested variable inside them, the tool returns status='error' with a message naming the variable. Common cause: the analyst named an integer parameter (no alias emitted) or a variable that isn't in this kernel at all."""
+    monkeypatch.chdir(tmp_path)
+    src = _SINGLETON_BASELINE_TEMPLATE.format(
+        sentinel_begin=KERNEL_BEGIN_SENTINEL,
+        sentinel_end=KERNEL_END_SENTINEL,
+    )
+    _stage_baseline_for_singleton(
+        tmp_path, "k",
+        oracle_payload={"kernel": "k", "seed": 42, "inputs": {}, "outputs": {}},
+        driver_source=src,
+    )
+
+    def fail_run(*a, **kw):
+        raise AssertionError("subprocess.run must not be called when alias is missing")
+
+    monkeypatch.setattr(subprocess, "run", fail_run)
+
+    # `q` has no alias line in the template.
+    result = tools.test_variable_downcast(
+        "k", "q", "float", _TOL_SIG_FIGS_3, "kokkos"
+    )
+
+    assert result["status"] == "error"
+    assert "qType" in result["stderr"] or "q" in result["stderr"]
+
+
+def test_variable_downcast_errors_when_alias_line_duplicated(
+    monkeypatch, tmp_path
+):
+    """If two `using aType = ...;` lines exist inside the sentinels (contract violation from the baseline_harness), the tool refuses the splice with status='error' rather than picking one non-deterministically. This is defensive: the alias contract in the harness prompt promises exactly one per parameter."""
+    monkeypatch.chdir(tmp_path)
+    src = f"""\
+int main() {{
+{KERNEL_BEGIN_SENTINEL}
+using aType = Kokkos::View<double*>;
+using aType = double;
+using bType = double;
+{KERNEL_END_SENTINEL}
+  return 0;
+}}
+"""
+    _stage_baseline_for_singleton(
+        tmp_path, "k",
+        oracle_payload={"kernel": "k", "seed": 42, "inputs": {}, "outputs": {}},
+        driver_source=src,
+    )
+
+    def fail_run(*a, **kw):
+        raise AssertionError("subprocess.run must not be called on duplicate alias")
+
+    monkeypatch.setattr(subprocess, "run", fail_run)
+
+    result = tools.test_variable_downcast(
+        "k", "a", "float", _TOL_SIG_FIGS_3, "kokkos"
+    )
+
+    assert result["status"] == "error"
+    assert "2" in result["stderr"]
+
+
+def test_variable_downcast_errors_when_alias_rhs_has_no_double(
+    monkeypatch, tmp_path
+):
+    """If the alias RHS is already `float` (or any type without a `double` token), there is nothing to downcast to `float`, so the tool errors instead of returning a no-op success that would deceive the orchestrator into thinking the variable had been downcast."""
+    monkeypatch.chdir(tmp_path)
+    src = f"""\
+int main() {{
+{KERNEL_BEGIN_SENTINEL}
+using aType = Kokkos::View<float*>;
+{KERNEL_END_SENTINEL}
+  return 0;
+}}
+"""
+    _stage_baseline_for_singleton(
+        tmp_path, "k",
+        oracle_payload={"kernel": "k", "seed": 42, "inputs": {}, "outputs": {}},
+        driver_source=src,
+    )
+
+    def fail_run(*a, **kw):
+        raise AssertionError("subprocess.run must not be called on no-double alias")
+
+    monkeypatch.setattr(subprocess, "run", fail_run)
+
+    result = tools.test_variable_downcast(
+        "k", "a", "float", _TOL_SIG_FIGS_3, "kokkos"
+    )
+
+    assert result["status"] == "error"
+    assert "double" in result["stderr"]
+
+
+def test_variable_downcast_splice_replaces_double_with_target_cxx(
+    monkeypatch, tmp_path
+):
+    """Happy-path splice: for variable `b` whose baseline alias is `using bType = Kokkos::View<const double*>;`, the mutated singleton driver at baselines/<stem>/varprobe/singleton_b/driver.cpp has `Kokkos::View<const float*>` and no `double` on that line. The baseline driver at baselines/<stem>/driver.cpp is left byte-for-byte unchanged; other alias lines (aType, alphaType) are unaffected."""
+    monkeypatch.chdir(tmp_path)
+    oracle = {"kernel": "k", "seed": 42, "inputs": {}, "outputs": {"y": [1.0]}}
+    _stage_baseline_for_singleton(tmp_path, "k", oracle_payload=oracle)
+    baseline_src_before = (tmp_path / "baselines" / "k" / "driver.cpp").read_text()
+
+    _install_fake_compile_and_run(
+        monkeypatch, tmp_path, candidate_payload=oracle
+    )
+
+    result = tools.test_variable_downcast(
+        "k", "b", "float", _TOL_SIG_FIGS_3, "kokkos"
+    )
+
+    assert result["status"] == "ok", result["stderr"]
+    singleton_src = (
+        tmp_path / "baselines" / "k" / "varprobe" / "singleton_b" / "driver.cpp"
+    ).read_text()
+    assert "using bType = Kokkos::View<const float*>;" in singleton_src
+    # Other alias lines are untouched.
+    assert "using aType = Kokkos::View<double*>;" in singleton_src
+    assert "using alphaType = double;" in singleton_src
+    # And the baseline driver is untouched.
+    baseline_src_after = (tmp_path / "baselines" / "k" / "driver.cpp").read_text()
+    assert baseline_src_after == baseline_src_before
+
+
+def test_variable_downcast_variable_name_boundary_isolation(
+    monkeypatch, tmp_path
+):
+    """A request for variable `a` must NOT match `alphaType` (the alias line for a different variable whose name happens to start with `a`). Guards against a naive substring-match splice that would silently retarget the wrong alias."""
+    monkeypatch.chdir(tmp_path)
+    src = f"""\
+int main() {{
+{KERNEL_BEGIN_SENTINEL}
+using alphaType = double;
+{KERNEL_END_SENTINEL}
+  return 0;
+}}
+"""
+    _stage_baseline_for_singleton(
+        tmp_path, "k",
+        oracle_payload={"kernel": "k", "seed": 42, "inputs": {}, "outputs": {}},
+        driver_source=src,
+    )
+
+    def fail_run(*a, **kw):
+        raise AssertionError("subprocess.run must not be called; no aType alias exists")
+
+    monkeypatch.setattr(subprocess, "run", fail_run)
+
+    result = tools.test_variable_downcast(
+        "k", "a", "float", _TOL_SIG_FIGS_3, "kokkos"
+    )
+
+    assert result["status"] == "error"
+    # The error should be the missing-alias error, NOT a wrong-splice
+    # success. We verify by confirming no singleton driver was written.
+    singleton_dir = tmp_path / "baselines" / "k" / "varprobe" / "singleton_a"
+    assert not (singleton_dir / "driver.cpp").exists()
+
+
+def test_variable_downcast_returns_ok_on_tolerance_pass(monkeypatch, tmp_path):
+    """When the mutated driver produces output identical (within tolerance) to the oracle, the tool returns status='ok' with stdout starting `VERDICT: pass` and lists the singleton source, binary, and reference.json in artifacts."""
+    monkeypatch.chdir(tmp_path)
+    oracle = {
+        "kernel": "k", "seed": 42, "inputs": {},
+        "outputs": {"y": [1.0, 2.0, 3.0]},
+    }
+    _stage_baseline_for_singleton(tmp_path, "k", oracle_payload=oracle)
+    _install_fake_compile_and_run(
+        monkeypatch, tmp_path, candidate_payload=oracle
+    )
+
+    result = tools.test_variable_downcast(
+        "k", "a", "float", _TOL_SIG_FIGS_3, "kokkos"
+    )
+
+    assert result["status"] == "ok", result["stderr"]
+    assert result["stdout"].startswith("VERDICT: pass")
+    assert any("varprobe/singleton_a/driver.cpp" in a for a in result["artifacts"])
+    assert any(a.endswith("varprobe/singleton_a/driver") for a in result["artifacts"])
+    assert any(
+        "varprobe/singleton_a/reference.json" in a for a in result["artifacts"]
+    )
+
+
+def test_variable_downcast_returns_ok_on_tolerance_fail(monkeypatch, tmp_path):
+    """When the mutated driver's output deviates beyond tolerance from the oracle, the tool returns status='ok' (a mismatch is a valid VERDICT, not an infrastructure failure) with stdout starting `VERDICT: fail`. The mismatch summary in stdout names the offending output. status='error' is reserved for infra-level failures per the tool's contract."""
+    monkeypatch.chdir(tmp_path)
+    oracle = {
+        "kernel": "k", "seed": 42, "inputs": {},
+        "outputs": {"y": [1.0, 2.0, 3.0]},
+    }
+    # Candidate deviates well beyond 3 sig figs on every entry.
+    candidate = {
+        "kernel": "k", "seed": 42, "inputs": {},
+        "outputs": {"y": [1.5, 2.5, 3.5]},
+    }
+    _stage_baseline_for_singleton(tmp_path, "k", oracle_payload=oracle)
+    _install_fake_compile_and_run(
+        monkeypatch, tmp_path, candidate_payload=candidate
+    )
+
+    result = tools.test_variable_downcast(
+        "k", "a", "float", _TOL_SIG_FIGS_3, "kokkos"
+    )
+
+    assert result["status"] == "ok", result["stderr"]
+    assert result["stdout"].startswith("VERDICT: fail")
+    assert "'y'" in result["stdout"]
+
+
+def test_variable_downcast_propagates_compile_failure_as_error(
+    monkeypatch, tmp_path
+):
+    """If the mutated driver fails to compile, the tool returns status='error' with the compiler's stderr propagated verbatim. The orchestrator sees the diagnostic and can retry with a different target or fall back to `keep`."""
+    monkeypatch.chdir(tmp_path)
+    _stage_baseline_for_singleton(
+        tmp_path, "k",
+        oracle_payload={"kernel": "k", "seed": 42, "inputs": {}, "outputs": {}},
+    )
+    _install_fake_compile_and_run(
+        monkeypatch, tmp_path, candidate_payload={}, compile_ok=False
+    )
+
+    result = tools.test_variable_downcast(
+        "k", "a", "float", _TOL_SIG_FIGS_3, "kokkos"
+    )
+
+    assert result["status"] == "error"
+    # Compile failure propagates the compiler stderr.
+    assert "boom" in result["stderr"]
+
+
+def test_variable_downcast_propagates_run_failure_as_error(
+    monkeypatch, tmp_path
+):
+    """If the mutated driver compiles but fails at runtime (non-zero exit, timeout, or missing reference.json), the tool returns status='error'. Distinct from a tolerance-mismatch, which is status='ok' + VERDICT: fail."""
+    monkeypatch.chdir(tmp_path)
+    _stage_baseline_for_singleton(
+        tmp_path, "k",
+        oracle_payload={"kernel": "k", "seed": 42, "inputs": {}, "outputs": {}},
+    )
+    _install_fake_compile_and_run(
+        monkeypatch, tmp_path, candidate_payload={}, run_ok=False
+    )
+
+    result = tools.test_variable_downcast(
+        "k", "a", "float", _TOL_SIG_FIGS_3, "kokkos"
+    )
+
+    assert result["status"] == "error"
+
+
+def test_variable_downcast_shape_mismatch_between_oracle_and_candidate_is_error(
+    monkeypatch, tmp_path
+):
+    """If the oracle and the singleton candidate disagree on the shape of `outputs` (different array names, different lengths, or a kernel/seed mismatch), the tool returns status='error' rather than fabricating a VERDICT. Shape divergence usually means the splice broke something structural."""
+    monkeypatch.chdir(tmp_path)
+    oracle = {
+        "kernel": "k", "seed": 42, "inputs": {},
+        "outputs": {"y": [1.0, 2.0, 3.0]},
+    }
+    # Candidate has a different length for `y`.
+    candidate = {
+        "kernel": "k", "seed": 42, "inputs": {},
+        "outputs": {"y": [1.0, 2.0]},
+    }
+    _stage_baseline_for_singleton(tmp_path, "k", oracle_payload=oracle)
+    _install_fake_compile_and_run(
+        monkeypatch, tmp_path, candidate_payload=candidate
+    )
+
+    result = tools.test_variable_downcast(
+        "k", "a", "float", _TOL_SIG_FIGS_3, "kokkos"
+    )
+
+    assert result["status"] == "error"
+
+
+def test_variable_downcast_result_keys_are_stable(monkeypatch, tmp_path):
+    """Every code path (early error, splice error, compile error, run error, ok) returns the same four keys: status, stdout, stderr, artifacts. Uniformity across code paths is the contract every orchestrator tool must honor so _execute_tool's result handling stays branchless."""
+    monkeypatch.chdir(tmp_path)
+    expected_keys = {"status", "stdout", "stderr", "artifacts"}
+
+    # Early error: baseline missing.
+    r_early = tools.test_variable_downcast(
+        "k", "a", "float", _TOL_SIG_FIGS_3, "kokkos"
+    )
+    assert set(r_early.keys()) >= expected_keys
+
+    # Happy path.
+    oracle = {
+        "kernel": "k", "seed": 42, "inputs": {},
+        "outputs": {"y": [1.0]},
+    }
+    _stage_baseline_for_singleton(tmp_path, "k", oracle_payload=oracle)
+    _install_fake_compile_and_run(
+        monkeypatch, tmp_path, candidate_payload=oracle
+    )
+    r_ok = tools.test_variable_downcast(
+        "k", "a", "float", _TOL_SIG_FIGS_3, "kokkos"
+    )
+    assert set(r_ok.keys()) >= expected_keys
+    assert r_ok["status"] == "ok"
