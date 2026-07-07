@@ -360,6 +360,344 @@ PROBE EVIDENCE (when present in your task):
     headroom_argument source-grounded."""
 
 # ---------------------------------------------------------------------------
+# Candidate finder
+# ---------------------------------------------------------------------------
+#
+# The candidate finder is the FIRST agent in the per-variable analyst
+# pipeline. It runs after the precision probe (when the probe ran) and
+# before any spawn_variable_analyst call. Its job is triage: rank every
+# floating-point variable in the kernel by likelihood of surviving a
+# downcast, and mark variables that are certainly-dangerous (long-time
+# integrators, cancellation-prone reductions, exponent-blow-up sites)
+# as non-candidates so we don't waste a per-variable analyst call on
+# them. Downstream steps iterate over `downcast_candidate=true` entries
+# in rank order (best-first); `downcast_candidate=false` entries never
+# get their own analyst call and are treated as fixed 'keep' verdicts
+# by the finalizer.
+#
+# Coverage rule (same as the analyst): one entry per named
+# floating-point variable, with every variable accounted for in a
+# single unified list. Splitting into candidates/excluded arrays was
+# considered and rejected because reconciling the two lists to
+# guarantee coverage is easy to get wrong.
+
+CANDIDATE_FINDER_OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "variables": {
+            "type": "array",
+            "description": (
+                "One entry per named variable in the kernel that carries "
+                "a floating-point value. Include every such variable; "
+                "coverage is mandatory. An entry missing from this array "
+                "is treated as a wrong answer."
+            ),
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": (
+                            "The variable's name as it appears in the "
+                            "source."
+                        ),
+                    },
+                    "downcast_candidate": {
+                        "type": "boolean",
+                        "description": (
+                            "True iff this variable is worth trying to "
+                            "downcast. Set false ONLY when the source "
+                            "and/or probe evidence show a certain "
+                            "danger (long-time integrator, cancellation-"
+                            "prone reduction, exponent blow-up, or a "
+                            "probe cell whose per-output stats already "
+                            "exceed the tolerance for this variable's "
+                            "output). Downstream steps will not spend a "
+                            "per-variable analyst call on a false "
+                            "entry; it becomes a fixed 'keep' verdict."
+                        ),
+                    },
+                    "rank": {
+                        "type": "integer",
+                        "description": (
+                            "1 = most likely to survive downcast; larger "
+                            "= less likely. Every variable gets a rank, "
+                            "candidates and non-candidates alike, to "
+                            "make the triage auditable. Ranks must be "
+                            "unique across the array (no ties)."
+                        ),
+                    },
+                    "rationale": {
+                        "type": "string",
+                        "description": (
+                            "One-line justification for both the "
+                            "downcast_candidate bool and the rank, "
+                            "grounded in the kernel's numerics "
+                            "(cancellation, accumulation, long-time "
+                            "integration, bounded range, etc.) and, "
+                            "when present, the probe evidence."
+                        ),
+                    },
+                },
+                "required": [
+                    "name",
+                    "downcast_candidate",
+                    "rank",
+                    "rationale",
+                ],
+            },
+        },
+        "overall_notes": {
+            "type": "string",
+            "description": (
+                "Brief cross-cutting observations about the kernel's "
+                "numerical structure that shaped the ranking (e.g. "
+                "'kernel is dominated by a single accumulator loop'; "
+                "'all outputs are bounded in [-1, 1]'). Optional but "
+                "useful context for the per-variable analysts that "
+                "follow."
+            ),
+        },
+    },
+    "required": ["variables", "overall_notes"],
+}
+
+CANDIDATE_FINDER_SYSTEM_PROMPT = """You are the candidate-finder agent
+for a mixed-precision analysis pipeline. You run FIRST, before any
+per-variable analyst call, and your output steers which variables the
+downstream analysts spend a full analysis on.
+
+You will be given a kernel's source AND an output-precision tolerance
+(either N significant figures of the output, or N decimal digits after
+the point). If the orchestrator ran a precision probe on this kernel,
+you will ALSO be given a PROBE EVIDENCE (JSON) block at the end of
+your task showing per-output numerical stats from the kernel run at
+several precisions (currently quad / double / float / mixed_io) and
+seeds (currently 42 and 43).
+
+Your job is triage, not verdict. For every named floating-point
+variable in the kernel, produce:
+
+  { name, downcast_candidate: bool, rank: int, rationale: str }
+
+Rules:
+
+- COVERAGE: enumerate every named floating-point entity in the kernel
+  (scalar arguments, View / array / container arguments, local
+  variables, loop-carried accumulators, named temporaries) and emit
+  exactly one entry per name. Do not invent variables. Do not omit
+  variables. An entry missing from your list is treated as a wrong
+  answer.
+
+- downcast_candidate:
+  * TRUE for variables that look plausibly downcast-safe. This is the
+    default answer. Prefer inclusion; the per-variable analysts will
+    do the deeper analysis and the empirical tests will catch anything
+    they miss.
+  * FALSE only when the source and/or probe evidence show a certain
+    danger: a long-time integrator (state that evolves over many
+    steps), a cancellation-prone subtraction of nearby values, a
+    reduction / accumulator that visibly loses digits, an
+    exponent-blow-up site (exp / pow of a large magnitude), or a
+    probe cell whose per-output stats for THIS variable's output
+    already exceed the tolerance. If in doubt, mark TRUE; the cost of
+    a false-positive candidate is one wasted analyst call, but the
+    cost of a false-negative is a permanently-locked 'keep' verdict
+    that a real analyst would have overturned.
+
+- rank: 1 = most likely to survive downcast, 2 = next, and so on.
+  Every variable gets a rank, candidates and non-candidates alike,
+  so the triage is fully auditable. Ranks MUST be unique across the
+  array (no ties). Non-candidates typically rank at the bottom, but
+  order them by relative safety within the non-candidate group too
+  (a 'noisy accumulator' outranks a 'long-time integrator' even
+  though both are false).
+
+- rationale: one line naming the specific numerical concern
+  (cancellation, accumulation, long-time integration, bounded range,
+  probe cell max_absrel = X against tolerance = Y, etc.) that
+  justifies both the bool AND the rank.
+
+You do NOT decide the actual precision action (downcast / emulate /
+keep), you do NOT fill in target_precision or emulation_type, and
+you do NOT propose kernel-shape rework. Those are downstream
+responsibilities. Your only job is to say which variables are worth
+the downstream analysts' time, and in what order.
+
+PROBE EVIDENCE (when present in your task):
+- A cell whose per-output stats are well below the tolerance is
+  evidence for downcast_candidate=TRUE for the variables that feed
+  that output.
+- A cell whose stats are AT or ABOVE the tolerance is evidence for
+  downcast_candidate=FALSE for the variables that feed that output.
+- A large cross-seed delta (same precision, very different results
+  at seed=42 vs seed=43) is evidence of input-dependent rounding
+  pain and usually argues for FALSE.
+- A 'no_quad_partner', 'missing', or 'load_error' cell means no
+  signal — NOT 'precision is safe'. Reason from source for those
+  variables and default to TRUE unless the source itself is a red
+  flag.
+- The evidence is per-output, not per-variable. Map outputs back to
+  the variables that produced them using your source-level
+  understanding of the kernel.
+
+Return your result by calling the submit_result tool with:
+- variables: the per-variable triage list described above.
+- overall_notes: brief cross-cutting observations about the kernel's
+  numerical structure (optional but useful)."""
+
+# ---------------------------------------------------------------------------
+# Variable analyst (per-variable slice of the old monolithic analyst)
+# ---------------------------------------------------------------------------
+#
+# One instance of this agent runs per candidate_finder entry whose
+# downcast_candidate=True. It reasons about the WHOLE kernel (so it does
+# not miss cross-variable numerical coupling) but returns a verdict for
+# a single named variable. The orchestrator LLM assembles the per-call
+# results into an ANALYST_OUTPUT_SCHEMA-shaped dict when it invokes
+# spawn_rewriter next; non-candidates from the finder become fixed
+# 'keep' entries.
+#
+# The variable_analyst deliberately does NOT emit precision_budget or
+# rework: those are top-level, whole-kernel concerns that don't
+# decompose per-variable. Step 5's analyst_finalizer fills them in.
+
+VARIABLE_ANALYST_OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "variable": {
+            "type": "object",
+            "description": (
+                "The single-variable verdict. Shape matches one entry "
+                "of ANALYST_OUTPUT_SCHEMA.variables[] verbatim, so the "
+                "orchestrator can splice N of these together into a "
+                "monolithic-analyst-shaped dict without any field "
+                "renaming."
+            ),
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": (
+                        "The variable's name as it appears in the "
+                        "source. MUST equal the TARGET VARIABLE name "
+                        "supplied in the task."
+                    ),
+                },
+                "action": {
+                    "type": "string",
+                    "enum": ["downcast", "emulate", "keep"],
+                    "description": (
+                        "Same semantics as ANALYST_OUTPUT_SCHEMA: "
+                        "'downcast' narrows the storage type, "
+                        "'emulate' keeps effective precision via a "
+                        "software-emulated pair (float-float / "
+                        "Dekker), 'keep' leaves the variable alone."
+                    ),
+                },
+                "target_precision": {
+                    "type": "string",
+                    "description": (
+                        "Target hardware precision when "
+                        "action='downcast' (e.g. 'float', 'half'). "
+                        "Empty string when action='emulate' or 'keep'."
+                    ),
+                },
+                "emulation_type": {
+                    "type": "string",
+                    "description": (
+                        "Name of the emulated representation when "
+                        "action='emulate' (e.g. 'float-float'). "
+                        "Empty string when action='downcast' or "
+                        "'keep'."
+                    ),
+                },
+                "reason": {
+                    "type": "string",
+                    "description": (
+                        "One-line justification grounded in the "
+                        "kernel's numerics."
+                    ),
+                },
+            },
+            "required": [
+                "name",
+                "action",
+                "target_precision",
+                "emulation_type",
+                "reason",
+            ],
+        },
+        "notes": {
+            "type": "string",
+            "description": (
+                "Optional per-call notes about interactions with other "
+                "variables that the finalizer might want to consider "
+                "when writing overall_notes / precision_budget."
+            ),
+        },
+    },
+    "required": ["variable", "notes"],
+}
+
+VARIABLE_ANALYST_SYSTEM_PROMPT = """You are a per-variable mixed-precision
+analyst. Unlike the monolithic analyst you replaced, you analyze the
+WHOLE kernel but return a verdict for exactly one named variable.
+
+Your task will contain:
+- The full kernel source.
+- A tolerance block (target_kind = sig_figs or decimal_digits,
+  target_value, source). This is a HARD constraint on the kernel's
+  outputs, not a preference.
+- A PROBE EVIDENCE (JSON) block (when the orchestrator ran a probe).
+  Same schema and interpretation rules as for the candidate_finder:
+  per-output stats at several precisions and seeds, with 'ok',
+  'missing', 'load_error', 'no_quad_partner', or 'shape_error'
+  statuses per cell.
+- A CANDIDATE FINDER RESULT (JSON) block: the ranked triage list
+  produced by the candidate_finder agent, showing which variables
+  were flagged downcast_candidate=True / False and why. Treat this
+  as context, not gospel — you may downgrade a TRUE finder call to
+  'keep' if the source reveals a hazard the finder missed.
+- A TARGET VARIABLE line naming exactly one variable. This is the
+  ONLY variable you emit a verdict for. Reason about the rest of
+  the kernel to understand coupling, but do not produce verdicts
+  for other variables.
+
+Pick action from {downcast, emulate, keep}:
+- 'downcast': replace the variable's declared type with a narrower
+  hardware type (float, half). Set target_precision accordingly;
+  leave emulation_type empty. Prefer this when the source and probe
+  evidence both suggest the variable is precision-safe.
+- 'emulate': keep effective precision via a software-emulated pair
+  (currently only float-float / Dekker). Set emulation_type; leave
+  target_precision empty. Use this ONLY when a straight downcast
+  would violate the tolerance AND the variable is on a hot path
+  where staying in double is a real cost. Emulate is
+  throughput-negative — never the default.
+- 'keep': leave the variable at its original precision. Set both
+  target_precision and emulation_type to the empty string. Use this
+  when the source shows a clear hazard (long-time integration,
+  cancellation-prone reduction, exponent blow-up) OR the probe
+  evidence for outputs this variable feeds is already at or above
+  the tolerance.
+
+Rules:
+- The name field in your output MUST equal the TARGET VARIABLE name
+  in the task. If you cannot find a variable by that name in the
+  source, return action='keep' with a reason explaining the miss.
+- Do NOT produce verdicts for any other variable.
+- Do NOT emit a precision_budget or rework block. Those are
+  whole-kernel concerns filled in by the finalizer downstream.
+- Do NOT silently substitute one action for another. If you think
+  downcast is unsafe but emulate is expensive, pick 'keep' and say
+  so in reason.
+
+Return your result by calling the submit_result tool with:
+- variable: { name, action, target_precision, emulation_type, reason }
+- notes: optional string with per-call observations about cross-
+  variable coupling."""
+
+# ---------------------------------------------------------------------------
 # Rewriter
 # ---------------------------------------------------------------------------
 
@@ -738,6 +1076,18 @@ from .languages import PROFILES as _PROFILES  # noqa: E402
 # reduced. See AGENTS.md for the rationale and `run_agent` for the
 # enforcement point.
 AGENTS = {
+    "candidate_finder": {
+        "system_prompt": CANDIDATE_FINDER_SYSTEM_PROMPT,
+        "output_schema": CANDIDATE_FINDER_OUTPUT_SCHEMA,
+        "model": "claude-opus-4-7",
+        "supports_temperature": False,
+    },
+    "variable_analyst": {
+        "system_prompt": VARIABLE_ANALYST_SYSTEM_PROMPT,
+        "output_schema": VARIABLE_ANALYST_OUTPUT_SCHEMA,
+        "model": "claude-opus-4-7",
+        "supports_temperature": False,
+    },
     "analyst": {
         "system_prompt": ANALYST_SYSTEM_PROMPT,
         "output_schema": ANALYST_OUTPUT_SCHEMA,

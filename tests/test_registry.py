@@ -4,6 +4,8 @@ from workflow.registry import (
     AGENTS,
     ANALYST_OUTPUT_SCHEMA,
     BASELINE_HARNESS_OUTPUT_SCHEMA,
+    CANDIDATE_FINDER_OUTPUT_SCHEMA,
+    VARIABLE_ANALYST_OUTPUT_SCHEMA,
     VERIFIER_OUTPUT_SCHEMA,
 )
 
@@ -11,6 +13,8 @@ from workflow.registry import (
 def test_known_agent_types():
     """AGENTS exposes the core agent types plus one baseline_harness_<lang> per registered language profile, with `baseline_harness` aliased to the Kokkos entry."""
     core_types = {
+        "candidate_finder",
+        "variable_analyst",
         "analyst",
         "rewriter",
         "verifier",
@@ -1094,3 +1098,123 @@ def test_baseline_harness_sycl_prompt_does_not_mention_omp_offload():
     assert "#pragma omp target" not in prompt
     assert "omp_set_num_threads" not in prompt
     assert "-fopenmp-targets" not in prompt
+
+
+# ---------- Candidate finder: schema shape + prompt smoke checks ----------
+
+
+def test_candidate_finder_registered():
+    """candidate_finder is a registered agent, distinct from analyst, with its own prompt + schema (not a back-compat alias to another entry)."""
+    assert "candidate_finder" in AGENTS
+    finder = AGENTS["candidate_finder"]
+    analyst = AGENTS["analyst"]
+    assert finder is not analyst
+    assert finder["output_schema"] is CANDIDATE_FINDER_OUTPUT_SCHEMA
+    assert finder["output_schema"] is not analyst["output_schema"]
+    assert finder["system_prompt"] != analyst["system_prompt"]
+
+
+def test_candidate_finder_schema_variable_item_required_fields():
+    """Each variables[] entry must declare name (str), downcast_candidate (bool), rank (int), rationale (str). Unified schema — one row per FP variable, non-candidates included so the triage is auditable."""
+    items = CANDIDATE_FINDER_OUTPUT_SCHEMA["properties"]["variables"]["items"]
+    assert items["type"] == "object"
+    required = set(items["required"])
+    assert required == {"name", "downcast_candidate", "rank", "rationale"}
+    props = items["properties"]
+    assert props["name"]["type"] == "string"
+    assert props["downcast_candidate"]["type"] == "boolean"
+    assert props["rank"]["type"] == "integer"
+    assert props["rationale"]["type"] == "string"
+
+
+def test_candidate_finder_schema_top_level_required_fields():
+    """The top-level object requires variables (the ranked list) and overall_notes (cross-cutting context for downstream analysts). No verdict, no precision_budget, no rework — the finder is triage, not verdict."""
+    required = set(CANDIDATE_FINDER_OUTPUT_SCHEMA["required"])
+    assert required == {"variables", "overall_notes"}
+    props = CANDIDATE_FINDER_OUTPUT_SCHEMA["properties"]
+    assert "verdict" not in props
+    assert "precision_budget" not in props
+    assert "rework" not in props
+
+
+def test_candidate_finder_prompt_mentions_probe_evidence_and_tolerance():
+    """The finder prompt tells the agent it may receive a PROBE EVIDENCE (JSON) block AND that the tolerance is a hard downstream constraint. Both pieces are handed to the finder the same way they are handed to the analyst."""
+    prompt = AGENTS["candidate_finder"]["system_prompt"]
+    assert "PROBE EVIDENCE" in prompt
+    assert "tolerance" in prompt.lower()
+
+
+def test_candidate_finder_schema_does_not_emit_verdicts():
+    """The finder's SCHEMA must not carry the analyst's per-variable action fields (action, target_precision, emulation_type) — that would collapse the finder and analyst back into one agent. The prompt is allowed to mention those tokens descriptively (e.g. 'you do NOT fill in target_precision'), so we check the schema shape, not prompt text."""
+    item_props = CANDIDATE_FINDER_OUTPUT_SCHEMA[
+        "properties"
+    ]["variables"]["items"]["properties"]
+    assert "action" not in item_props
+    assert "target_precision" not in item_props
+    assert "emulation_type" not in item_props
+
+
+# ---------- Variable analyst: schema shape + prompt smoke checks ----------
+
+
+def test_variable_analyst_registered():
+    """variable_analyst is a registered agent, distinct from analyst and candidate_finder, with its own prompt + schema (not a back-compat alias). Step 2 of the per-variable refactor introduces this agent; the monolithic analyst entry is retained only for the still-passing tests that exercise the legacy dispatch branch, not for LLM-driven runs."""
+    assert "variable_analyst" in AGENTS
+    var_analyst = AGENTS["variable_analyst"]
+    analyst = AGENTS["analyst"]
+    finder = AGENTS["candidate_finder"]
+    assert var_analyst is not analyst
+    assert var_analyst is not finder
+    assert var_analyst["output_schema"] is VARIABLE_ANALYST_OUTPUT_SCHEMA
+    assert var_analyst["output_schema"] is not analyst["output_schema"]
+    assert var_analyst["output_schema"] is not finder["output_schema"]
+    assert var_analyst["system_prompt"] != analyst["system_prompt"]
+    assert var_analyst["system_prompt"] != finder["system_prompt"]
+
+
+def test_variable_analyst_schema_top_level_shape():
+    """The top-level object requires exactly the single-variable verdict object plus per-call notes. No verdict, no precision_budget, no rework, no overall_notes — the finalizer (Step 5) owns those fields; the per-variable analyst is a per-variable specialist and nothing more."""
+    required = set(VARIABLE_ANALYST_OUTPUT_SCHEMA["required"])
+    assert required == {"variable", "notes"}
+    props = VARIABLE_ANALYST_OUTPUT_SCHEMA["properties"]
+    assert set(props) == {"variable", "notes"}
+    assert props["variable"]["type"] == "object"
+    assert props["notes"]["type"] == "string"
+
+
+def test_variable_analyst_schema_single_variable_matches_monolithic_item():
+    """The variable-verdict object's field set must equal one ANALYST_OUTPUT_SCHEMA.variables[] entry verbatim, so the orchestrator can splice N per-variable results into a monolithic-analyst-shaped dict in Step 2 with no field renaming. If the monolithic per-variable schema changes, this must change in lockstep."""
+    variable = VARIABLE_ANALYST_OUTPUT_SCHEMA["properties"]["variable"]
+    mono_item = ANALYST_OUTPUT_SCHEMA["properties"]["variables"]["items"]
+    assert set(variable["required"]) == set(mono_item["required"])
+    assert set(variable["properties"]) == set(mono_item["properties"])
+    # Enum on 'action' must be identical or the assembled monolithic
+    # dict fails downstream validation.
+    assert (
+        variable["properties"]["action"]["enum"]
+        == mono_item["properties"]["action"]["enum"]
+    )
+
+
+def test_variable_analyst_schema_does_not_emit_budget_or_rework():
+    """The variable analyst's SCHEMA must not carry precision_budget, rework, overall_notes, or any collection of multiple variables — those are the finalizer's job. Checking schema shape (not prompt text) so descriptive prompt mentions are allowed."""
+    props = VARIABLE_ANALYST_OUTPUT_SCHEMA["properties"]
+    assert "precision_budget" not in props
+    assert "rework" not in props
+    assert "overall_notes" not in props
+    assert "variables" not in props  # plural — that's the monolithic shape
+
+
+def test_variable_analyst_prompt_mentions_target_variable_and_finder_and_probe():
+    """The variable-analyst prompt must tell the agent (a) its task will name a TARGET VARIABLE and it returns a verdict only for that variable; (b) it may receive a CANDIDATE FINDER RESULT block for cross-variable context; and (c) it may receive a PROBE EVIDENCE block. All three are dispatch-time injections done by the orchestrator's `_execute_tool`; the prompt is the contract."""
+    prompt = AGENTS["variable_analyst"]["system_prompt"]
+    assert "TARGET VARIABLE" in prompt
+    assert "CANDIDATE FINDER" in prompt
+    assert "PROBE EVIDENCE" in prompt
+
+
+def test_variable_analyst_prompt_mentions_tolerance_as_hard_constraint():
+    """The tolerance is a hard downstream constraint (same rule as the monolithic analyst). Without this the per-variable specialist could recommend downcasts that violate the operator's target when composed with other per-variable verdicts."""
+    prompt = AGENTS["variable_analyst"]["system_prompt"]
+    assert "tolerance" in prompt.lower()
+    assert "hard" in prompt.lower() or "constraint" in prompt.lower()

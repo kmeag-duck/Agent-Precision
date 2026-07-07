@@ -79,6 +79,259 @@ def test_execute_tool_unknown_raises(monkeypatch):
         _execute_tool("not_a_tool", {}, KOKKOS_PROFILE)
 
 
+def test_execute_tool_dispatches_spawn_candidate_finder(monkeypatch):
+    """_execute_tool routes spawn_candidate_finder to run_agent('candidate_finder', kernel_source) and wraps the result the same way spawn_analyst does. Single-shot only — no ensemble path in this transitional phase (the finder is informational, not verdict-emitting, so K>1 self-consistency is not yet meaningful)."""
+    calls = []
+
+    def stub_run_agent(type_, task):
+        calls.append((type_, task))
+        return {
+            "variables": [
+                {
+                    "name": "x",
+                    "downcast_candidate": True,
+                    "rank": 1,
+                    "rationale": "bounded",
+                }
+            ],
+            "overall_notes": "stubbed",
+        }
+
+    def fail_ensemble(*a, **kw):
+        raise AssertionError(
+            "candidate_finder is single-shot in Step 1; run_agent_ensemble must not fire"
+        )
+
+    monkeypatch.setattr(orchestrator, "run_agent", stub_run_agent)
+    monkeypatch.setattr(orchestrator, "run_agent_ensemble", fail_ensemble)
+
+    result = _execute_tool(
+        "spawn_candidate_finder",
+        {"kernel_source": "SOURCE"},
+        KOKKOS_PROFILE,
+    )
+
+    assert result["status"] == "ok"
+    assert result["result"]["overall_notes"] == "stubbed"
+    assert calls == [("candidate_finder", "SOURCE")]
+    # Never carries aggregator_metadata — that key is the ensemble
+    # signal, and the finder does not ensemble.
+    assert "aggregator_metadata" not in result
+
+
+def test_execute_tool_spawn_candidate_finder_injects_probe_evidence_when_present(
+    monkeypatch, tmp_path,
+):
+    """spawn_candidate_finder shares the analyst's probe-evidence auto-injection: when baselines/<kernel_stem>/probe/evidence.json exists, the finder's task gets a PROBE EVIDENCE (JSON) block appended after the kernel source. Same read path (single source of truth for where evidence lives on disk), same silent-skip contract when the file is absent."""
+    monkeypatch.chdir(tmp_path)
+    evidence_dir = tmp_path / "baselines" / "nbody_force" / "probe"
+    evidence_dir.mkdir(parents=True)
+    evidence_payload = {"cells": {"float_seed42": {"status": "ok"}}}
+    (evidence_dir / "evidence.json").write_text(json.dumps(evidence_payload))
+
+    captured = {}
+
+    def stub_run_agent(type_, task):
+        captured["type"] = type_
+        captured["task"] = task
+        return {"variables": [], "overall_notes": "ok"}
+
+    monkeypatch.setattr(orchestrator, "run_agent", stub_run_agent)
+
+    result = _execute_tool(
+        "spawn_candidate_finder",
+        {"kernel_source": "ORIGINAL KERNEL SOURCE"},
+        KOKKOS_PROFILE,
+        kernel_stem="nbody_force",
+    )
+
+    assert result["status"] == "ok"
+    assert captured["type"] == "candidate_finder"
+    assert captured["task"].startswith("ORIGINAL KERNEL SOURCE")
+    assert "PROBE EVIDENCE (JSON):" in captured["task"]
+    assert "float_seed42" in captured["task"]
+    para_idx = captured["task"].index("PROBE EVIDENCE (JSON):")
+    json_idx = captured["task"].index('"cells"')
+    assert json_idx > para_idx
+
+
+def test_execute_tool_spawn_candidate_finder_no_evidence_file_unchanged_task(
+    monkeypatch, tmp_path,
+):
+    """When evidence.json is absent, spawn_candidate_finder silently falls back to the un-augmented kernel source — same rule the analyst branch already follows. Missing evidence is informational-absent, never a hard stop."""
+    monkeypatch.chdir(tmp_path)
+    captured = {}
+
+    def stub_run_agent(type_, task):
+        captured["task"] = task
+        return {"variables": [], "overall_notes": "ok"}
+
+    monkeypatch.setattr(orchestrator, "run_agent", stub_run_agent)
+
+    _execute_tool(
+        "spawn_candidate_finder",
+        {"kernel_source": "ORIGINAL KERNEL SOURCE"},
+        KOKKOS_PROFILE,
+        kernel_stem="nbody_force",
+    )
+
+    assert captured["task"] == "ORIGINAL KERNEL SOURCE"
+    assert "PROBE EVIDENCE" not in captured["task"]
+
+
+def test_execute_tool_dispatches_spawn_variable_analyst(monkeypatch):
+    """_execute_tool routes spawn_variable_analyst to run_agent('variable_analyst', task) where task = <kernel_source>\\n\\nTARGET VARIABLE: <name>. Single-shot only in Step 2 — no ensemble, no aggregator metadata. No probe-consistency gate on single-variable output (the gate walks a full variables[] list; running it here would be an under-check compared to the assembled verdict downstream — that's a Step 5 concern)."""
+    calls = []
+
+    def stub_run_agent(type_, task):
+        calls.append((type_, task))
+        return {
+            "variable": {
+                "name": "x",
+                "action": "downcast",
+                "target_precision": "float",
+                "emulation_type": "",
+                "reason": "bounded input",
+            },
+            "notes": "",
+        }
+
+    def fail_ensemble(*a, **kw):
+        raise AssertionError(
+            "variable_analyst is single-shot in Step 2; run_agent_ensemble must not fire"
+        )
+
+    monkeypatch.setattr(orchestrator, "run_agent", stub_run_agent)
+    monkeypatch.setattr(orchestrator, "run_agent_ensemble", fail_ensemble)
+
+    result = _execute_tool(
+        "spawn_variable_analyst",
+        {"kernel_source": "SOURCE", "target_variable": "x"},
+        KOKKOS_PROFILE,
+    )
+
+    assert result["status"] == "ok"
+    assert result["result"]["variable"]["name"] == "x"
+    assert len(calls) == 1
+    type_, task = calls[0]
+    assert type_ == "variable_analyst"
+    assert task.startswith("SOURCE")
+    assert "TARGET VARIABLE: x" in task
+    # Never carries aggregator_metadata — that key is the ensemble
+    # signal, and variable_analyst does not ensemble in Step 2.
+    assert "aggregator_metadata" not in result
+
+
+def test_execute_tool_spawn_variable_analyst_injects_probe_evidence_when_present(
+    monkeypatch, tmp_path,
+):
+    """spawn_variable_analyst shares the finder/analyst probe-evidence auto-injection: when baselines/<kernel_stem>/probe/evidence.json exists, the task gets a PROBE EVIDENCE (JSON) block appended AFTER the TARGET VARIABLE line (single source of truth for WHERE evidence lives on disk). The evidence block ordering — kernel_source, then TARGET VARIABLE, then PROBE EVIDENCE — keeps the variable name visible in-context with the CANDIDATE FINDER RESULT block the caller already put in kernel_source, while still funneling the probe stats last."""
+    monkeypatch.chdir(tmp_path)
+    evidence_dir = tmp_path / "baselines" / "nbody_force" / "probe"
+    evidence_dir.mkdir(parents=True)
+    evidence_payload = {"cells": {"float_seed42": {"status": "ok"}}}
+    (evidence_dir / "evidence.json").write_text(json.dumps(evidence_payload))
+
+    captured = {}
+
+    def stub_run_agent(type_, task):
+        captured["type"] = type_
+        captured["task"] = task
+        return {
+            "variable": {
+                "name": "vx",
+                "action": "keep",
+                "target_precision": "",
+                "emulation_type": "",
+                "reason": "insufficient headroom per probe",
+            },
+            "notes": "",
+        }
+
+    monkeypatch.setattr(orchestrator, "run_agent", stub_run_agent)
+
+    result = _execute_tool(
+        "spawn_variable_analyst",
+        {"kernel_source": "ORIGINAL KERNEL SOURCE", "target_variable": "vx"},
+        KOKKOS_PROFILE,
+        kernel_stem="nbody_force",
+    )
+
+    assert result["status"] == "ok"
+    assert captured["type"] == "variable_analyst"
+    task = captured["task"]
+    assert task.startswith("ORIGINAL KERNEL SOURCE")
+    assert "TARGET VARIABLE: vx" in task
+    assert "PROBE EVIDENCE (JSON):" in task
+    assert "float_seed42" in task
+    # Enforce section ordering: kernel_source, then TARGET VARIABLE,
+    # then PROBE EVIDENCE, then the JSON payload.
+    src_idx = task.index("ORIGINAL KERNEL SOURCE")
+    tv_idx = task.index("TARGET VARIABLE: vx")
+    probe_idx = task.index("PROBE EVIDENCE (JSON):")
+    json_idx = task.index('"cells"')
+    assert src_idx < tv_idx < probe_idx < json_idx
+
+
+def test_execute_tool_spawn_variable_analyst_no_evidence_file_unchanged_task(
+    monkeypatch, tmp_path,
+):
+    """When evidence.json is absent, spawn_variable_analyst silently falls back to the un-augmented task (kernel_source + TARGET VARIABLE line only) — same silent-skip rule the finder/analyst branches already follow. Missing evidence is informational-absent, never a hard stop; a kernel run without --probe (or on a profile with an empty probe_precisions) must still be able to call the per-variable analyst."""
+    monkeypatch.chdir(tmp_path)
+    captured = {}
+
+    def stub_run_agent(type_, task):
+        captured["task"] = task
+        return {
+            "variable": {
+                "name": "x",
+                "action": "downcast",
+                "target_precision": "float",
+                "emulation_type": "",
+                "reason": "no probe -- reasoning from source",
+            },
+            "notes": "",
+        }
+
+    monkeypatch.setattr(orchestrator, "run_agent", stub_run_agent)
+
+    _execute_tool(
+        "spawn_variable_analyst",
+        {"kernel_source": "ORIGINAL KERNEL SOURCE", "target_variable": "x"},
+        KOKKOS_PROFILE,
+        kernel_stem="nbody_force",
+    )
+
+    task = captured["task"]
+    assert "PROBE EVIDENCE" not in task
+    # Task is exactly kernel_source + separator + TARGET VARIABLE line.
+    assert task == "ORIGINAL KERNEL SOURCE\n\nTARGET VARIABLE: x"
+
+
+def test_orchestrator_tools_expose_spawn_variable_analyst_with_required_args():
+    """ORCHESTRATOR_TOOLS exposes spawn_variable_analyst with exactly {kernel_source, target_variable} as required inputs. The CANDIDATE FINDER RESULT block is embedded IN kernel_source by the orchestrator LLM (not passed as a separate arg) so the tool schema stays minimal and the same content can be reused across N per-variable calls with only target_variable changing."""
+    tool = next(
+        t for t in orchestrator.ORCHESTRATOR_TOOLS
+        if t["name"] == "spawn_variable_analyst"
+    )
+    schema = tool["input_schema"]
+    assert schema["type"] == "object"
+    assert set(schema["required"]) == {"kernel_source", "target_variable"}
+    props = schema["properties"]
+    assert props["kernel_source"]["type"] == "string"
+    assert props["target_variable"]["type"] == "string"
+
+
+def test_orchestrator_tools_no_longer_expose_spawn_analyst():
+    """Step 2 of the per-variable refactor REMOVES spawn_analyst from the LLM-visible tool list — the monolithic analyst is replaced by the candidate_finder + N * variable_analyst pipeline (Step 5 will add a finalizer for precision_budget / rework). The dispatch branch for spawn_analyst inside _execute_tool is INTENTIONALLY retained as a callable-from-tests-only backdoor so the 39 existing test references keep working during the transition; this test guards the LLM-visible surface, not the Python API."""
+    names = {t["name"] for t in orchestrator.ORCHESTRATOR_TOOLS}
+    assert "spawn_analyst" not in names
+    # Sanity: the replacement IS exposed, so this test can't false-pass
+    # by accidentally guarding against a completely-empty tool list.
+    assert "spawn_variable_analyst" in names
+    assert "spawn_candidate_finder" in names
+
+
 def test_execute_tool_dispatches_spawn_analyst(monkeypatch):
     """_execute_tool routes spawn_analyst to run_agent('analyst', kernel_source) and wraps the result."""
     calls = []
@@ -2253,10 +2506,12 @@ def test_orchestrator_prompt_mentions_compare_outputs_and_finish_gate():
     assert "tolerance_json" in text
     # Must explicitly call out the finish-gate change for .cpp inputs.
     assert "precondition for finish" in text.lower()
-    # Must mention the retry-bias suggestion (spawn_analyst, not
-    # spawn_rewriter, on comparator error) so the model has a clear
-    # next move when the gate blocks finish.
-    assert "spawn_analyst" in text
+    # Must mention the retry-bias suggestion (per-variable analyst,
+    # not spawn_rewriter, on comparator error) so the model has a
+    # clear next move when the gate blocks finish. Step 2 of the
+    # per-variable refactor removed the monolithic spawn_analyst
+    # tool; the retry is now spawn_variable_analyst.
+    assert "spawn_variable_analyst" in text
 
 
 def test_format_baseline_block_cpp_mentions_compare_outputs_step():

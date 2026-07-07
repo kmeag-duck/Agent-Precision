@@ -1,8 +1,12 @@
 """LLM orchestrator with human-in-the-loop pause before every agent call.
 
 The orchestrator is itself a Claude conversation. Its tools are one per
-agent type (`spawn_analyst`, `spawn_rewriter`) plus a `finish` tool that
-ends the workflow.
+agent type (`spawn_candidate_finder`, `spawn_variable_analyst`,
+`spawn_rewriter`, `spawn_verifier`, `spawn_baseline_harness`) plus a
+`finish` tool that ends the workflow. `spawn_analyst` is no longer
+exposed as a tool to the orchestrator LLM in step 2 of the per-variable
+refactor; its `_execute_tool` branch is retained so unit tests and
+future direct callers still work.
 
 Before any tool is actually executed, this module prints the (tool_name,
 arguments) and waits for the user to approve (y), reject (n), or quit (q).
@@ -11,7 +15,8 @@ orchestrator decided to send to an agent before that call runs.
 
 The orchestrator itself is a router + guardrail: it dispatches to
 specialist agents and assembles their outputs. It does not make
-per-variable precision decisions — that is the analyst's job.
+per-variable precision decisions — that is the candidate_finder's
+job (triage) and the variable_analyst's job (per-variable verdict).
 """
 
 import json
@@ -81,11 +86,25 @@ Your job is to call the right agent at the right time, thread the
 tolerance and verdicts through their task prompts faithfully, and
 assemble their outputs.
 
-You have access to four specialist agents:
-  - analyst: takes the kernel source AND the agreed tolerance, and
-    returns a structured per-variable verdict plus an optional
-    kernel-shape rework block, a precision_budget block, and overall
-    notes. Per-variable entries are
+You have access to five specialist agents:
+  - candidate_finder: takes the kernel source AND the agreed tolerance,
+    and returns a ranked per-variable triage list of the form
+      {name, downcast_candidate, rank, rationale}
+    covering every named floating-point variable. It runs FIRST
+    (after the baseline / probe chain, before the per-variable
+    analysts) to decide which variables the downstream analysts
+    should spend time on. If the probe ran, the orchestrator
+    auto-attaches the probe evidence to its task; you do NOT need to
+    thread it through yourself.
+
+  - variable_analyst: takes the full kernel source, the agreed
+    tolerance, the candidate_finder result, and the name of ONE
+    target variable, and returns a single per-variable verdict
+      {name, action, target_precision, emulation_type, reason}
+    plus optional notes. You call this ONCE PER candidate_finder
+    entry whose downcast_candidate=true, in rank order. It replaces
+    the old monolithic analyst. If the probe ran, the orchestrator
+    also auto-attaches the probe evidence to each call's task. Per-variable entries are
       {name, action, target_precision, emulation_type, reason}
     where action is one of:
       * 'downcast' — replace the declared type with a narrower one
@@ -192,11 +211,12 @@ You also have two deterministic (non-LLM) tools:
     truth -> no comparison); any other missing or failed cell is
     recorded with a non-ok status and skipped during the stats walk.
     The aggregated evidence is INFORMATIONAL: the orchestrator loop
-    automatically attaches it to the next spawn_analyst call's task
-    prompt as a PROBE EVIDENCE (JSON) block — you do NOT need to
-    pass it through yourself. Call this exactly once, after all
-    probe_step cells the matrix lists have been attempted (succeed or
-    fail), and before spawn_analyst.
+    automatically attaches it to the next spawn_candidate_finder
+    call's task AND to each spawn_variable_analyst call's task as a
+    PROBE EVIDENCE (JSON) block — you do NOT need to pass it through
+    yourself. Call this exactly once, after all probe_step cells the
+    matrix lists have been attempted (succeed or fail), and before
+    spawn_candidate_finder.
 
   - splice_rewritten_kernel: takes a kernel_stem and the rewriter's
     rewritten kernel source. Reads the baseline driver source under
@@ -267,7 +287,8 @@ You also have two deterministic (non-LLM) tools:
     status='ok' for the current rewrite cycle. If compare_outputs
     returns an error, the numerical mismatch usually indicates the
     verifier's verdict was wrong rather than just the implementation;
-    spawn_analyst (not spawn_rewriter) is typically the right retry.
+    a spawn_variable_analyst re-run for the implicated variable(s)
+    (not spawn_rewriter) is typically the right retry.
     Profiles with dynamic_verification=False (none today; reserved for
     languages registered before a baseline harness exists) skip this
     whole chain and finish remains gated only on the verifier verdict.
@@ -292,36 +313,71 @@ Your job after the tolerance is fixed:
    a probe matrix (precision/seed pairs), drive each cell with one
    probe_step call, then call probe_compare exactly once. Failures
    in any baseline or probe call are non-fatal to the analyst ->
-   rewriter -> verifier loop; proceed to step 1 in either case.
-1. Call spawn_analyst with a kernel_source argument that contains the
-   kernel and a clearly-labeled tolerance block (target_kind,
-   target_value, source). The analyst will fill precision_budget from
-   that block. If probe_compare succeeded, the orchestrator will
-   automatically attach the aggregated probe evidence to the task; you
-   do not need to thread it through yourself.
-2. Translate the analyst's verdict into a self-contained task_prompt for
-   the rewriter. The prompt must include the full kernel source, the
-   agreed tolerance, and, for each variable, the analyst's chosen
-   method (downcast / emulate / keep) together with target_precision or
-   emulation_type as applicable. If the analyst's rework.suggested is
-   true, include the transformation, rationale, and affected_variables
-   verbatim and tell the rewriter to apply that transformation in
-   addition to the per-variable changes. Do not editorialize —
-   faithfully convey the analyst's calls and do not choose a method the
-   analyst did not ask for.
+   rewriter -> verifier loop; proceed to step 0.5 in either case.
+0.5. Call spawn_candidate_finder with a kernel_source argument that
+   contains the kernel and a clearly-labeled tolerance block
+   (target_kind, target_value, source). The finder ranks every
+   floating-point variable by downcast survivability and marks the
+   certainly-dangerous ones as non-candidates. If probe_compare
+   succeeded, the orchestrator will automatically attach the
+   aggregated probe evidence to the finder's task; you do not need
+   to thread it through yourself. This step is REQUIRED — step 1
+   iterates over its output.
+1. For EACH candidate_finder entry with downcast_candidate=true, in
+   ascending rank order, call spawn_variable_analyst with:
+     - kernel_source: the full kernel plus the same tolerance block
+       plus a CANDIDATE FINDER RESULT (JSON) block containing the
+       finder's full output (variables list + overall_notes),
+     - target_variable: the variable's name.
+   The orchestrator auto-attaches the probe evidence to each call's
+   task; you do not need to thread it through yourself. Collect all
+   N per-variable results in order.
+2. Assemble a self-contained task_prompt for the rewriter. The prompt
+   must include:
+     - the full kernel source,
+     - the agreed tolerance,
+     - a per-variable verdict list built by concatenating:
+       (a) the `variable` object from each spawn_variable_analyst
+           call for candidate_finder entries with
+           downcast_candidate=true, AND
+       (b) a fixed `{name, action:'keep', target_precision:'',
+           emulation_type:'', reason:'not a downcast candidate per
+           finder: <finder rationale>'}` entry for each
+           candidate_finder entry with downcast_candidate=false.
+   The concatenated list MUST cover every finder entry — coverage is
+   the invariant that keeps the downstream verifier / rewriter
+   contracts intact. Do not editorialize — faithfully convey the
+   per-variable analysts' calls and do not choose a method they did
+   not ask for.
 3. Call spawn_rewriter with that task_prompt.
 4. Call spawn_verifier with (original_source, rewritten_source from the
    rewriter, analyst_verdict_json, tolerance_json). The
-   analyst_verdict_json argument must be the analyst's full result
-   object serialized as a JSON string. The tolerance_json argument
-   must be the agreed tolerance serialized as a JSON string.
+   analyst_verdict_json argument must be a JSON object of the shape
+     {
+       "variables": [ ...the concatenated per-variable list from
+                      step 2... ],
+       "rework": {"suggested": false, "transformation": "",
+                  "rationale": "", "affected_variables": []},
+       "precision_budget": {"target_kind": <from tolerance>,
+                            "target_value": <from tolerance>,
+                            "source": <from tolerance>,
+                            "claimed_output_precision": "",
+                            "headroom_argument": ""},
+       "overall_notes": ""
+     }
+   serialized as a JSON string. The rework and precision_budget
+   stubs are intentional: the per-variable analysts do not emit
+   those blocks in this phase (a future finalizer agent will).
+   The tolerance_json argument must be the agreed tolerance
+   serialized as a JSON string.
 5. If the verifier returns verdict='accept', call finish with the
    rewritten code. If verdict='reject', either call spawn_rewriter again
    with a task_prompt that incorporates the verifier's per-variable
    mismatches and concerns, or — if the verifier's `concerns` implicate
-   the analyst's verdict itself — call spawn_analyst again with the
-   same tolerance. After any re-run, you must call spawn_verifier again
-   on the new rewrite before calling finish.
+   a specific variable's verdict — call spawn_variable_analyst again
+   for that variable (and re-assemble the verdict for the rewriter as
+   in step 2) with the same tolerance. After any re-run, you must
+   call spawn_verifier again on the new rewrite before calling finish.
 
 Hard rules:
 - You may not call finish unless the most recent spawn_verifier call
@@ -339,13 +395,22 @@ over several short ones."""
 
 ORCHESTRATOR_TOOLS = [
     {
-        "name": "spawn_analyst",
+        "name": "spawn_candidate_finder",
         "description": (
-            "Run the analyst agent on a kernel source AND a tolerance. "
-            "The kernel_source argument must contain both the kernel and a "
-            "clearly-labeled tolerance block (target_kind, target_value, "
-            "source). Returns the analyst's per-variable verdict, rework "
-            "block, precision_budget, and overall_notes."
+            "Run the candidate_finder agent on a kernel source AND a "
+            "tolerance. The kernel_source argument must contain both "
+            "the kernel and a clearly-labeled tolerance block "
+            "(target_kind, target_value, source). Returns a ranked "
+            "per-variable triage list of the form "
+            "{name, downcast_candidate, rank, rationale} covering "
+            "every named floating-point variable in the kernel, plus "
+            "optional overall_notes. Call this AFTER the baseline / "
+            "probe chain (if any) and BEFORE the per-variable "
+            "analysts. The orchestrator auto-attaches the aggregated "
+            "probe evidence (when present) to the finder's task; you "
+            "do not need to thread it through yourself. This step is "
+            "REQUIRED — the downstream spawn_variable_analyst loop "
+            "iterates over the finder's output."
         ),
         "input_schema": {
             "type": "object",
@@ -354,15 +419,57 @@ ORCHESTRATOR_TOOLS = [
                     "type": "string",
                     "description": (
                         "The full kernel source with a clearly-labeled "
-                        "tolerance block prepended or appended (containing "
-                        "target_kind, target_value, source). The analyst "
-                        "must see the tolerance so it can fill in "
-                        "precision_budget. Do not include file paths or "
-                        "other framing."
+                        "tolerance block prepended or appended "
+                        "(containing target_kind, target_value, "
+                        "source). Do not include file paths or other "
+                        "framing."
                     ),
                 },
             },
             "required": ["kernel_source"],
+        },
+    },
+    {
+        "name": "spawn_variable_analyst",
+        "description": (
+            "Run the variable_analyst agent on ONE target variable. "
+            "The kernel_source argument must contain the full kernel, "
+            "a clearly-labeled tolerance block (target_kind, "
+            "target_value, source), AND a CANDIDATE FINDER RESULT "
+            "(JSON) block with the finder's full output. The "
+            "target_variable argument names the single variable to "
+            "produce a verdict for. Returns {variable, notes} where "
+            "`variable` is one entry matching an "
+            "ANALYST_OUTPUT_SCHEMA.variables[] item. Call this ONCE "
+            "PER candidate_finder entry with downcast_candidate=true, "
+            "in ascending rank order. The orchestrator auto-attaches "
+            "the aggregated probe evidence (when present) to each "
+            "call's task; you do not need to thread it through "
+            "yourself."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "kernel_source": {
+                    "type": "string",
+                    "description": (
+                        "The full kernel source with a clearly-"
+                        "labeled tolerance block AND a CANDIDATE "
+                        "FINDER RESULT (JSON) block. Same content "
+                        "for every call in one round; only "
+                        "target_variable changes."
+                    ),
+                },
+                "target_variable": {
+                    "type": "string",
+                    "description": (
+                        "The name of the single variable this call "
+                        "should produce a verdict for. Must match a "
+                        "name in the CANDIDATE FINDER RESULT."
+                    ),
+                },
+            },
+            "required": ["kernel_source", "target_variable"],
         },
     },
     {
@@ -416,9 +523,14 @@ ORCHESTRATOR_TOOLS = [
                 "analyst_verdict_json": {
                     "type": "string",
                     "description": (
-                        "The analyst's full result object serialized as a "
-                        "JSON string (i.e. json.dumps of the dict you got "
-                        "back from spawn_analyst)."
+                        "The assembled analyst verdict object serialized as "
+                        "a JSON string. In the per-variable phase you build "
+                        "this yourself from the spawn_variable_analyst "
+                        "results (plus fixed 'keep' entries for non-"
+                        "candidates) with stub rework and stub "
+                        "precision_budget fields, matching "
+                        "ANALYST_OUTPUT_SCHEMA. See the orchestrator "
+                        "system prompt, step 4, for the exact shape."
                     ),
                 },
                 "tolerance_json": {
@@ -668,9 +780,9 @@ ORCHESTRATOR_TOOLS = [
             "only on language profiles whose probe_precisions is "
             "non-empty (currently Kokkos: quad / double / float / "
             "mixed_io). Call once per (precision, seed) cell after a "
-            "successful run_baseline_driver and before spawn_analyst; "
-            "skip cleanly on profiles where the BASELINE STEP block "
-            "does not mention probe_step."
+            "successful run_baseline_driver and before "
+            "spawn_candidate_finder; skip cleanly on profiles where "
+            "the BASELINE STEP block does not mention probe_step."
         ),
         "input_schema": {
             "type": "object",
@@ -719,9 +831,10 @@ ORCHESTRATOR_TOOLS = [
             "Hard-errors only when the canonical quad_seed42 cell is "
             "missing — without it there is no ground truth. Call once "
             "after all probe_step cells have been attempted, and "
-            "before spawn_analyst. The evidence is INFORMATIONAL: the "
-            "analyst sees it but is told to treat it as one input "
-            "among several, not as a verdict."
+            "before spawn_candidate_finder. The evidence is "
+            "INFORMATIONAL: the finder and each variable_analyst see "
+            "it but are told to treat it as one input among several, "
+            "not as a verdict."
         ),
         "input_schema": {
             "type": "object",
@@ -758,10 +871,11 @@ ORCHESTRATOR_TOOLS = [
             ".cpp (Kokkos) kernels: the orchestrator loop refuses a "
             "finish call until compare_outputs has returned "
             "status='ok' for the current rewrite cycle. On a "
-            "comparator error, spawn_analyst (not spawn_rewriter) is "
+            "comparator error, re-running spawn_variable_analyst on "
+            "the implicated variable(s) (not spawn_rewriter) is "
             "typically the right retry, because a numerical mismatch "
-            "usually indicates the verifier's verdict was wrong "
-            "rather than just the implementation."
+            "usually indicates one of the per-variable verdicts was "
+            "wrong rather than just the implementation."
         ),
         "input_schema": {
             "type": "object",
@@ -977,6 +1091,44 @@ def _execute_tool(
     reason kernel_stem is: unit tests that call _execute_tool in
     isolation should not have to synthesize a tolerance.
     """
+    if tool_name == "spawn_candidate_finder":
+        # Probe evidence injection: same mechanism as spawn_analyst
+        # below. The finder benefits from the same evidence the
+        # analyst gets, and this keeps a single source of truth for
+        # WHERE the probe evidence lives on disk. No consistency
+        # gate here — that gate is analyst-specific (it checks a
+        # verdict against the probe, and the finder emits triage,
+        # not a verdict). No K-ensemble either in this transitional
+        # phase; single-shot only.
+        finder_task = tool_input["kernel_source"]
+        if kernel_stem is not None:
+            evidence_path = (
+                Path("baselines") / kernel_stem / "probe" / "evidence.json"
+            )
+            if evidence_path.is_file():
+                try:
+                    evidence_text = evidence_path.read_text()
+                except OSError:
+                    evidence_text = None
+                if evidence_text is not None:
+                    finder_task = (
+                        f"{finder_task}\n\n"
+                        "PROBE EVIDENCE (JSON): the orchestrator ran a "
+                        "precision probe on this kernel before invoking "
+                        "you. The aggregated evidence below shows, for "
+                        "each (precision, seed) cell that succeeded, "
+                        "per-output stats against the quad/seed=42 "
+                        "ground truth, plus cross-seed deltas. Use it "
+                        "to inform your triage: cells that clear the "
+                        "tolerance are evidence for downcast_candidate="
+                        "TRUE on the variables that feed those outputs; "
+                        "cells that miss it are evidence for FALSE. "
+                        "Absent / errored cells are no signal, not a "
+                        "safety license.\n"
+                        f"{evidence_text}"
+                    )
+        result = run_agent("candidate_finder", finder_task)
+        return {"status": "ok", "result": result}
     if tool_name == "spawn_analyst":
         # Probe evidence injection: if a prior probe_compare call wrote
         # baselines/<kernel_stem>/probe/evidence.json, append it to the
@@ -1050,6 +1202,52 @@ def _execute_tool(
         gate = _probe_consistency_gate(result, kernel_stem, tolerance)
         if gate is not None:
             return gate
+        return {"status": "ok", "result": result}
+    if tool_name == "spawn_variable_analyst":
+        # Per-variable analyst. Probe evidence is auto-injected using
+        # the same mechanism as spawn_candidate_finder / spawn_analyst
+        # (single source of truth for WHERE evidence lives on disk).
+        # The target_variable is spliced in as a TARGET VARIABLE line
+        # AFTER the caller-supplied kernel_source and BEFORE the
+        # probe-evidence block, so the analyst sees the variable name
+        # in-context with the CANDIDATE FINDER RESULT block the
+        # caller already put in kernel_source. No consistency gate
+        # (the analyst only returns ONE variable — the gate is
+        # designed to walk a full variables[] list; running it here
+        # would be an under-check compared to running it on the
+        # assembled verdict downstream, which is a step-5 concern).
+        # No K-ensemble in this phase; single-shot only.
+        variable_task = (
+            f"{tool_input['kernel_source']}\n\n"
+            f"TARGET VARIABLE: {tool_input['target_variable']}"
+        )
+        if kernel_stem is not None:
+            evidence_path = (
+                Path("baselines") / kernel_stem / "probe" / "evidence.json"
+            )
+            if evidence_path.is_file():
+                try:
+                    evidence_text = evidence_path.read_text()
+                except OSError:
+                    evidence_text = None
+                if evidence_text is not None:
+                    variable_task = (
+                        f"{variable_task}\n\n"
+                        "PROBE EVIDENCE (JSON): the orchestrator ran a "
+                        "precision probe on this kernel before invoking "
+                        "you. The aggregated evidence below shows, for "
+                        "each (precision, seed) cell that succeeded, "
+                        "per-output stats against the quad/seed=42 "
+                        "ground truth, plus cross-seed deltas. Focus on "
+                        "the outputs your TARGET VARIABLE feeds; other "
+                        "outputs are context. Treat this as ONE input "
+                        "among several: corroborate it against the "
+                        "source you can see, and remember that a "
+                        "'no_quad_partner' or 'missing' cell means no "
+                        "signal -- not 'precision is safe'.\n"
+                        f"{evidence_text}"
+                    )
+        result = run_agent("variable_analyst", variable_task)
         return {"status": "ok", "result": result}
     if tool_name == "spawn_rewriter":
         result = run_agent("rewriter", tool_input["task_prompt"])
@@ -1501,8 +1699,8 @@ def _format_baseline_block(
             "PROBE STEP: this kernel's language profile carries a "
             f"non-empty probe_precisions tuple ({precisions_list}). "
             "After run_baseline_driver returns status='ok', drive the "
-            "precision probe before calling spawn_analyst. The probe "
-            "matrix for this run is:\n"
+            "precision probe before calling spawn_candidate_finder. "
+            "The probe matrix for this run is:\n"
             f"  precisions: {precisions_list}\n"
             f"  seeds:      {seeds_list}\n"
             f"  cells:      {len(cells)} total = "
@@ -1516,11 +1714,12 @@ def _format_baseline_block(
             "been attempted, call probe_compare exactly once with the "
             "same KERNEL STEM. probe_compare hard-errors only if the "
             "canonical quad/seed=42 cell is missing. The aggregated "
-            "evidence is attached to spawn_analyst automatically; you "
-            "do not pass it through yourself. If run_baseline_driver "
+            "evidence is attached to spawn_candidate_finder AND to "
+            "each spawn_variable_analyst call automatically; you do "
+            "not pass it through yourself. If run_baseline_driver "
             "did NOT return status='ok' (so the probe templates may "
             "not be on disk in usable shape), skip the probe step "
-            "entirely and proceed to spawn_analyst.\n"
+            "entirely and proceed to spawn_candidate_finder.\n"
         )
     else:
         probe_block = ""
@@ -1567,10 +1766,11 @@ def _format_baseline_block(
         "a synthetic tool error. A "
         "splice, rewritten-compile, or rewritten-run error means the "
         "comparator cannot run, so the chain must be repaired before "
-        "finish. If compare_outputs returns an error, prefer spawn_analyst "
-        "(not spawn_rewriter) for the retry — a numerical mismatch "
-        "usually indicates the verifier's verdict was wrong rather "
-        "than just the implementation."
+        "finish. If compare_outputs returns an error, prefer "
+        "re-running spawn_variable_analyst on the implicated "
+        "variable(s) (not spawn_rewriter) for the retry — a "
+        "numerical mismatch usually indicates one of the per-variable "
+        "verdicts was wrong rather than just the implementation."
     )
 
 
@@ -1653,14 +1853,14 @@ class _FinishGateState:
         if tool_name == "compare_outputs":
             self.last_compare_status = exec_result.get("status")
             return
-        # Other tools (spawn_analyst,
-        # spawn_baseline_harness, compile_baseline_driver,
+        # Other tools (spawn_candidate_finder, spawn_variable_analyst,
+        # spawn_analyst, spawn_baseline_harness, compile_baseline_driver,
         # run_baseline_driver, probe_step, probe_compare) do not affect
         # the gate. The probe tools in particular are INFORMATIONAL --
-        # they exist to give the analyst evidence, not to gate finish;
-        # a failed or skipped probe does not block finish, and a
-        # successful probe does not earn finish without the regular
-        # verifier+comparator chain.
+        # they exist to give the finder and analysts evidence, not to
+        # gate finish; a failed or skipped probe does not block finish,
+        # and a successful probe does not earn finish without the
+        # regular verifier+comparator chain.
         return
 
     def check_finish(self) -> str | None:
@@ -1671,8 +1871,9 @@ class _FinishGateState:
                 "call did not return verdict='accept' (current state: "
                 f"verifier_verdict={self.last_verifier_verdict!r}). "
                 "Call spawn_verifier on the current rewritten kernel "
-                "(re-running spawn_rewriter and/or spawn_analyst first "
-                "if needed) before calling finish."
+                "(re-running spawn_rewriter and/or "
+                "spawn_variable_analyst first if needed) before "
+                "calling finish."
             )
         if self.requires_comparator and self.last_compare_status != "ok":
             return (
@@ -1688,10 +1889,12 @@ class _FinishGateState:
                 "same kernel_stem and the same tolerance_json passed "
                 "to spawn_verifier) before calling finish. If "
                 "compare_outputs has already returned an error, the "
-                "numerical mismatch usually indicates the verifier's "
-                "verdict was wrong rather than just the "
-                "implementation, so spawn_analyst (not "
-                "spawn_rewriter) is typically the right retry."
+                "numerical mismatch usually indicates one of the "
+                "per-variable verdicts was wrong rather than just "
+                "the implementation, so re-running "
+                "spawn_variable_analyst on the implicated "
+                "variable(s) (not spawn_rewriter) is typically the "
+                "right retry."
             )
         return None
 
