@@ -1437,6 +1437,49 @@ def _hitl_pause(tool_name: str, tool_input: dict) -> str:
         print("Please answer y, n, or q.")
 
 
+def _require_tool_input_keys(
+    tool_name: str, tool_input: dict, required: list[str]
+) -> dict | None:
+    """Return a tool-result error dict if any required key is missing.
+
+    Returns None when every required key is present in `tool_input`
+    (the branch may proceed with bare `tool_input["key"]` access).
+    Otherwise returns a dict shaped like the other error results in
+    this module: `{status:'error', stdout:'', stderr:<diagnostic>,
+    artifacts:[], is_error:True}`. The `is_error` key is popped by
+    the caller loop in `run_orchestrator` and lifted onto the
+    Anthropic tool_result block so the model sees a failed tool
+    call it can retry with the corrected arguments.
+
+    Motivating case: the Argo proxy path does not always enforce
+    the tool schema's `required` list server-side, so the model can
+    (and empirically does, once per ~10 candidates on nbody_force)
+    emit a tool_use for spawn_variable_analyst with only
+    `target_variable` set and `kernel_source` omitted. Without this
+    guard the KeyError propagates out of `_execute_tool` and kills
+    the whole run; with the guard the model gets a diagnostic and
+    retries on its next turn. Per-branch opt-in (rather than a
+    universal wrapper) keeps the blast radius scoped to the three
+    new-and-least-battle-tested per-variable pipeline branches;
+    older branches (rewriter, verifier, harness) have not surfaced
+    this failure mode in months of use.
+    """
+    missing = [k for k in required if k not in tool_input]
+    if not missing:
+        return None
+    return {
+        "status": "error",
+        "stdout": "",
+        "stderr": (
+            f"{tool_name}: missing required tool_input key(s): "
+            f"{missing}. tool schema requires: {required}. "
+            "Retry the tool call with every required key present."
+        ),
+        "artifacts": [],
+        "is_error": True,
+    }
+
+
 def _execute_tool(
     tool_name: str,
     tool_input: dict,
@@ -1477,6 +1520,11 @@ def _execute_tool(
         # analyst gets, and this keeps a single source of truth for
         # WHERE the probe evidence lives on disk. No K-ensemble in
         # this transitional phase; single-shot only.
+        err = _require_tool_input_keys(
+            tool_name, tool_input, ["kernel_source"]
+        )
+        if err is not None:
+            return err
         finder_task = tool_input["kernel_source"]
         if kernel_stem is not None:
             evidence_path = (
@@ -1585,6 +1633,13 @@ def _execute_tool(
         # would be an under-check compared to running it on the
         # assembled verdict downstream, which is a step-5 concern).
         # No K-ensemble in this phase; single-shot only.
+        err = _require_tool_input_keys(
+            tool_name,
+            tool_input,
+            ["kernel_source", "target_variable"],
+        )
+        if err is not None:
+            return err
         variable_task = (
             f"{tool_input['kernel_source']}\n\n"
             f"TARGET VARIABLE: {tool_input['target_variable']}"
@@ -1633,6 +1688,13 @@ def _execute_tool(
         # per-variable list is mechanically fixed by the pipeline
         # upstream, so K-way voting on the finalizer's prose would
         # be low-value.
+        err = _require_tool_input_keys(
+            tool_name,
+            tool_input,
+            ["kernel_source", "assembled_verdict_json"],
+        )
+        if err is not None:
+            return err
         finalizer_task = (
             f"{tool_input['kernel_source']}\n\n"
             "ASSEMBLED VERDICT (JSON): the orchestrator built the "

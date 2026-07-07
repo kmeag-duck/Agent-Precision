@@ -3671,3 +3671,94 @@ def test_execute_tool_spawn_analyst_finalizer_no_evidence_file_unchanged_task(
     assert task.startswith("ORIGINAL KERNEL SOURCE")
     assert "ASSEMBLED VERDICT (JSON):" in task
     assert assembled in task
+
+
+# ---------- per-variable pipeline: missing-tool-input-key guards ----------
+#
+# The Argo proxy path does not always enforce the tool schema's
+# `required` list server-side, so the model can emit a spawn_*
+# tool_use with only a subset of the required keys. Without a
+# per-branch guard the KeyError propagates out of _execute_tool
+# and kills the whole run (regression: nbody_force run 2026-07-07,
+# spawn_variable_analyst for `inv_r` sent target_variable but not
+# kernel_source; process died at
+# `f"{tool_input['kernel_source']}\n\n"`). The three guards below
+# return a {status:'error', is_error:True} dict so the orchestrator
+# loop lifts is_error onto the tool_result and the model retries
+# with the missing key on its next turn. Kept scoped to the three
+# per-variable pipeline branches (Step 5c) rather than blanket-
+# wrapping every branch — the older branches (rewriter, verifier,
+# harness) have not surfaced this failure mode.
+
+
+def test_execute_tool_spawn_candidate_finder_missing_kernel_source_returns_error(
+    monkeypatch,
+):
+    """When the LLM omits kernel_source from a spawn_candidate_finder tool_use, _execute_tool returns a {status:'error', is_error:True} dict naming the missing key and the required-keys list, rather than raising KeyError. run_agent must not be invoked (the guard short-circuits before dispatch)."""
+    def fail_run_agent(*a, **kw):
+        raise AssertionError(
+            "run_agent must not fire when required keys are missing"
+        )
+
+    monkeypatch.setattr(orchestrator, "run_agent", fail_run_agent)
+
+    result = _execute_tool(
+        "spawn_candidate_finder",
+        {},  # kernel_source omitted
+        KOKKOS_PROFILE,
+    )
+
+    assert result["status"] == "error"
+    assert result["is_error"] is True
+    assert "kernel_source" in result["stderr"]
+    assert "spawn_candidate_finder" in result["stderr"]
+    # Error shape matches the other error results in the module so
+    # the orchestrator loop can trace + surface it uniformly.
+    assert result["stdout"] == ""
+    assert result["artifacts"] == []
+
+
+def test_execute_tool_spawn_variable_analyst_missing_kernel_source_returns_error(
+    monkeypatch,
+):
+    """When the LLM omits kernel_source from a spawn_variable_analyst tool_use (target_variable present), _execute_tool returns the guarded error dict rather than raising KeyError on `tool_input['kernel_source']`. This is the exact regression that killed the 2026-07-07 nbody_force run at candidate #10 (`inv_r`). run_agent must not fire."""
+    def fail_run_agent(*a, **kw):
+        raise AssertionError(
+            "run_agent must not fire when required keys are missing"
+        )
+
+    monkeypatch.setattr(orchestrator, "run_agent", fail_run_agent)
+
+    result = _execute_tool(
+        "spawn_variable_analyst",
+        {"target_variable": "inv_r"},  # kernel_source omitted
+        KOKKOS_PROFILE,
+    )
+
+    assert result["status"] == "error"
+    assert result["is_error"] is True
+    assert "kernel_source" in result["stderr"]
+    assert "spawn_variable_analyst" in result["stderr"]
+
+
+def test_execute_tool_spawn_analyst_finalizer_missing_assembled_verdict_returns_error(
+    monkeypatch,
+):
+    """When the LLM omits assembled_verdict_json from a spawn_analyst_finalizer tool_use (kernel_source present), _execute_tool returns the guarded error dict rather than raising KeyError. Covers the second required key so both bare-access sites in the finalizer branch are guarded, not just the kernel_source one."""
+    def fail_run_agent(*a, **kw):
+        raise AssertionError(
+            "run_agent must not fire when required keys are missing"
+        )
+
+    monkeypatch.setattr(orchestrator, "run_agent", fail_run_agent)
+
+    result = _execute_tool(
+        "spawn_analyst_finalizer",
+        {"kernel_source": "SRC"},  # assembled_verdict_json omitted
+        KOKKOS_PROFILE,
+    )
+
+    assert result["status"] == "error"
+    assert result["is_error"] is True
+    assert "assembled_verdict_json" in result["stderr"]
+    assert "spawn_analyst_finalizer" in result["stderr"]
