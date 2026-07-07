@@ -63,7 +63,17 @@ ORCHESTRATOR_MODEL = "claude-opus-4-7"
 # analyst even starts), plus headroom for a verifier-driven rewriter
 # retry (analyst -> rewriter -> verifier -> rewriter -> verifier ->
 # splice -> compile -> run -> compare).
-MAX_TURNS = 60
+# Raised again from 60 to 150 for the per-variable analyst pipeline
+# (candidate_finder -> N * variable_analyst -> N * test_variable_downcast
+# -> test_variable_union_downcast -> bisect_variable_downcast ->
+# analyst_finalizer -> rewriter -> verifier -> dynamic-verification chain).
+# For a kernel with ~10 downcast candidates that adds ~22 extra tool
+# calls to the happy path (~31 total for the analyst-side pipeline plus
+# ~11 for the probe/baseline chain = ~42), plus headroom for one or
+# two verifier-driven finalizer-rerun cycles and for kernels with
+# larger candidate counts. 150 gives roughly 3x margin above the
+# happy-path estimate.
+MAX_TURNS = 150
 
 ORCHESTRATOR_SYSTEM_PROMPT = """You are the orchestrator of a small
 workflow whose goal is to rewrite a numerical kernel to reduce precision
