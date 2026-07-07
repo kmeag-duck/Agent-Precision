@@ -31,7 +31,6 @@ from .languages import LanguageProfile, detect_language
 from .run_agent import run_agent, run_agent_ensemble
 from .tools import (
     bisect_variable_downcast,
-    check_analyst_verdict_against_probe,
     compare_outputs,
     compile_baseline_driver,
     compile_rewritten_driver,
@@ -1428,80 +1427,6 @@ def _hitl_pause(tool_name: str, tool_input: dict) -> str:
         print("Please answer y, n, or q.")
 
 
-def _probe_consistency_gate(
-    verdict: dict,
-    kernel_stem: str | None,
-    tolerance: dict | None,
-) -> dict | None:
-    """Post-analyst safety net: return a synthetic error dict when the
-    analyst's verdict positively contradicts the probe evidence, or
-    None when there is no basis to intervene.
-
-    Design (see AGENTS.md "Probe pipeline" and the item-#5 rationale
-    in the file header): motivated by the nbody_force N=5 consistency
-    sweep where run #2's analyst returned action='downcast'
-    target_precision='float' for every storage View despite the float
-    probe cell showing max_absrel ~0.34 on vy against a sig_figs=6
-    (~1e-6) tolerance. The verifier accepted it, the comparator
-    rejected it, and the run burned four full rewrite cycles before
-    MAX_TURNS killed it. This gate catches that failure mode BEFORE
-    spawn_rewriter is even called.
-
-    Silent-skip whenever:
-      - tolerance is None or kernel_stem is None (test-mode calls),
-      - baselines/<kernel_stem>/probe/evidence.json does not exist
-        (probe was disabled or never ran),
-      - the evidence.json is unreadable or unparseable (non-fatal by
-        the same policy that already gates prompt-injection),
-      - the check returns an empty violation list (verdict is
-        consistent with evidence, or there was no basis to flag any
-        variable -- see check_analyst_verdict_against_probe for the
-        full skip matrix).
-
-    When violations are found, returns a dict shaped like the
-    finish-gate's synthetic error: {status:'error', is_error:True,
-    stderr:<one line per violation>, probe_consistency_violations:
-    <the raw list>}. The is_error key propagates to the SDK's
-    tool_result is_error flag (via the same mechanism used elsewhere
-    in _execute_tool), so the orchestrator LLM sees this as a tool
-    failure and retries spawn_analyst rather than forwarding the
-    verdict to the rewriter. There is deliberately no retry counter
-    -- MAX_TURNS is the only backstop, matching the finish-gate
-    convention.
-    """
-    if tolerance is None or kernel_stem is None:
-        return None
-    evidence_path = (
-        Path("baselines") / kernel_stem / "probe" / "evidence.json"
-    )
-    if not evidence_path.is_file():
-        return None
-    try:
-        evidence = json.loads(evidence_path.read_text())
-    except (OSError, json.JSONDecodeError):
-        return None
-    violations = check_analyst_verdict_against_probe(
-        verdict, evidence, tolerance
-    )
-    if not violations:
-        return None
-    header = (
-        "Probe-consistency gate rejected the analyst verdict: the "
-        "verdict contradicts the empirical probe evidence for one "
-        "or more variables. Re-run spawn_analyst; either revise "
-        "the flagged variables to a wider precision (or 'keep'), or "
-        "justify in the reason field why the probe evidence should "
-        "be overridden for this specific case.\n"
-    )
-    body = "\n".join(f"  - {v}" for v in violations)
-    return {
-        "status": "error",
-        "is_error": True,
-        "stderr": header + body,
-        "probe_consistency_violations": violations,
-    }
-
-
 def _execute_tool(
     tool_name: str,
     tool_input: dict,
@@ -1532,29 +1457,16 @@ def _execute_tool(
     in isolation.
 
     `tolerance` is the {kind, value, source} dict the run was launched
-    with, threaded here so the spawn_analyst branch's post-analyst
-    probe-consistency check has the numerical threshold to compare
-    probe cells against. The check reads the same evidence.json the
-    prompt-injection above uses, calls
-    tools.check_analyst_verdict_against_probe, and if any violations
-    come back it returns a synthetic {status:'error', is_error:true}
-    result naming the offending variables so the orchestrator LLM
-    retries spawn_analyst instead of forwarding a
-    probe-contradicting verdict to the rewriter. Silent-skip whenever
-    tolerance is None, evidence.json is absent/unreadable, or no
-    variable trips the check. Kept optional (None) for the same
-    reason kernel_stem is: unit tests that call _execute_tool in
-    isolation should not have to synthesize a tolerance.
+    with, threaded here for future per-tool use. Kept optional (None)
+    for unit tests that call _execute_tool in isolation and do not
+    need to synthesize a tolerance.
     """
     if tool_name == "spawn_candidate_finder":
         # Probe evidence injection: same mechanism as spawn_analyst
         # below. The finder benefits from the same evidence the
         # analyst gets, and this keeps a single source of truth for
-        # WHERE the probe evidence lives on disk. No consistency
-        # gate here — that gate is analyst-specific (it checks a
-        # verdict against the probe, and the finder emits triage,
-        # not a verdict). No K-ensemble either in this transitional
-        # phase; single-shot only.
+        # WHERE the probe evidence lives on disk. No K-ensemble in
+        # this transitional phase; single-shot only.
         finder_task = tool_input["kernel_source"]
         if kernel_stem is not None:
             evidence_path = (
@@ -1642,21 +1554,12 @@ def _execute_tool(
                 temperature=temperature,
             )
             aggregated, report = aggregate_analyst_verdicts(verdicts)
-            gate = _probe_consistency_gate(
-                aggregated, kernel_stem, tolerance
-            )
-            if gate is not None:
-                gate["aggregator_metadata"] = report
-                return gate
             return {
                 "status": "ok",
                 "result": aggregated,
                 "aggregator_metadata": report,
             }
         result = run_agent("analyst", analyst_task)
-        gate = _probe_consistency_gate(result, kernel_stem, tolerance)
-        if gate is not None:
-            return gate
         return {"status": "ok", "result": result}
     if tool_name == "spawn_variable_analyst":
         # Per-variable analyst. Probe evidence is auto-injected using
@@ -1719,9 +1622,7 @@ def _execute_tool(
         # FINDER RESULT block. Single-shot only (no ensemble): the
         # per-variable list is mechanically fixed by the pipeline
         # upstream, so K-way voting on the finalizer's prose would
-        # be low-value. No consistency gate either (that concern was
-        # already checked at spawn_variable_analyst time on the
-        # per-variable calls).
+        # be low-value.
         finalizer_task = (
             f"{tool_input['kernel_source']}\n\n"
             "ASSEMBLED VERDICT (JSON): the orchestrator built the "
