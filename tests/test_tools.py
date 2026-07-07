@@ -4832,3 +4832,553 @@ def test_variable_downcast_result_keys_are_stable(monkeypatch, tmp_path):
     )
     assert set(r_ok.keys()) >= expected_keys
     assert r_ok["status"] == "ok"
+
+
+# ---------- test_variable_union_downcast ----------
+#
+# Tests the per-variable joint empirical test tool used in step 1.6 of
+# the per-variable analyst pipeline. The tool mutates N alias lines in
+# one splice, writes the mutated driver to baselines/<stem>/varprobe/
+# union/, compiles and runs it, and compares the resulting reference.
+# json against the canonical oracle. Purpose: catch interaction effects
+# between downcasts that individually pass step 1.5 but jointly violate
+# tolerance.
+#
+# NOTE: workflow.tools.test_variable_union_downcast has a `test_` prefix
+# by domain convention. Reached via the module attribute to avoid pytest
+# auto-collection.
+
+
+def _tol_json(kind="sig_figs", value=3):
+    return json.dumps({"kind": kind, "value": value, "source": "user_cli"})
+
+
+def test_variable_union_downcast_errors_on_non_list_variable_names(
+    monkeypatch, tmp_path
+):
+    """variable_names must be a list; a scalar or dict is a caller-contract violation returned as status='error' pre-splice. The union tool is invoked directly by the orchestrator LLM (not the model API), so a shape violation is a bug, not an infrastructure failure — but we still want a legible error rather than an AttributeError deep in the splice."""
+    monkeypatch.chdir(tmp_path)
+
+    def fail_run(*a, **kw):
+        raise AssertionError("subprocess.run must not be called on bad args")
+
+    monkeypatch.setattr(subprocess, "run", fail_run)
+
+    result = tools.test_variable_union_downcast(
+        "k", "not-a-list", ["float"], _TOL_SIG_FIGS_3, "kokkos"
+    )
+
+    assert result["status"] == "error"
+    assert "list" in result["stderr"]
+
+
+def test_variable_union_downcast_errors_on_length_mismatch(monkeypatch, tmp_path):
+    """variable_names and target_precisions must have the same length. A mismatch is a caller-contract violation returned pre-splice as status='error'; every variable in a union needs an explicit target precision."""
+    monkeypatch.chdir(tmp_path)
+
+    def fail_run(*a, **kw):
+        raise AssertionError("subprocess.run must not be called on length mismatch")
+
+    monkeypatch.setattr(subprocess, "run", fail_run)
+
+    result = tools.test_variable_union_downcast(
+        "k", ["a", "b"], ["float"], _TOL_SIG_FIGS_3, "kokkos"
+    )
+
+    assert result["status"] == "error"
+    assert "length" in result["stderr"] or "same" in result["stderr"]
+
+
+def test_variable_union_downcast_errors_on_empty_variable_names(
+    monkeypatch, tmp_path
+):
+    """An empty variable_names is a caller-contract violation, NOT a silent no-op. The orchestrator prompt tells the LLM to skip step 1.6 entirely when the step-3-passing subset is empty; if the LLM calls the tool anyway with an empty list, that's a bug we want to surface loudly."""
+    monkeypatch.chdir(tmp_path)
+
+    def fail_run(*a, **kw):
+        raise AssertionError("subprocess.run must not be called on empty list")
+
+    monkeypatch.setattr(subprocess, "run", fail_run)
+
+    result = tools.test_variable_union_downcast(
+        "k", [], [], _TOL_SIG_FIGS_3, "kokkos"
+    )
+
+    assert result["status"] == "error"
+    assert "non-empty" in result["stderr"] or "empty" in result["stderr"]
+
+
+def test_variable_union_downcast_errors_on_duplicate_variable_name(
+    monkeypatch, tmp_path
+):
+    """A duplicate name in variable_names is rejected pre-splice: the second splice for the same alias would fail on 'no double token' after the first splice floated the alias, producing a misleading downstream error. Rejecting early gives a legible message."""
+    monkeypatch.chdir(tmp_path)
+
+    def fail_run(*a, **kw):
+        raise AssertionError("subprocess.run must not be called on duplicate name")
+
+    monkeypatch.setattr(subprocess, "run", fail_run)
+
+    result = tools.test_variable_union_downcast(
+        "k", ["a", "a"], ["float", "float"], _TOL_SIG_FIGS_3, "kokkos"
+    )
+
+    assert result["status"] == "error"
+    assert "duplicate" in result["stderr"]
+
+
+def test_variable_union_downcast_errors_on_unsupported_target_precision(
+    monkeypatch, tmp_path
+):
+    """Any target precision outside the v0 support set ({'float'}) is rejected pre-splice with status='error'. Same guard as test_variable_downcast — half-precision has never been smoke-tested end-to-end and must fail loudly."""
+    monkeypatch.chdir(tmp_path)
+
+    def fail_run(*a, **kw):
+        raise AssertionError("subprocess.run must not be called on unsupported target")
+
+    monkeypatch.setattr(subprocess, "run", fail_run)
+
+    result = tools.test_variable_union_downcast(
+        "k", ["a", "b"], ["float", "half"], _TOL_SIG_FIGS_3, "kokkos"
+    )
+
+    assert result["status"] == "error"
+    assert "half" in result["stderr"]
+
+
+def test_variable_union_downcast_errors_on_malformed_tolerance_json(
+    monkeypatch, tmp_path
+):
+    """A malformed tolerance_json returns status='error' pre-splice with no subprocess call. Same yardstick as test_variable_downcast; factored via _parse_tolerance_json so drift between the two tools is impossible."""
+    monkeypatch.chdir(tmp_path)
+
+    def fail_run(*a, **kw):
+        raise AssertionError("subprocess.run must not be called on bad JSON")
+
+    monkeypatch.setattr(subprocess, "run", fail_run)
+
+    result = tools.test_variable_union_downcast(
+        "k", ["a"], ["float"], "not-json", "kokkos"
+    )
+
+    assert result["status"] == "error"
+    assert "JSON" in result["stderr"] or "json" in result["stderr"]
+
+
+def test_variable_union_downcast_errors_when_baseline_missing(
+    monkeypatch, tmp_path
+):
+    """status='error' with no subprocess call when baselines/<stem>/driver.cpp is missing. Same guard as the singleton tool — the LLM must have run spawn_baseline_harness successfully before calling the union tool."""
+    monkeypatch.chdir(tmp_path)
+
+    def fail_run(*a, **kw):
+        raise AssertionError("subprocess.run must not be called when baseline missing")
+
+    monkeypatch.setattr(subprocess, "run", fail_run)
+
+    result = tools.test_variable_union_downcast(
+        "k", ["a"], ["float"], _TOL_SIG_FIGS_3, "kokkos"
+    )
+
+    assert result["status"] == "error"
+    assert "driver.cpp" in result["stderr"]
+
+
+def test_variable_union_downcast_errors_when_oracle_missing(monkeypatch, tmp_path):
+    """status='error' with no subprocess call when the oracle reference.json is missing. Cannot compute a verdict without ground truth; on Kokkos this file is normally the quad-promoted reference from probe_compare."""
+    monkeypatch.chdir(tmp_path)
+    _stage_baseline_for_singleton(tmp_path, "k")  # no oracle_payload
+
+    def fail_run(*a, **kw):
+        raise AssertionError("subprocess.run must not be called when oracle missing")
+
+    monkeypatch.setattr(subprocess, "run", fail_run)
+
+    result = tools.test_variable_union_downcast(
+        "k", ["a"], ["float"], _TOL_SIG_FIGS_3, "kokkos"
+    )
+
+    assert result["status"] == "error"
+    assert "reference.json" in result["stderr"]
+
+
+def test_variable_union_downcast_splice_replaces_all_aliases(
+    monkeypatch, tmp_path
+):
+    """Happy-path splice: for variables ['a', 'b'] with targets ['float', 'float'], the mutated union driver at baselines/<stem>/varprobe/union/driver.cpp has BOTH aliases mutated to float and no `double` on either alias line. Untouched alias lines (alphaType here) remain double. Baseline driver at baselines/<stem>/driver.cpp is left byte-for-byte unchanged."""
+    monkeypatch.chdir(tmp_path)
+    oracle = {"kernel": "k", "seed": 42, "inputs": {}, "outputs": {"y": [1.0]}}
+    _stage_baseline_for_singleton(tmp_path, "k", oracle_payload=oracle)
+    baseline_src_before = (tmp_path / "baselines" / "k" / "driver.cpp").read_text()
+
+    _install_fake_compile_and_run(
+        monkeypatch, tmp_path, candidate_payload=oracle
+    )
+
+    result = tools.test_variable_union_downcast(
+        "k", ["a", "b"], ["float", "float"], _TOL_SIG_FIGS_3, "kokkos"
+    )
+
+    assert result["status"] == "ok", result["stderr"]
+    union_src = (
+        tmp_path / "baselines" / "k" / "varprobe" / "union" / "driver.cpp"
+    ).read_text()
+    assert "using aType = Kokkos::View<float*>;" in union_src
+    assert "using bType = Kokkos::View<const float*>;" in union_src
+    # Third alias (alphaType) is not in the union: still double.
+    assert "using alphaType = double;" in union_src
+    # And the baseline driver is untouched.
+    baseline_src_after = (tmp_path / "baselines" / "k" / "driver.cpp").read_text()
+    assert baseline_src_after == baseline_src_before
+
+
+def test_variable_union_downcast_returns_ok_on_tolerance_pass(
+    monkeypatch, tmp_path
+):
+    """When the union-mutated driver produces output identical (within tolerance) to the oracle, status='ok' with stdout starting `VERDICT: pass -- variables ['a', 'b']`. The variable list is echoed into the verdict so the trace records exactly which subset the pass covers."""
+    monkeypatch.chdir(tmp_path)
+    oracle = {
+        "kernel": "k", "seed": 42, "inputs": {},
+        "outputs": {"y": [1.0, 2.0, 3.0]},
+    }
+    _stage_baseline_for_singleton(tmp_path, "k", oracle_payload=oracle)
+    _install_fake_compile_and_run(
+        monkeypatch, tmp_path, candidate_payload=oracle
+    )
+
+    result = tools.test_variable_union_downcast(
+        "k", ["a", "b"], ["float", "float"], _TOL_SIG_FIGS_3, "kokkos"
+    )
+
+    assert result["status"] == "ok", result["stderr"]
+    assert result["stdout"].startswith("VERDICT: pass")
+    assert "'a'" in result["stdout"]
+    assert "'b'" in result["stdout"]
+    assert any("varprobe/union/driver.cpp" in a for a in result["artifacts"])
+    assert any(a.endswith("varprobe/union/driver") for a in result["artifacts"])
+    assert any(
+        "varprobe/union/reference.json" in a for a in result["artifacts"]
+    )
+
+
+def test_variable_union_downcast_returns_ok_on_tolerance_fail(
+    monkeypatch, tmp_path
+):
+    """When the union-mutated driver deviates beyond tolerance from the oracle, status='ok' (a mismatch is a valid VERDICT, not an infrastructure failure) with stdout starting `VERDICT: fail`. This is the failure mode that motivates step 1.7 bisection — the orchestrator sees VERDICT: fail and follows up with bisect_variable_downcast."""
+    monkeypatch.chdir(tmp_path)
+    oracle = {
+        "kernel": "k", "seed": 42, "inputs": {},
+        "outputs": {"y": [1.0, 2.0, 3.0]},
+    }
+    candidate = {
+        "kernel": "k", "seed": 42, "inputs": {},
+        "outputs": {"y": [1.5, 2.5, 3.5]},
+    }
+    _stage_baseline_for_singleton(tmp_path, "k", oracle_payload=oracle)
+    _install_fake_compile_and_run(
+        monkeypatch, tmp_path, candidate_payload=candidate
+    )
+
+    result = tools.test_variable_union_downcast(
+        "k", ["a", "b"], ["float", "float"], _TOL_SIG_FIGS_3, "kokkos"
+    )
+
+    assert result["status"] == "ok", result["stderr"]
+    assert result["stdout"].startswith("VERDICT: fail")
+
+
+def test_variable_union_downcast_propagates_compile_failure_as_error(
+    monkeypatch, tmp_path
+):
+    """If the union-mutated driver fails to compile, status='error' with the compiler's stderr propagated verbatim. The orchestrator sees the diagnostic and typically falls back to bisect (which would also fail at compile in this case — but that's the correct signal)."""
+    monkeypatch.chdir(tmp_path)
+    _stage_baseline_for_singleton(
+        tmp_path, "k",
+        oracle_payload={"kernel": "k", "seed": 42, "inputs": {}, "outputs": {}},
+    )
+    _install_fake_compile_and_run(
+        monkeypatch, tmp_path, candidate_payload={}, compile_ok=False
+    )
+
+    result = tools.test_variable_union_downcast(
+        "k", ["a", "b"], ["float", "float"], _TOL_SIG_FIGS_3, "kokkos"
+    )
+
+    assert result["status"] == "error"
+    assert "boom" in result["stderr"]
+
+
+def test_variable_union_downcast_error_names_offending_variable(
+    monkeypatch, tmp_path
+):
+    """When the splice fails for one variable in the middle of the union (e.g. the alias line for 'b' has no double token), the error message names the offending variable so the orchestrator can tell which of the N variables broke the union. Prevents 'union failed somewhere' opacity."""
+    monkeypatch.chdir(tmp_path)
+    # `b` alias already float — no double to downcast.
+    src = f"""\
+int main() {{
+{KERNEL_BEGIN_SENTINEL}
+using aType = Kokkos::View<double*>;
+using bType = Kokkos::View<const float*>;
+{KERNEL_END_SENTINEL}
+  return 0;
+}}
+"""
+    _stage_baseline_for_singleton(
+        tmp_path, "k",
+        oracle_payload={"kernel": "k", "seed": 42, "inputs": {}, "outputs": {}},
+        driver_source=src,
+    )
+
+    def fail_run(*a, **kw):
+        raise AssertionError("subprocess.run must not be called on splice failure")
+
+    monkeypatch.setattr(subprocess, "run", fail_run)
+
+    result = tools.test_variable_union_downcast(
+        "k", ["a", "b"], ["float", "float"], _TOL_SIG_FIGS_3, "kokkos"
+    )
+
+    assert result["status"] == "error"
+    assert "'b'" in result["stderr"]
+
+
+def test_variable_union_downcast_result_keys_are_stable(monkeypatch, tmp_path):
+    """Every code path (arg error, tolerance error, splice error, compile error, run error, ok pass, ok fail) returns the same four keys: status, stdout, stderr, artifacts. Uniformity across code paths is the contract every orchestrator tool must honor so _execute_tool's result handling stays branchless."""
+    monkeypatch.chdir(tmp_path)
+    expected_keys = {"status", "stdout", "stderr", "artifacts"}
+
+    # Arg error.
+    r_arg = tools.test_variable_union_downcast(
+        "k", [], [], _TOL_SIG_FIGS_3, "kokkos"
+    )
+    assert set(r_arg.keys()) >= expected_keys
+
+    # Happy path.
+    oracle = {"kernel": "k", "seed": 42, "inputs": {}, "outputs": {"y": [1.0]}}
+    _stage_baseline_for_singleton(tmp_path, "k", oracle_payload=oracle)
+    _install_fake_compile_and_run(
+        monkeypatch, tmp_path, candidate_payload=oracle
+    )
+    r_ok = tools.test_variable_union_downcast(
+        "k", ["a", "b"], ["float", "float"], _TOL_SIG_FIGS_3, "kokkos"
+    )
+    assert set(r_ok.keys()) >= expected_keys
+    assert r_ok["status"] == "ok"
+
+
+# ---------- bisect_variable_downcast ----------
+#
+# Tests the drop-from-end bisection tool used in step 1.7 of the per-
+# variable analyst pipeline. Iterates over prefixes of the singleton-
+# passing set (rank order preserved), dropping the lowest-rank variable
+# each time the union fails, until either a prefix passes or the set is
+# empty. Writes iteration artifacts to bisect_iter_<n>/ and a summary
+# to bisect_result.json.
+#
+# NOTE: reached via the module attribute to avoid pytest auto-collection
+# of the `test_variable_union_downcast` helper it internally references.
+
+
+def test_bisect_variable_downcast_full_prefix_passes_first_try(
+    monkeypatch, tmp_path
+):
+    """When the full union passes on the first attempt, bisect stops immediately: iterations=1, passed_subset equals the full input, dropped is empty. bisect_iter_1/ contains the driver artifacts and bisect_result.json summarizes."""
+    monkeypatch.chdir(tmp_path)
+    oracle = {
+        "kernel": "k", "seed": 42, "inputs": {},
+        "outputs": {"y": [1.0, 2.0]},
+    }
+    _stage_baseline_for_singleton(tmp_path, "k", oracle_payload=oracle)
+    _install_fake_compile_and_run(
+        monkeypatch, tmp_path, candidate_payload=oracle
+    )
+
+    result = tools.bisect_variable_downcast(
+        "k", ["a", "b"], ["float", "float"], _TOL_SIG_FIGS_3, "kokkos"
+    )
+
+    assert result["status"] == "ok", result["stderr"]
+    assert result["stdout"].startswith("BISECT:")
+    summary_path = (
+        tmp_path / "baselines" / "k" / "varprobe" / "bisect_result.json"
+    )
+    summary = json.loads(summary_path.read_text())
+    assert summary["passed_subset"] == ["a", "b"]
+    assert summary["dropped"] == []
+    assert summary["iterations"] == 1
+    assert summary["union_stdout_last"].startswith("VERDICT: pass")
+    # iter_1/ exists; iter_2/ does not.
+    assert (
+        tmp_path / "baselines" / "k" / "varprobe" / "bisect_iter_1" / "driver.cpp"
+    ).exists()
+    assert not (
+        tmp_path / "baselines" / "k" / "varprobe" / "bisect_iter_2"
+    ).exists()
+
+
+def test_bisect_variable_downcast_empty_subset_when_nothing_passes(
+    monkeypatch, tmp_path
+):
+    """When every non-empty subset fails, bisect exits with passed_subset=[] and dropped listing every variable in the original (highest-rank-first) order. This is status='ok' — bisection ran successfully and produced a definite (if disappointing) answer. The orchestrator will demote every variable to action='keep'."""
+    monkeypatch.chdir(tmp_path)
+    oracle = {
+        "kernel": "k", "seed": 42, "inputs": {},
+        "outputs": {"y": [1.0, 2.0]},
+    }
+    candidate = {
+        "kernel": "k", "seed": 42, "inputs": {},
+        "outputs": {"y": [9.0, 9.0]},  # always fails tolerance
+    }
+    _stage_baseline_for_singleton(tmp_path, "k", oracle_payload=oracle)
+    _install_fake_compile_and_run(
+        monkeypatch, tmp_path, candidate_payload=candidate
+    )
+
+    result = tools.bisect_variable_downcast(
+        "k", ["a", "b"], ["float", "float"], _TOL_SIG_FIGS_3, "kokkos"
+    )
+
+    assert result["status"] == "ok", result["stderr"]
+    assert "no non-empty subset" in result["stdout"]
+    summary = json.loads(
+        (tmp_path / "baselines" / "k" / "varprobe" / "bisect_result.json").read_text()
+    )
+    assert summary["passed_subset"] == []
+    assert [d["name"] for d in summary["dropped"]] == ["b", "a"]
+    assert summary["iterations"] == 2
+    assert summary["union_stdout_last"].startswith("VERDICT: fail")
+    # Both iteration dirs preserved for post-mortem.
+    assert (
+        tmp_path / "baselines" / "k" / "varprobe" / "bisect_iter_1" / "driver.cpp"
+    ).exists()
+    assert (
+        tmp_path / "baselines" / "k" / "varprobe" / "bisect_iter_2" / "driver.cpp"
+    ).exists()
+
+
+def test_bisect_variable_downcast_drops_lowest_rank_first(monkeypatch, tmp_path):
+    """When iteration N fails, iteration N+1 uses the input with the LAST (lowest-rank) variable removed. The dropped list records each drop in order. Verified by monkeypatching _run_union_attempt to fail on the first attempt (full ['a','b']) and pass on the second (['a']) — the summary must show passed_subset=['a'], dropped=[{name:'b', ...}]."""
+    monkeypatch.chdir(tmp_path)
+    _stage_baseline_for_singleton(
+        tmp_path, "k",
+        oracle_payload={"kernel": "k", "seed": 42, "inputs": {}, "outputs": {}},
+    )
+
+    call_log = []
+
+    def fake_run_union_attempt(
+        kernel_stem, profile, variable_names, target_cxxs,
+        tol_kind, tol_value, attempt_dir,
+    ):
+        call_log.append(list(variable_names))
+        # Create the attempt_dir so bisect can list artifacts under it.
+        attempt_dir.mkdir(parents=True, exist_ok=True)
+        (attempt_dir / "driver.cpp").write_text("stub")
+        # Fail on the full ['a', 'b'] union, pass once 'b' is dropped.
+        if len(variable_names) == 2:
+            return {
+                "status": "ok",
+                "stdout": "VERDICT: fail -- interaction between a and b",
+                "stderr": "",
+                "artifacts": [str(attempt_dir / "driver.cpp")],
+            }
+        return {
+            "status": "ok",
+            "stdout": "VERDICT: pass -- ['a'] alone tolerates downcast",
+            "stderr": "",
+            "artifacts": [str(attempt_dir / "driver.cpp")],
+        }
+
+    monkeypatch.setattr(tools, "_run_union_attempt", fake_run_union_attempt)
+
+    result = tools.bisect_variable_downcast(
+        "k", ["a", "b"], ["float", "float"], _TOL_SIG_FIGS_3, "kokkos"
+    )
+
+    assert result["status"] == "ok", result["stderr"]
+    # Iteration 1 tried the full set, iteration 2 dropped the LAST entry.
+    assert call_log == [["a", "b"], ["a"]]
+    summary = json.loads(
+        (tmp_path / "baselines" / "k" / "varprobe" / "bisect_result.json").read_text()
+    )
+    assert summary["passed_subset"] == ["a"]
+    assert summary["dropped"] == [{
+        "name": "b",
+        "reason": (
+            "joint downcast failed at iteration 1 with subset of 2; "
+            "dropped lowest-rank variable 'b'."
+        ),
+    }]
+    assert summary["iterations"] == 2
+    assert summary["union_stdout_last"].startswith("VERDICT: pass")
+
+
+def test_bisect_variable_downcast_infrastructure_error_short_circuits(
+    monkeypatch, tmp_path
+):
+    """If any iteration returns status='error' (infrastructure failure, e.g. compile error), bisect surfaces it verbatim and does NOT continue iterating. Compile failures usually indicate a splice-contract bug that shrinking the subset won't fix. No bisect_result.json is written on this path — the failure is the whole story."""
+    monkeypatch.chdir(tmp_path)
+    _stage_baseline_for_singleton(
+        tmp_path, "k",
+        oracle_payload={"kernel": "k", "seed": 42, "inputs": {}, "outputs": {}},
+    )
+    _install_fake_compile_and_run(
+        monkeypatch, tmp_path, candidate_payload={}, compile_ok=False
+    )
+
+    result = tools.bisect_variable_downcast(
+        "k", ["a", "b"], ["float", "float"], _TOL_SIG_FIGS_3, "kokkos"
+    )
+
+    assert result["status"] == "error"
+    assert "boom" in result["stderr"]
+    # No summary artifact was written on the short-circuit path.
+    assert not (
+        tmp_path / "baselines" / "k" / "varprobe" / "bisect_result.json"
+    ).exists()
+
+
+def test_bisect_variable_downcast_errors_on_invalid_args(monkeypatch, tmp_path):
+    """Arg validation is shared with test_variable_union_downcast via _validate_union_args and _parse_tolerance_json, so all the same rejection modes apply: empty list, length mismatch, duplicate names, unsupported target precision, malformed tolerance. Spot-check duplicate + empty here to confirm the wiring."""
+    monkeypatch.chdir(tmp_path)
+
+    def fail_run(*a, **kw):
+        raise AssertionError("subprocess.run must not be called on bad args")
+
+    monkeypatch.setattr(subprocess, "run", fail_run)
+
+    r_empty = tools.bisect_variable_downcast(
+        "k", [], [], _TOL_SIG_FIGS_3, "kokkos"
+    )
+    assert r_empty["status"] == "error"
+
+    r_dup = tools.bisect_variable_downcast(
+        "k", ["a", "a"], ["float", "float"], _TOL_SIG_FIGS_3, "kokkos"
+    )
+    assert r_dup["status"] == "error"
+    assert "duplicate" in r_dup["stderr"]
+
+
+def test_bisect_variable_downcast_summary_json_shape(monkeypatch, tmp_path):
+    """bisect_result.json has exactly the four keys the AGENTS.md contract promises: passed_subset (list[str]), dropped (list of {name, reason}), iterations (int), union_stdout_last (str). Pinning the shape here catches accidental key renames that would break any downstream consumer parsing the summary."""
+    monkeypatch.chdir(tmp_path)
+    oracle = {"kernel": "k", "seed": 42, "inputs": {}, "outputs": {"y": [1.0]}}
+    _stage_baseline_for_singleton(tmp_path, "k", oracle_payload=oracle)
+    _install_fake_compile_and_run(
+        monkeypatch, tmp_path, candidate_payload=oracle
+    )
+
+    tools.bisect_variable_downcast(
+        "k", ["a"], ["float"], _TOL_SIG_FIGS_3, "kokkos"
+    )
+
+    summary = json.loads(
+        (tmp_path / "baselines" / "k" / "varprobe" / "bisect_result.json").read_text()
+    )
+    assert set(summary.keys()) == {
+        "passed_subset", "dropped", "iterations", "union_stdout_last"
+    }
+    assert isinstance(summary["passed_subset"], list)
+    assert isinstance(summary["dropped"], list)
+    assert isinstance(summary["iterations"], int)
+    assert isinstance(summary["union_stdout_last"], str)

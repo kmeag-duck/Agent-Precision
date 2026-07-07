@@ -3303,6 +3303,10 @@ def test_layer2_score_known_tools_includes_probe_step_and_probe_compare():
     assert "spawn_candidate_finder" in _KNOWN_TOOLS
     assert "spawn_variable_analyst" in _KNOWN_TOOLS
     assert "test_variable_downcast" in _KNOWN_TOOLS
+    # Per-variable pipeline tools (Step 4): joint downcast test + bisect
+    # fallback. Same closed-set-drift risk as every tool above.
+    assert "test_variable_union_downcast" in _KNOWN_TOOLS
+    assert "bisect_variable_downcast" in _KNOWN_TOOLS
 
 
 def test_run_cli_no_probe_flag_threads_run_probe_false(monkeypatch, tmp_path):
@@ -3424,6 +3428,236 @@ def test_execute_tool_test_variable_downcast_under_cuda_profile_injects_cuda_lan
             "kernel_stem": "vector_add",
             "variable_name": "x",
             "target_precision": "float",
+            "tolerance_json": '{"kind": "sig_figs", "value": 6, "source": "user_cli"}',
+        },
+        CUDA_PROFILE,
+    )
+    assert captured == {"language_id": "cuda"}
+
+
+# ---------- test_variable_union_downcast + bisect_variable_downcast (Step 4 wiring) ----------
+
+
+def test_orchestrator_tools_include_test_variable_union_downcast_with_required_args():
+    """ORCHESTRATOR_TOOLS exposes test_variable_union_downcast to the LLM with exactly {kernel_stem, variable_names, target_precisions, tolerance_json} as required inputs. language_id is NOT in the schema — _execute_tool injects profile.id, mirroring the singleton test_variable_downcast dispatch. variable_names and target_precisions are lists (typed 'array') so the LLM cannot pass a single string where a list is expected; the tool's own _validate_union_args then enforces same-length + non-empty + no-duplicate + all-supported-target."""
+    by_name = {t["name"]: t for t in ORCHESTRATOR_TOOLS}
+    assert "test_variable_union_downcast" in by_name
+
+    schema = by_name["test_variable_union_downcast"]["input_schema"]
+    props = schema["properties"]
+    assert set(props.keys()) == {
+        "kernel_stem",
+        "variable_names",
+        "target_precisions",
+        "tolerance_json",
+    }
+    assert set(schema["required"]) == {
+        "kernel_stem",
+        "variable_names",
+        "target_precisions",
+        "tolerance_json",
+    }
+    assert "language_id" not in props
+    assert props["variable_names"]["type"] == "array"
+    assert props["target_precisions"]["type"] == "array"
+
+
+def test_orchestrator_tools_include_bisect_variable_downcast_with_required_args():
+    """ORCHESTRATOR_TOOLS exposes bisect_variable_downcast with the SAME required-input shape as test_variable_union_downcast (kernel_stem + variable_names + target_precisions + tolerance_json), because bisect is a drop-in escalation from the union: the orchestrator lifts the same argument list from step 1.6 into step 1.7 on VERDICT: fail. language_id is NOT in the schema — _execute_tool injects profile.id."""
+    by_name = {t["name"]: t for t in ORCHESTRATOR_TOOLS}
+    assert "bisect_variable_downcast" in by_name
+
+    schema = by_name["bisect_variable_downcast"]["input_schema"]
+    props = schema["properties"]
+    assert set(props.keys()) == {
+        "kernel_stem",
+        "variable_names",
+        "target_precisions",
+        "tolerance_json",
+    }
+    assert set(schema["required"]) == {
+        "kernel_stem",
+        "variable_names",
+        "target_precisions",
+        "tolerance_json",
+    }
+    assert "language_id" not in props
+    assert props["variable_names"]["type"] == "array"
+    assert props["target_precisions"]["type"] == "array"
+
+
+def test_execute_tool_dispatches_test_variable_union_downcast(monkeypatch):
+    """_execute_tool routes test_variable_union_downcast to workflow.tools.test_variable_union_downcast, forwards kernel_stem / variable_names / target_precisions / tolerance_json verbatim (lists preserved in order), and injects profile.id as language_id. Returns the deterministic tool's {status, stdout, stderr, artifacts} dict unchanged — no wrapping, no VERDICT-parsing. Ordering matters here because bisect's drop-from-end contract relies on variable_names being in candidate-finder rank order; the dispatch must not reorder it."""
+    captured = {}
+
+    def stub_test_variable_union_downcast(
+        kernel_stem, variable_names, target_precisions, tolerance_json, language_id
+    ):
+        captured["kernel_stem"] = kernel_stem
+        captured["variable_names"] = variable_names
+        captured["target_precisions"] = target_precisions
+        captured["tolerance_json"] = tolerance_json
+        captured["language_id"] = language_id
+        return {
+            "status": "ok",
+            "stdout": "VERDICT: pass -- variables ['x', 'y']",
+            "stderr": "",
+            "artifacts": [
+                "baselines/nbody_force/varprobe/union/reference.json"
+            ],
+        }
+
+    monkeypatch.setattr(
+        orchestrator,
+        "test_variable_union_downcast",
+        stub_test_variable_union_downcast,
+    )
+
+    result = _execute_tool(
+        "test_variable_union_downcast",
+        {
+            "kernel_stem": "nbody_force",
+            "variable_names": ["x", "y"],
+            "target_precisions": ["float", "float"],
+            "tolerance_json": '{"kind": "sig_figs", "value": 6, "source": "user_cli"}',
+        },
+        KOKKOS_PROFILE,
+    )
+
+    assert captured == {
+        "kernel_stem": "nbody_force",
+        "variable_names": ["x", "y"],
+        "target_precisions": ["float", "float"],
+        "tolerance_json": '{"kind": "sig_figs", "value": 6, "source": "user_cli"}',
+        "language_id": "kokkos",
+    }
+    assert result["status"] == "ok"
+    assert "VERDICT: pass" in result["stdout"]
+    assert result["artifacts"] == [
+        "baselines/nbody_force/varprobe/union/reference.json"
+    ]
+
+
+def test_execute_tool_test_variable_union_downcast_under_cuda_profile_injects_cuda_language_id(
+    monkeypatch,
+):
+    """_execute_tool's language_id injection for test_variable_union_downcast is per-profile, not Kokkos-hardcoded: under CUDA_PROFILE the tool receives language_id='cuda'. The CUDA baseline harness doesn't emit the precision-alias pattern in v0, so a real call would error — but the dispatch contract itself must remain profile-driven so a future CUDA alias adoption 'just works'. Same principle as the singleton test's CUDA-injection test."""
+    captured = {}
+
+    def stub_test_variable_union_downcast(
+        kernel_stem, variable_names, target_precisions, tolerance_json, language_id
+    ):
+        captured["language_id"] = language_id
+        return {
+            "status": "error",
+            "stdout": "",
+            "stderr": "no alias block for variable 'x' in baseline driver",
+            "artifacts": [],
+        }
+
+    monkeypatch.setattr(
+        orchestrator,
+        "test_variable_union_downcast",
+        stub_test_variable_union_downcast,
+    )
+
+    _execute_tool(
+        "test_variable_union_downcast",
+        {
+            "kernel_stem": "vector_add",
+            "variable_names": ["x", "y"],
+            "target_precisions": ["float", "float"],
+            "tolerance_json": '{"kind": "sig_figs", "value": 6, "source": "user_cli"}',
+        },
+        CUDA_PROFILE,
+    )
+    assert captured == {"language_id": "cuda"}
+
+
+def test_execute_tool_dispatches_bisect_variable_downcast(monkeypatch):
+    """_execute_tool routes bisect_variable_downcast to workflow.tools.bisect_variable_downcast, forwards kernel_stem / variable_names / target_precisions / tolerance_json verbatim (list order preserved — required for the drop-from-end contract), and injects profile.id as language_id. Returns the deterministic tool's {status, stdout, stderr, artifacts} dict unchanged. Bisect emits stdout starting with 'BISECT:' rather than 'VERDICT:', so we cross-check that prefix here to catch accidental reformatting in the dispatch layer."""
+    captured = {}
+
+    def stub_bisect_variable_downcast(
+        kernel_stem, variable_names, target_precisions, tolerance_json, language_id
+    ):
+        captured["kernel_stem"] = kernel_stem
+        captured["variable_names"] = variable_names
+        captured["target_precisions"] = target_precisions
+        captured["tolerance_json"] = tolerance_json
+        captured["language_id"] = language_id
+        return {
+            "status": "ok",
+            "stdout": (
+                "BISECT: passed_subset=['x'] after 2 iteration(s), "
+                "dropped 1 variable(s)."
+            ),
+            "stderr": "",
+            "artifacts": [
+                "baselines/nbody_force/varprobe/bisect_result.json"
+            ],
+        }
+
+    monkeypatch.setattr(
+        orchestrator,
+        "bisect_variable_downcast",
+        stub_bisect_variable_downcast,
+    )
+
+    result = _execute_tool(
+        "bisect_variable_downcast",
+        {
+            "kernel_stem": "nbody_force",
+            "variable_names": ["x", "y"],
+            "target_precisions": ["float", "float"],
+            "tolerance_json": '{"kind": "sig_figs", "value": 6, "source": "user_cli"}',
+        },
+        KOKKOS_PROFILE,
+    )
+
+    assert captured == {
+        "kernel_stem": "nbody_force",
+        "variable_names": ["x", "y"],
+        "target_precisions": ["float", "float"],
+        "tolerance_json": '{"kind": "sig_figs", "value": 6, "source": "user_cli"}',
+        "language_id": "kokkos",
+    }
+    assert result["status"] == "ok"
+    assert result["stdout"].startswith("BISECT:")
+    assert result["artifacts"] == [
+        "baselines/nbody_force/varprobe/bisect_result.json"
+    ]
+
+
+def test_execute_tool_bisect_variable_downcast_under_cuda_profile_injects_cuda_language_id(
+    monkeypatch,
+):
+    """_execute_tool's language_id injection for bisect_variable_downcast is per-profile, mirroring every other language-parameterized dispatch. Same rationale as the union tool's CUDA-injection test — a real call would error today, but the wiring must remain profile-driven so future CUDA alias support drops in without a router edit."""
+    captured = {}
+
+    def stub_bisect_variable_downcast(
+        kernel_stem, variable_names, target_precisions, tolerance_json, language_id
+    ):
+        captured["language_id"] = language_id
+        return {
+            "status": "error",
+            "stdout": "",
+            "stderr": "no alias block for variable 'x' in baseline driver",
+            "artifacts": [],
+        }
+
+    monkeypatch.setattr(
+        orchestrator,
+        "bisect_variable_downcast",
+        stub_bisect_variable_downcast,
+    )
+
+    _execute_tool(
+        "bisect_variable_downcast",
+        {
+            "kernel_stem": "vector_add",
+            "variable_names": ["x", "y"],
+            "target_precisions": ["float", "float"],
             "tolerance_json": '{"kind": "sig_figs", "value": 6, "source": "user_cli"}',
         },
         CUDA_PROFILE,

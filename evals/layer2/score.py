@@ -43,6 +43,8 @@ _KNOWN_TOOLS = frozenset({
     "probe_step",
     "probe_compare",
     "test_variable_downcast",
+    "test_variable_union_downcast",
+    "bisect_variable_downcast",
     "finish",
 })
 

@@ -30,6 +30,7 @@ from .aggregator import aggregate_analyst_verdicts
 from .languages import LanguageProfile, detect_language
 from .run_agent import run_agent, run_agent_ensemble
 from .tools import (
+    bisect_variable_downcast,
     check_analyst_verdict_against_probe,
     compare_outputs,
     compile_baseline_driver,
@@ -41,6 +42,7 @@ from .tools import (
     splice_rewritten_kernel,
     syntax_check_driver_source,
     test_variable_downcast,
+    test_variable_union_downcast,
 )
 from .verifier_panel import (
     VERIFIER_LENSES,
@@ -255,6 +257,63 @@ You also have two deterministic (non-LLM) tools:
     per-variable decision. Failures here are NOT finish-gating on their
     own — the finish-gate remains compare_outputs on the assembled
     rewrite — but they change WHICH variables land in that rewrite.
+    Note: singleton passes are NECESSARY but NOT SUFFICIENT — the
+    per-variable tests do not detect interactions between simultaneously-
+    downcast variables. Step 1.6 (test_variable_union_downcast) is the
+    joint-safety check that closes that gap.
+
+  - test_variable_union_downcast: takes a kernel_stem, a
+    variable_names[] array, a parallel target_precisions[] array, and a
+    tolerance_json. Mutates N alias lines
+    ('using <variable_name>Type = ...;') inside the kernel sentinels in
+    baselines/<kernel_stem>/<profile driver filename> in one pass,
+    writes the joint-mutated driver under baselines/<kernel_stem>/
+    varprobe/union/, compiles and runs it, and compares its
+    reference.json against the canonical oracle at baselines/
+    <kernel_stem>/reference.json under the supplied tolerance. Returns
+    {status, stdout, stderr, artifacts}. SAME VERDICT contract as
+    test_variable_downcast: status='ok' means the tool ran end-to-end;
+    the VERDICT ('pass' or 'fail') is in stdout as 'VERDICT: pass' or
+    'VERDICT: fail'. status='error' is reserved for infrastructure
+    failures. Call this EXACTLY ONCE, after every test_variable_downcast
+    call from step 1.5 has returned, passing ONLY the variables whose
+    singleton test's outcome was 'pass' (filter out singleton-fail and
+    singleton-error entries — those are already demoted to
+    action='keep' by step 2's assembly recipe and MUST NOT appear
+    here). If the singleton-passing set is empty, SKIP this call
+    entirely and proceed directly to step 2 with every downcast verdict
+    demoted. The purpose of this joint test is to catch interactions
+    between individually-safe downcasts (e.g. downcasting both a
+    producer view and its consumer view may compound rounding error
+    that either downcast alone would not have exposed).
+
+  - bisect_variable_downcast: takes a kernel_stem, a variable_names[]
+    array in candidate-finder RANK ORDER (highest rank / most-
+    desirable-to-downcast first), a parallel target_precisions[] array,
+    and a tolerance_json. Finds the largest PREFIX of variable_names[]
+    whose joint downcast passes the oracle comparison under the
+    supplied tolerance, by trying the full union first and then
+    dropping the LAST (lowest-rank) variable on each subsequent
+    iteration until either the prefix passes or the empty subset is
+    reached. Each iteration's driver / binary / reference.json is
+    preserved under baselines/<kernel_stem>/varprobe/bisect_iter_<n>/.
+    Emits baselines/<kernel_stem>/varprobe/bisect_result.json with
+    keys {passed_subset, dropped, iterations, union_stdout_last}.
+    Returns {status, stdout, stderr, artifacts}. status='ok' covers
+    BOTH the full-prefix-passed and the empty-subset-only cases —
+    from the tool's perspective, bisection ran successfully and
+    produced a definite answer either way. status='error' is reserved
+    for infrastructure failures. Call this EXACTLY ONCE, IMMEDIATELY
+    after a test_variable_union_downcast call whose outcome was
+    'VERDICT: fail' OR status='error'; pass the same variable_names /
+    target_precisions the union tool received, in candidate-finder
+    rank order (the same order step 1 iterated over the analysts).
+    Do NOT call this if the union tool's outcome was 'VERDICT: pass' —
+    the full singleton-passing set is safe and no bisection is needed.
+    After this tool returns, step 2's assembly recipe uses
+    `passed_subset` from the artifact JSON (or from stdout's 'BISECT:'
+    header) as the surviving downcast set; variables NOT in
+    passed_subset MUST be demoted to action='keep'.
 
   - splice_rewritten_kernel: takes a kernel_stem and the rewriter's
     rewritten kernel source. Reads the baseline driver source under
@@ -381,11 +440,43 @@ Your job after the tolerance is fixed:
    AND its stdout contains 'VERDICT: fail'; 'fail' if the tool
    returned status='error' (e.g. because the analyst chose an
    unsupported target_precision like 'half', or the compile / run
-   failed). This step is REQUIRED — step 2's assembly recipe uses its
-   outcomes to decide which downcast verdicts survive into the
-   rewriter's task_prompt.
-2. Assemble a self-contained task_prompt for the rewriter. The prompt
-   must include:
+   failed). This step is REQUIRED — steps 1.6 and 2 use its outcomes
+   to decide which downcast verdicts advance to the joint-safety
+   check and, ultimately, into the rewriter's task_prompt.
+1.6. Compute the SINGLETON-PASSING SET: the ordered list of
+   (variable_name, target_precision) pairs whose step 1.5 outcome
+   was 'pass', in candidate-finder rank order (the same order step 1
+   iterated over the analysts). If this set is EMPTY, SKIP steps 1.6
+   and 1.7 entirely and proceed to step 2 (every downcast verdict
+   gets demoted). Otherwise, call test_variable_union_downcast ONCE
+   with the same kernel_stem, the singleton-passing set as parallel
+   variable_names[] / target_precisions[] arrays, and the tolerance
+   serialized as a JSON string. Track the empirical outcome as either
+   'pass' (status='ok' AND stdout contains 'VERDICT: pass') or
+   'fail' (status='ok' AND stdout contains 'VERDICT: fail', OR
+   status='error'). If the outcome is 'pass', the SURVIVING DOWNCAST
+   SET for step 2 is the full singleton-passing set. If the outcome
+   is 'fail', go to step 1.7 to bisect. This step is REQUIRED unless
+   the singleton-passing set is empty.
+1.7. Call bisect_variable_downcast ONCE, with the same kernel_stem,
+   the same singleton-passing set (variable_names[] in candidate-
+   finder rank order, parallel target_precisions[]), and the same
+   tolerance_json that was passed to test_variable_union_downcast.
+   The tool drops from the END of the list, so the answer is the
+   largest passing PREFIX under the finder's rank order. Read
+   `passed_subset` from the returned stdout's 'BISECT:' header (or
+   from the baselines/<kernel_stem>/varprobe/bisect_result.json
+   artifact); that is the SURVIVING DOWNCAST SET for step 2. Any
+   singleton-passing variable NOT in passed_subset gets demoted in
+   step 2. Only reach this step when step 1.6 returned 'fail'.
+2. Assemble a self-contained task_prompt for the rewriter. Let the
+   SURVIVING DOWNCAST SET be:
+     - the full singleton-passing set from step 1.5, if step 1.6 was
+       skipped (empty singleton-passing set — trivially the empty
+       set) OR step 1.6's outcome was 'pass';
+     - `passed_subset` from step 1.7's bisect_result.json, if step
+       1.7 ran.
+   The prompt must include:
      - the full kernel source,
      - the agreed tolerance,
      - a per-variable verdict list built by concatenating:
@@ -393,15 +484,17 @@ Your job after the tolerance is fixed:
            * if the spawn_variable_analyst verdict had action='keep' or
              action='emulate', echo it verbatim;
            * if the spawn_variable_analyst verdict had action='downcast'
-             AND the corresponding test_variable_downcast outcome from
-             step 1.5 was 'pass', echo it verbatim;
+             AND the variable is in the SURVIVING DOWNCAST SET, echo
+             it verbatim;
            * if the spawn_variable_analyst verdict had action='downcast'
-             AND the corresponding test_variable_downcast outcome from
-             step 1.5 was 'fail', DEMOTE it to
+             AND the variable is NOT in the SURVIVING DOWNCAST SET,
+             DEMOTE it to
              {name, action:'keep', target_precision:'',
               emulation_type:'',
-              reason:'singleton downcast to <target_precision> did not
-              meet tolerance: <one-line stdout excerpt>'};
+              reason:'<one of: singleton downcast to <target_precision>
+              did not meet tolerance | joint downcast dropped by bisect
+              (interaction with other downcasts violated tolerance)>:
+              <one-line stdout excerpt>'};
        (b) a fixed `{name, action:'keep', target_precision:'',
            emulation_type:'', reason:'not a downcast candidate per
            finder: <finder rationale>'}` entry for each
@@ -409,8 +502,8 @@ Your job after the tolerance is fixed:
    The concatenated list MUST cover every finder entry — coverage is
    the invariant that keeps the downstream verifier / rewriter
    contracts intact. Do not editorialize — faithfully convey the
-   per-variable analysts' calls (as gated by step 1.5) and do not
-   choose a method they did not ask for.
+   per-variable analysts' calls (as gated by steps 1.5 through 1.7)
+   and do not choose a method they did not ask for.
 3. Call spawn_rewriter with that task_prompt.
 4. Call spawn_verifier with (original_source, rewritten_source from the
    rewriter, analyst_verdict_json, tolerance_json). The
@@ -992,6 +1085,162 @@ ORCHESTRATOR_TOOLS = [
                 "kernel_stem",
                 "variable_name",
                 "target_precision",
+                "tolerance_json",
+            ],
+        },
+    },
+    {
+        "name": "test_variable_union_downcast",
+        "description": (
+            "Deterministic (non-LLM) tool. Empirically tests whether "
+            "N variables can be jointly downcast to their respective "
+            "target_precisions while still meeting the operator-"
+            "supplied tolerance. Mutates N alias lines in "
+            "baselines/<kernel_stem>/driver.cpp in one pass, writes "
+            "the joint-mutated driver to baselines/<kernel_stem>/"
+            "varprobe/union/, compiles and runs it, and compares its "
+            "reference.json against the canonical oracle. Returns "
+            "{status, stdout, stderr, artifacts}. Same VERDICT "
+            "contract as test_variable_downcast: status='ok' with "
+            "'VERDICT: pass' or 'VERDICT: fail' in stdout; "
+            "status='error' is infrastructure failure only. Call this "
+            "ONCE after every test_variable_downcast call has "
+            "returned, passing ONLY the variables whose singleton "
+            "test returned 'VERDICT: pass' (i.e. filter out singleton-"
+            "fail and singleton-error variables — those are already "
+            "demoted to action='keep'). The purpose is to catch "
+            "interactions between individually-safe downcasts (e.g. "
+            "downcasting both a producer view and its consumer view "
+            "may compound rounding error that either downcast alone "
+            "would not have exposed). On 'VERDICT: pass', use the "
+            "full input list to build the rewriter's task_prompt. On "
+            "'VERDICT: fail' or status='error', call "
+            "bisect_variable_downcast next to find the largest "
+            "passing subset."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "kernel_stem": {
+                    "type": "string",
+                    "description": (
+                        "Filesystem-safe short name for this kernel; "
+                        "MUST match the kernel_stem passed to the "
+                        "preceding spawn_baseline_harness call."
+                    ),
+                },
+                "variable_names": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "The variables to jointly downcast. Each must "
+                        "match a `name` in the spawn_variable_analyst "
+                        "output AND correspond to a "
+                        "`using <variable_name>Type = ...;` alias "
+                        "line inside the kernel sentinels. Order does "
+                        "not affect the joint test; pass in any "
+                        "convenient order (e.g. candidate-finder rank)."
+                    ),
+                },
+                "target_precisions": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "The precision to retarget each variable's "
+                        "alias to, parallel to variable_names[]. "
+                        "Currently only 'float' is supported in v0."
+                    ),
+                },
+                "tolerance_json": {
+                    "type": "string",
+                    "description": (
+                        "The same {kind, value, source} JSON string "
+                        "the orchestrator threads through the rest of "
+                        "the pipeline."
+                    ),
+                },
+            },
+            "required": [
+                "kernel_stem",
+                "variable_names",
+                "target_precisions",
+                "tolerance_json",
+            ],
+        },
+    },
+    {
+        "name": "bisect_variable_downcast",
+        "description": (
+            "Deterministic (non-LLM) tool. Given a list of variables "
+            "in candidate-finder RANK ORDER (highest rank / most-"
+            "desirable-to-downcast first), finds the largest PREFIX "
+            "whose joint downcast passes the oracle comparison under "
+            "the operator-supplied tolerance. Internally: tries the "
+            "full union in baselines/<kernel_stem>/varprobe/"
+            "bisect_iter_1/; on 'VERDICT: fail' drops the LAST "
+            "(lowest-rank) variable and retries in bisect_iter_2/, "
+            "and so on. Each iteration's artifacts are preserved. "
+            "Emits baselines/<kernel_stem>/varprobe/bisect_result.json "
+            "with keys {passed_subset, dropped, iterations, "
+            "union_stdout_last}. Returns {status, stdout, stderr, "
+            "artifacts}. status='ok' covers both the full-prefix-"
+            "passed and the empty-subset-only cases (from the tool's "
+            "perspective, bisection ran successfully and produced a "
+            "definite answer either way). status='error' is reserved "
+            "for infrastructure failures. Call this ONCE, IMMEDIATELY "
+            "after a test_variable_union_downcast call returned "
+            "'VERDICT: fail' or status='error'; pass the same "
+            "variable_names / target_precisions the union tool "
+            "received, in candidate-finder rank order. After this "
+            "tool returns, use `passed_subset` from the artifact JSON "
+            "(or from stdout's 'BISECT:' header) as the downcast set "
+            "for the rewriter's task_prompt; variables NOT in "
+            "passed_subset MUST be demoted to action='keep'."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "kernel_stem": {
+                    "type": "string",
+                    "description": (
+                        "Filesystem-safe short name for this kernel; "
+                        "MUST match the kernel_stem passed to the "
+                        "preceding spawn_baseline_harness call."
+                    ),
+                },
+                "variable_names": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "The variables to bisect over, in candidate-"
+                        "finder RANK ORDER (highest rank first). "
+                        "Order IS significant: the tool drops from "
+                        "the END of the list first, so the answer is "
+                        "the largest passing PREFIX under this order."
+                    ),
+                },
+                "target_precisions": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "The precision to retarget each variable's "
+                        "alias to, parallel to variable_names[]. "
+                        "Currently only 'float' is supported in v0."
+                    ),
+                },
+                "tolerance_json": {
+                    "type": "string",
+                    "description": (
+                        "The same {kind, value, source} JSON string "
+                        "the orchestrator threads through the rest of "
+                        "the pipeline."
+                    ),
+                },
+            },
+            "required": [
+                "kernel_stem",
+                "variable_names",
+                "target_precisions",
                 "tolerance_json",
             ],
         },
@@ -1758,6 +2007,42 @@ def _execute_tool(
             tool_input["kernel_stem"],
             tool_input["variable_name"],
             tool_input["target_precision"],
+            tool_input["tolerance_json"],
+            profile.id,
+        )
+    if tool_name == "test_variable_union_downcast":
+        # Deterministic tool (no LLM call): joint downcast of N alias
+        # lines in one splice. The step-3 singleton passes are only
+        # necessary, not sufficient -- interaction effects between
+        # downcast producers and consumers still need proof. The LLM
+        # is instructed to invoke this once, filtering the input to
+        # step-3-passing variables only. `profile.id` is injected here
+        # so the LLM never has to pass it (mirrors test_variable_
+        # downcast). Returns the same {status, stdout, stderr,
+        # artifacts} shape; VERDICT ('pass' | 'fail') is a substring
+        # of stdout, NOT the status field.
+        return test_variable_union_downcast(
+            tool_input["kernel_stem"],
+            tool_input["variable_names"],
+            tool_input["target_precisions"],
+            tool_input["tolerance_json"],
+            profile.id,
+        )
+    if tool_name == "bisect_variable_downcast":
+        # Deterministic tool (no LLM call): drop-from-end bisection
+        # over the singleton-passing set, called ONLY after a
+        # test_variable_union_downcast returned VERDICT: fail (or
+        # status='error'). The LLM is instructed to pass the same
+        # variable list in candidate-finder rank order (highest first);
+        # the tool's largest-passing-prefix answer respects that order.
+        # Emits baselines/<stem>/varprobe/bisect_result.json which the
+        # LLM parses to decide which variables get demoted to
+        # action='keep'. `profile.id` is injected here so the LLM
+        # never has to pass it.
+        return bisect_variable_downcast(
+            tool_input["kernel_stem"],
+            tool_input["variable_names"],
+            tool_input["target_precisions"],
             tool_input["tolerance_json"],
             profile.id,
         )

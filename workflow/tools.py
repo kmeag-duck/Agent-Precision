@@ -2219,3 +2219,521 @@ def test_variable_downcast(
             str(candidate_path),
         ],
     }
+
+
+# ---------- test_variable_union_downcast + bisect_variable_downcast ----------
+#
+# Step 4 of the per-variable analyst pipeline. After Step 3
+# (test_variable_downcast) has validated each candidate variable's
+# downcast in ISOLATION, we still have to prove they interact safely
+# when applied TOGETHER: two singleton passes do not imply a joint
+# pass, because a downstream variable that consumed the singleton-
+# downcast producer at full double precision in Step 3 will see the
+# reduced-precision producer in the joint case.
+#
+# `test_variable_union_downcast` mutates N alias lines at once and
+# tests the joint downcast against the oracle -- same yardstick,
+# same directory layout convention, same status contract as Step 3.
+# `bisect_variable_downcast` wraps it with a greedy drop-from-end
+# bisection: given the singleton-passing variables in candidate-
+# finder RANK ORDER (highest rank first), it tries the full union,
+# and on failure drops the last (lowest-rank) variable and retries,
+# recording every attempt under baselines/<stem>/varprobe/
+# bisect_iter_<n>/ and emitting a summary at
+# baselines/<stem>/varprobe/bisect_result.json.
+#
+# The reason bisection drops from the END rather than doing a
+# classic O(log n) binary search: the finder's rank encodes "how
+# safe / how high-value" a downcast candidate is, and we want to
+# preserve as many high-rank downcasts as possible. Linear drop-
+# from-end preserves the prefix, giving us the largest passing
+# prefix under the finder's ranking. O(log n) bisection over
+# subsets would break that monotonicity assumption. We also
+# accept the O(n) worst case here because n is small (a typical
+# kernel has 3-8 candidate variables after Step 3) and each
+# iteration is a full compile+run+compare cycle whose wall-clock
+# cost is dominated by the compile, not by the number of
+# iterations we skip.
+
+
+def _splice_union_aliases(
+    driver_text: str,
+    profile: LanguageProfile,
+    variable_names: list[str],
+    target_cxxs: list[str],
+) -> tuple[str | None, str | None]:
+    """Apply N single-alias splices to `driver_text` in sequence.
+
+    Each (variable_name, target_cxx) pair is passed through
+    `_splice_singleton_alias` in list order, using the result of
+    iteration i as the input to iteration i+1. This composes
+    trivially because each alias line is edited in place (its
+    position in the file does not shift) and the splicer's
+    scope-check finds sentinels by position, not by pattern.
+
+    Returns `(new_source, None)` on success or `(None, error_msg)`
+    on the first splice failure. The error message names the
+    offending variable and forwards the underlying splice error
+    verbatim, so the caller (and, transitively, the orchestrator)
+    can tell exactly which of the N variables the union is stuck
+    on.
+    """
+    if len(variable_names) != len(target_cxxs):
+        return (None, (
+            f"_splice_union_aliases requires len(variable_names) == "
+            f"len(target_cxxs); got {len(variable_names)} and "
+            f"{len(target_cxxs)}."
+        ))
+    current = driver_text
+    for name, cxx in zip(variable_names, target_cxxs):
+        new_source, err = _splice_singleton_alias(
+            current, profile, name, cxx
+        )
+        if err is not None:
+            return (None, f"variable {name!r}: {err}")
+        current = new_source
+    return (current, None)
+
+
+def _validate_union_args(
+    variable_names: object,
+    target_precisions: object,
+) -> tuple[list[str], list[str], str | None]:
+    """Validate the list-shaped args for the union / bisect tools.
+
+    Returns `(names, target_cxxs, error_msg)`. On success,
+    `error_msg` is None and `names` / `target_cxxs` are validated
+    parallel lists. On failure, `error_msg` names the specific
+    violation and the two lists are empty.
+
+    The validation catches: non-list inputs, length mismatch,
+    empty list (a zero-variable union is a caller bug, not a
+    silent no-op), each name being a non-empty stripped string,
+    duplicate names (would cause the second splice to fail on
+    "no double token" after the first splice already floated the
+    alias), and each target_precision being in the v0 support
+    set. Every rejection is a caller-contract violation, i.e.
+    status='error'.
+    """
+    if not isinstance(variable_names, list):
+        return ([], [], (
+            f"variable_names must be a list; got "
+            f"{type(variable_names).__name__}."
+        ))
+    if not isinstance(target_precisions, list):
+        return ([], [], (
+            f"target_precisions must be a list; got "
+            f"{type(target_precisions).__name__}."
+        ))
+    if len(variable_names) != len(target_precisions):
+        return ([], [], (
+            f"variable_names and target_precisions must have the same "
+            f"length; got {len(variable_names)} and "
+            f"{len(target_precisions)}."
+        ))
+    if not variable_names:
+        return ([], [], (
+            "variable_names must be non-empty; a zero-variable union "
+            "is a caller bug, not a silent no-op."
+        ))
+    names: list[str] = []
+    target_cxxs: list[str] = []
+    seen: set[str] = set()
+    for i, (name, prec) in enumerate(zip(variable_names, target_precisions)):
+        if not isinstance(name, str) or not name.strip() or name.strip() != name:
+            return ([], [], (
+                f"variable_names[{i}]={name!r} must be a non-empty "
+                f"string with no leading/trailing whitespace."
+            ))
+        if name in seen:
+            return ([], [], (
+                f"variable_names contains duplicate entry {name!r}; "
+                f"each variable may appear at most once in a union."
+            ))
+        seen.add(name)
+        if prec not in _SUPPORTED_TARGET_PRECISIONS:
+            return ([], [], (
+                f"target_precisions[{i}]={prec!r} is not supported by "
+                f"the per-variable pipeline in v0. Supported: "
+                f"{sorted(_SUPPORTED_TARGET_PRECISIONS)}."
+            ))
+        names.append(name)
+        target_cxxs.append(_TARGET_PRECISION_TO_CXX[prec])
+    return (names, target_cxxs, None)
+
+
+def _parse_tolerance_json(tolerance_json: str) -> tuple[str | None, int | None, str | None]:
+    """Parse and validate `tolerance_json`.
+
+    Returns `(kind, value, error_msg)`. On success, `error_msg` is
+    None and `kind` / `value` are the validated tolerance fields.
+    Same contract as the inline block in `test_variable_downcast`;
+    factored out so the union and bisect tools apply the same
+    yardstick without drift.
+    """
+    try:
+        tolerance = json.loads(tolerance_json)
+    except json.JSONDecodeError as exc:
+        return (None, None, (
+            f"tolerance_json is not valid JSON: {exc}. Expected an "
+            f"object like {{'kind': 'sig_figs', 'value': 3, 'source': "
+            f"'user_cli'}}."
+        ))
+    if not isinstance(tolerance, dict):
+        return (None, None, (
+            f"tolerance_json must be a JSON object; got "
+            f"{type(tolerance).__name__}."
+        ))
+    tol_kind = tolerance.get("kind")
+    tol_value = tolerance.get("value")
+    if tol_kind not in {"sig_figs", "decimal_digits"}:
+        return (None, None, (
+            f"Unsupported tolerance kind: {tol_kind!r}. Expected "
+            f"'sig_figs' or 'decimal_digits'."
+        ))
+    if (
+        not isinstance(tol_value, int)
+        or isinstance(tol_value, bool)
+        or tol_value < 1
+    ):
+        return (None, None, (
+            f"Invalid tolerance value: {tol_value!r}. Expected a "
+            f"positive integer."
+        ))
+    return (tol_kind, tol_value, None)
+
+
+def _run_union_attempt(
+    kernel_stem: str,
+    profile: LanguageProfile,
+    variable_names: list[str],
+    target_cxxs: list[str],
+    tol_kind: str,
+    tol_value: int,
+    attempt_dir: Path,
+) -> dict:
+    """Perform a single union attempt: splice, write, compile, run,
+    compare. Writes artifacts into `attempt_dir` (which the caller
+    creates fresh for each attempt so failed attempts are preserved).
+
+    Returns the uniform `{status, stdout, stderr, artifacts}` dict.
+    The caller decides how to interpret the result: for the union
+    tool the result is returned verbatim; for the bisect tool the
+    caller inspects status + `VERDICT:` in stdout to decide whether
+    to iterate.
+    """
+    baseline_dir = Path("baselines") / kernel_stem
+    baseline_driver_path = baseline_dir / profile.driver_filename
+    oracle_path = baseline_dir / "reference.json"
+
+    if not baseline_driver_path.is_file():
+        return _error(
+            f"Baseline driver source not found at "
+            f"{baseline_driver_path}. Did spawn_baseline_harness run "
+            f"and get approved for this kernel_stem?"
+        )
+    if not oracle_path.is_file():
+        return _error(
+            f"Oracle reference.json not found at {oracle_path}. Did "
+            f"run_baseline_driver (and, on Kokkos, the probe pipeline's "
+            f"oracle promotion in probe_compare) run and succeed for "
+            f"this kernel_stem?"
+        )
+
+    try:
+        baseline_text = baseline_driver_path.read_text()
+    except OSError as exc:
+        return _error(f"Failed to read {baseline_driver_path}: {exc}")
+
+    new_source, err = _splice_union_aliases(
+        baseline_text, profile, variable_names, target_cxxs
+    )
+    if err is not None:
+        return _error(f"In {baseline_driver_path}: {err}")
+
+    attempt_src = attempt_dir / profile.driver_filename
+    try:
+        attempt_dir.mkdir(parents=True, exist_ok=True)
+        attempt_src.write_text(new_source)
+    except OSError as exc:
+        return _error(f"Failed to write {attempt_src}: {exc}")
+
+    compile_result = _compile_driver(
+        attempt_dir,
+        profile,
+        missing_source_hint=(
+            "test_variable_union_downcast just wrote the driver source; "
+            f"this should not happen. Check filesystem permissions on "
+            f"{attempt_dir}."
+        ),
+    )
+    if compile_result["status"] != "ok":
+        return compile_result
+
+    run_result = _run_driver(
+        attempt_dir,
+        missing_binary_hint=(
+            "test_variable_union_downcast just compiled the driver; "
+            f"this should not happen. Check filesystem permissions on "
+            f"{attempt_dir}."
+        ),
+    )
+    if run_result["status"] != "ok":
+        return run_result
+
+    candidate_path = attempt_dir / "reference.json"
+    try:
+        passed, total, mismatches, shape_err = (
+            _compare_singleton_vs_oracle(
+                oracle_path, candidate_path, tol_kind, tol_value
+            )
+        )
+    except json.JSONDecodeError as exc:
+        return _error(
+            f"reference.json parse failure while comparing "
+            f"{candidate_path} against {oracle_path}: {exc}"
+        )
+    except OSError as exc:
+        return _error(
+            f"OS error while comparing {candidate_path} against "
+            f"{oracle_path}: {exc}"
+        )
+    if shape_err is not None:
+        return _error(
+            f"Shape mismatch between union output and oracle: "
+            f"{shape_err}"
+        )
+
+    names_str = ", ".join(repr(n) for n in variable_names)
+    verdict_header = (
+        f"VERDICT: pass -- variables [{names_str}] jointly tolerate "
+        f"downcast under {tol_kind}={tol_value} "
+        f"({total} values compared)."
+        if passed else
+        f"VERDICT: fail -- variables [{names_str}] do NOT jointly "
+        f"tolerate downcast under {tol_kind}={tol_value} "
+        f"({len(mismatches)}/{total} values disagree, first "
+        f"{len(mismatches)} shown)."
+    )
+    stdout_lines = [verdict_header]
+    for m in mismatches:
+        stdout_lines.append(
+            f"  ({m['name']!r}, idx={m['index']}, a={m['a']}, "
+            f"b={m['b']}, abs_err={m['abs_err']}, "
+            f"threshold={m['threshold']})"
+        )
+
+    return {
+        "status": "ok",
+        "stdout": "\n".join(stdout_lines),
+        "stderr": "",
+        "artifacts": [
+            str(attempt_src),
+            str(attempt_dir / "driver"),
+            str(candidate_path),
+        ],
+    }
+
+
+def test_variable_union_downcast(
+    kernel_stem: str,
+    variable_names: list[str],
+    target_precisions: list[str],
+    tolerance_json: str,
+    language_id: str,
+) -> dict:
+    """Empirically test a joint downcast of N variables together.
+
+    Applies each `(variable_names[i], target_precisions[i])` alias
+    mutation to the baseline driver in sequence, writes the mutated
+    driver to baselines/<kernel_stem>/varprobe/union/
+    <driver_filename>, compiles and runs it, and compares against
+    the canonical oracle at baselines/<kernel_stem>/reference.json
+    under the operator-supplied tolerance.
+
+    The purpose is to catch INTERACTIONS between downcasts that
+    individually pass the Step 3 singleton test: e.g. downcasting a
+    producer view AND its consumer view may compound rounding error
+    that either downcast alone would not have exposed. The
+    orchestrator is expected to invoke this tool once after all
+    Step 3 singleton passes, using the singleton-passing subset as
+    `variable_names`.
+
+    Same status / verdict contract as `test_variable_downcast`:
+    `status='ok'` means the tool ran end-to-end; verdict is in
+    stdout as `VERDICT: pass` or `VERDICT: fail`. `status='error'`
+    is infrastructure failure only (missing baseline / oracle,
+    compile / run failure, splice contract violation, malformed
+    args).
+    """
+    profile = _resolve_profile(language_id)
+
+    names, target_cxxs, err = _validate_union_args(
+        variable_names, target_precisions
+    )
+    if err is not None:
+        return _error(err)
+
+    tol_kind, tol_value, err = _parse_tolerance_json(tolerance_json)
+    if err is not None:
+        return _error(err)
+
+    attempt_dir = (
+        Path("baselines") / kernel_stem / "varprobe" / "union"
+    )
+    return _run_union_attempt(
+        kernel_stem, profile, names, target_cxxs,
+        tol_kind, tol_value, attempt_dir,
+    )
+
+
+def bisect_variable_downcast(
+    kernel_stem: str,
+    variable_names: list[str],
+    target_precisions: list[str],
+    tolerance_json: str,
+    language_id: str,
+) -> dict:
+    """Find the largest prefix of `variable_names` (in RANK ORDER,
+    highest first) whose joint downcast passes the oracle
+    comparison under the operator-supplied tolerance.
+
+    The caller passes the singleton-passing variables in candidate-
+    finder rank order (most-desirable-to-downcast first). The tool
+    tries the full union in
+    baselines/<kernel_stem>/varprobe/bisect_iter_1/; on VERDICT:
+    fail it drops the LAST (lowest-rank) variable and retries in
+    bisect_iter_2/, and so on. The first attempt whose VERDICT is
+    `pass` (or the empty subset, if every non-empty subset fails)
+    determines the result.
+
+    Each iteration's driver source, binary, and reference.json are
+    preserved in `bisect_iter_<n>/` (not overwritten across
+    iterations) so a post-mortem can inspect what the interaction
+    looked like at each subset size. A summary lands at
+    baselines/<kernel_stem>/varprobe/bisect_result.json with keys:
+      - passed_subset: list[str], the variable names that jointly
+        passed (may be empty).
+      - dropped: list of {name, reason} in the order they were
+        dropped (bisect_iter_1's drop is first).
+      - iterations: int, number of union attempts executed.
+      - union_stdout_last: str, the VERDICT header of the FINAL
+        attempt (whether pass or fail) so the caller has a summary
+        at a glance.
+
+    Returns the uniform `{status, stdout, stderr, artifacts}` dict
+    like every other orchestrator tool. `status='ok'` covers both
+    the empty-subset-only case and the full-prefix-passed case:
+    from the orchestrator's perspective, bisection ran successfully
+    and produced a definite answer either way. `status='error'` is
+    reserved for infra failures (as in the union tool) surfacing
+    from any iteration.
+
+    Design note: the "keep dropping from end" strategy is O(n) in
+    the number of iterations rather than O(log n), but in exchange
+    it preserves the finder's ranking (the answer is the largest
+    passing prefix under the given order rather than an arbitrary
+    largest passing subset). n is small in practice (typically
+    3-8), so the O(log n) win would rarely materialize in wall
+    time, and each iteration is preserved on disk for later
+    inspection.
+    """
+    profile = _resolve_profile(language_id)
+
+    names, target_cxxs, err = _validate_union_args(
+        variable_names, target_precisions
+    )
+    if err is not None:
+        return _error(err)
+
+    tol_kind, tol_value, err = _parse_tolerance_json(tolerance_json)
+    if err is not None:
+        return _error(err)
+
+    bisect_root = Path("baselines") / kernel_stem / "varprobe"
+    dropped: list[dict] = []
+    iterations = 0
+    passed_subset: list[str] = []
+    last_stdout_verdict = ""
+    all_artifacts: list[str] = []
+
+    current_names = list(names)
+    current_cxxs = list(target_cxxs)
+
+    while current_names:
+        iterations += 1
+        attempt_dir = bisect_root / f"bisect_iter_{iterations}"
+        result = _run_union_attempt(
+            kernel_stem, profile, current_names, current_cxxs,
+            tol_kind, tol_value, attempt_dir,
+        )
+        # Infrastructure failures short-circuit the whole bisection:
+        # a compile failure on the full union doesn't mean the empty
+        # subset would compile either (well, it would, but there's
+        # nothing to test), so we surface the infra error verbatim
+        # and let the orchestrator decide.
+        if result["status"] != "ok":
+            return result
+        all_artifacts.extend(result["artifacts"])
+        # First line of stdout is `VERDICT: pass|fail -- ...`. We
+        # detect pass vs fail by prefix rather than parsing the full
+        # line so the exact wording of the verdict header can evolve
+        # without breaking bisection.
+        first_line = result["stdout"].split("\n", 1)[0]
+        last_stdout_verdict = first_line
+        if first_line.startswith("VERDICT: pass"):
+            passed_subset = list(current_names)
+            break
+        # Drop the last (lowest-rank) variable and try again.
+        dropped_name = current_names[-1]
+        dropped.append({
+            "name": dropped_name,
+            "reason": (
+                f"joint downcast failed at iteration {iterations} with "
+                f"subset of {len(current_names)}; dropped lowest-rank "
+                f"variable {dropped_name!r}."
+            ),
+        })
+        current_names = current_names[:-1]
+        current_cxxs = current_cxxs[:-1]
+
+    # If we exited the loop with an empty current_names list and
+    # never hit a pass, `passed_subset` is [] and `dropped` lists
+    # every variable in the original order. That's a legitimate
+    # (if disappointing) result, not an error.
+
+    summary = {
+        "passed_subset": passed_subset,
+        "dropped": dropped,
+        "iterations": iterations,
+        "union_stdout_last": last_stdout_verdict,
+    }
+    summary_path = bisect_root / "bisect_result.json"
+    try:
+        bisect_root.mkdir(parents=True, exist_ok=True)
+        summary_path.write_text(json.dumps(summary, indent=2))
+    except OSError as exc:
+        return _error(f"Failed to write {summary_path}: {exc}")
+    all_artifacts.append(str(summary_path))
+
+    if passed_subset:
+        stdout = (
+            f"BISECT: passed_subset=[{', '.join(repr(n) for n in passed_subset)}] "
+            f"after {iterations} iteration(s), dropped "
+            f"{len(dropped)} variable(s)."
+        )
+    else:
+        stdout = (
+            f"BISECT: no non-empty subset of "
+            f"[{', '.join(repr(n) for n in names)}] passes joint "
+            f"downcast under {tol_kind}={tol_value} after {iterations} "
+            f"iteration(s). All variables must fall back to action="
+            f"'keep' for this rewrite cycle."
+        )
+
+    return {
+        "status": "ok",
+        "stdout": stdout,
+        "stderr": "",
+        "artifacts": all_artifacts,
+    }
