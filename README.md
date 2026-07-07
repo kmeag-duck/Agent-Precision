@@ -144,17 +144,19 @@ Argo paths exist).
 ## Workflow
 
 Intended happy path through the orchestrator for a Kokkos `.cpp`
-input when no tolerance flag is passed (so the advisor is called once
-up front, and the full dynamic-verification + probe chain runs). The
-same shape applies to CUDA, HIP, SYCL, and OpenMP-offload — only
-steps 5–6 (`probe_step ×8` and `probe_compare`) are skipped on
-profiles with empty `probe_precisions` (currently all non-Kokkos
-profiles), shortening the chain to 12 steps; the
-`spawn_baseline_harness_<id>` agent variant, driver file extension
-(`.cu` / `.hip` / `.cpp`), and compiler invoked in steps 3 / 11 are
-the only other differences. The orchestrator loop, finish-gate, and
-HITL contract are language-agnostic. `flowchart.md` carries the same
-diagram plus prose notes on each deviation branch.
+input with a tolerance flag (`--sig-figs N` or `--decimal-digits N`)
+and the full dynamic-verification + probe chain running. Step 6 is
+itself a six-stage subgraph — the per-variable analyst pipeline (see
+`flowchart.md` for the full expansion). The same shape applies to
+CUDA, HIP, SYCL, and OpenMP-offload — only steps 4–5 (`probe_step ×8`
+and `probe_compare`) are skipped on profiles with empty
+`probe_precisions` (currently all non-Kokkos profiles), shortening the
+chain to 11 steps; the `spawn_baseline_harness_<id>` agent variant,
+driver file extension (`.cu` / `.hip` / `.cpp`), and compiler invoked
+in steps 2 / 10 are the only other differences. The orchestrator
+loop, finish-gate, and HITL contract are language-agnostic.
+`flowchart.md` carries the same diagram plus prose notes on each
+deviation branch and on the step-6 subgraph.
 
 ```mermaid
 flowchart TD
@@ -163,7 +165,7 @@ flowchart TD
 
   U ==> Orch
 
-  subgraph Orch ["Orchestrator (Claude conversation loop)<br/>routes every step · gates finish · MAX_TURNS=60"]
+  subgraph Orch ["Orchestrator (Claude conversation loop)<br/>routes every step · gates finish · MAX_TURNS=150"]
     direction TB
 
     S1["<b>1. spawn_baseline_harness_&lt;id&gt;</b><br/><i>id ∈ {kokkos, cuda, hip, sycl, omp_offload};<br/>Kokkos emits 4 drivers, others emit 1</i><br/>→ baselines/&lt;stem&gt;/driver.&lt;ext&gt;<br/>(+ probe/&lt;precision&gt;/driver.cpp ×4 on Kokkos)"]:::agent
@@ -171,7 +173,7 @@ flowchart TD
     S3["<b>3. run_baseline_driver</b><br/>RUN_TIMEOUT_SEC (default 60)<br/>→ baselines/&lt;stem&gt;/reference.json"]:::det
     S4["<b>4. probe_step ×8</b><br/><i>Kokkos only; 4 precisions × seeds {42, 43};<br/>fused compile+run per cell</i><br/>→ probe/&lt;precision&gt;_seed&lt;N&gt;/reference.json"]:::det
     S5["<b>5. probe_compare</b><br/><i>Kokkos only; aggregates vs quad_seed42;<br/>then ORACLE PROMOTION:<br/>quad_seed42/reference.json →<br/>baselines/&lt;stem&gt;/reference.json</i><br/>→ probe/evidence.json<br/>(appended to next analyst task)"]:::det
-    S6["<b>6. spawn_analyst</b><br/><i>K-fold ensemble via AGENT_PRECISION_ANALYST_K;<br/>aggregator.aggregate_analyst_verdicts</i><br/>→ {variables, rework, precision_budget,<br/>overall_notes}"]:::agent
+    S6["<b>6. per-variable analyst pipeline</b><br/><i>spawn_candidate_finder → N × spawn_variable_analyst<br/>→ N × test_variable_downcast → test_variable_union_downcast<br/>→ bisect_variable_downcast → spawn_analyst_finalizer</i><br/>→ {variables, rework, precision_budget,<br/>overall_notes} (ANALYST_OUTPUT_SCHEMA)"]:::agent
     S7["<b>7. spawn_rewriter</b><br/>→ {rewritten_code, summary_of_changes}"]:::agent
     S8["<b>8. spawn_verifier</b><br/><i>K-lens panel (faithfulness / budget / edge_cases)<br/>via AGENT_PRECISION_VERIFIER_K;<br/>STRICT accept (all lenses must accept)</i>"]:::agent
     S9["<b>9. splice_rewritten_kernel</b><br/><i>text I/O: replace between<br/>KERNEL BEGIN / END sentinels</i><br/>→ baselines/&lt;stem&gt;/rewritten/driver.&lt;ext&gt;"]:::det
@@ -223,48 +225,48 @@ in interactive mode; `--auto` skips that pause and journals each
 executed tool to `baselines/<kernel_stem>/orchestrator_trace.jsonl`
 instead. On `verdict='reject'` at step 8, the orchestrator re-spawns
 the rewriter with the verifier's `concerns` folded into a new task
-prompt, or — if those concerns implicate the analyst's verdict itself
-— re-spawns the analyst; either way, a fresh `spawn_verifier` must
-return `accept` before `finish` is allowed. On a `compare_outputs`
-error at step 12, the orchestrator is steered (by both the system
-prompt and the synthetic gate-violation tool result) toward
-`spawn_analyst` rather than `spawn_rewriter`, because a numerical
-mismatch usually indicates the verifier's verdict was wrong rather
-than just the implementation. See `flowchart.md` for the full prose
-on each deviation branch.
+prompt, or — if those concerns implicate the assembled verdict itself
+— re-enters the step-6 analyst pipeline (typically re-running
+`spawn_analyst_finalizer`, or re-running individual
+`spawn_variable_analyst` calls); either way, a fresh
+`spawn_verifier` must return `accept` before `finish` is allowed. On
+a `compare_outputs` error at step 12, the orchestrator is steered
+(by both the system prompt and the synthetic gate-violation tool
+result) back into the step-6 pipeline (typically re-running
+`spawn_candidate_finder` and rebuilding the verdict) rather than
+into `spawn_rewriter`, because a numerical mismatch usually
+indicates the verifier's verdict was wrong rather than just the
+implementation. See `flowchart.md` for the full prose on each
+deviation branch and on the step-6 subgraph.
 
 ## Agents
 
 | Agent                | Model             | Input                                                                                       | Output (schema keys)                                                                                                                                                                                                                                            | Defined in                 |
 | -------------------- | ----------------- | ------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------- |
-| `analyst`            | `claude-opus-4-7` | kernel source + tolerance block (`target_kind`, `target_value`, `source`)                   | `variables[{name, action, target_precision, emulation_type, reason}]`, `rework{suggested, transformation, rationale, affected_variables}`, `precision_budget{target_kind, target_value, source, claimed_output_precision, headroom_argument}`, `overall_notes` | `workflow/registry.py`     |
+| `candidate_finder`   | `claude-opus-4-7` | kernel source + tolerance block + (auto-attached) probe evidence                            | `variables[{name, downcast_candidate, rank, rationale}]`, `overall_notes`                                                                                                                                                                                       | `workflow/registry.py`     |
+| `variable_analyst`   | `claude-opus-4-7` | kernel source + tolerance block + candidate_finder result + `target_variable: string` + (auto-attached) probe evidence | `{variable{name, action, target_precision, emulation_type, reason}, notes}`                                                                                                                                                                                     | `workflow/registry.py`     |
+| `analyst_finalizer`  | `claude-opus-4-7` | kernel source + `ASSEMBLED VERDICT (JSON)` (orchestrator-composed from candidate_finder + variable_analyst + empirical singleton/union/bisect results) + (auto-attached) probe evidence | same shape as `ANALYST_OUTPUT_SCHEMA`: `variables[{name, action, target_precision, emulation_type, reason}]`, `rework{suggested, transformation, rationale, affected_variables}`, `precision_budget{target_kind, target_value, source, claimed_output_precision, headroom_argument}`, `overall_notes`. Must echo per-variable `name/action/target_precision/emulation_type` verbatim; may only add `precision_budget`, `rework`, `overall_notes` | `workflow/registry.py`     |
 | `rewriter`           | `claude-opus-4-7` | `task_prompt` (source + verdict + any rework + tolerance, composed by orch.)                | `rewritten_code`, `summary_of_changes`                                                                                                                                                                                                                          | `workflow/registry.py`     |
 | `verifier`           | `claude-opus-4-7` | original source, rewritten source, analyst verdict (JSON string), tolerance (JSON string)   | `verdict` (`accept`/`reject`), `per_variable[{name, expected_action, observed_action, ok}]`, `concerns`                                                                                                                                                         | `workflow/registry.py`     |
 | `baseline_harness_<id>` | `claude-opus-4-7` | original kernel source (one harness agent per language profile; orchestrator dispatches by `LanguageProfile.id` resolved from the file suffix and source content) | `driver_source`, `kernel_function_name`, `inputs_summary`, `output_arrays` | `workflow/registry.py` (auto-registered from `workflow/languages/PROFILES`) |
 | `orchestrator`       | `claude-opus-4-7` | kernel path + source + tolerance (from CLI, required) + optional `kernel_name`              | one `finish(rewritten_code, notes)` call                                                                                                                                                                                                                        | `workflow/orchestrator.py` |
 
-The analyst receives the kernel source only — no file path, no orchestrator
-hints — so that ground-truth labels encoded in directory names cannot leak
-into the verdict.
+Every LLM agent in this table receives the kernel source only — no
+file path, no orchestrator hints — so that ground-truth labels
+encoded in directory names cannot leak into any verdict.
 
-The analyst is told the tolerance is a hard constraint, and that
-`emulate` is throughput-negative and only justified when `downcast` would
-violate that tolerance. The rewriter is forbidden from silently
-substituting one method for another (e.g. downcasting when asked to
-emulate), so the verifier's per-variable `ok` check has actual meaning.
+The analyst pipeline (candidate_finder → variable_analyst →
+analyst_finalizer) is told the tolerance is a hard constraint, and
+that `emulate` is throughput-negative and only justified when
+`downcast` would violate that tolerance. The rewriter is forbidden
+from silently substituting one method for another (e.g. downcasting
+when asked to emulate), so the verifier's per-variable `ok` check
+has actual meaning.
 
-The analyst and verifier each have an optional K-fold mode that the
-orchestrator picks up from environment variables (default `K=1`,
-behavior unchanged when unset; see "Run"):
+The verifier has an optional K-fold panel that the orchestrator picks
+up from environment variables (default `K=1`, behavior unchanged
+when unset; see "Run"):
 
-- `AGENT_PRECISION_ANALYST_K > 1` → the analyst is called K times in
-  parallel at `AGENT_PRECISION_ANALYST_T` (default `0.7`) and its
-  verdicts are folded by `workflow/aggregator.py` into a single
-  schema-conformant verdict (per-variable plurality with
-  `keep > emulate > downcast` conservative tiebreak; strict-majority
-  rework; budget+notes from the most-aligned source verdict). The
-  disagreement report rides alongside the result as
-  `aggregator_metadata` for the orchestrator trace.
 - `AGENT_PRECISION_VERIFIER_K > 1` (capped at the number of defined
   lenses, currently 3) → the verifier is called K times in parallel
   under K distinct lenses (`faithfulness`, `budget`, `edge_cases`;
@@ -278,6 +280,17 @@ behavior unchanged when unset; see "Run"):
   from the faithfulness lens verbatim, `concerns` unioned across
   lenses and prefixed with `[<lens>] ` so a rewriter-retry prompt
   sees which lens raised which concern.
+
+`AGENT_PRECISION_ANALYST_K` / `AGENT_PRECISION_ANALYST_T` are legacy
+env vars from the pre-Step-2 monolithic-analyst era. `spawn_analyst`
+is no longer exposed as an orchestrator tool (the per-variable
+pipeline replaced it), so those vars are inert on the production
+happy path; the `_execute_tool` branch that reads them is retained
+only as a tests-only backdoor for the aggregator machinery.
+Per-variable empirical gating (`test_variable_downcast` +
+`test_variable_union_downcast` + `bisect_variable_downcast`)
+supersedes the self-consistency ensemble as the mechanism for
+catching over-aggressive per-variable verdicts.
 
 The `baseline_harness_<id>` agents are orthogonal to the analyst →
 rewriter → verifier pipeline: one is invited (by the initial user
@@ -304,7 +317,9 @@ profile contracts (precision aliases, env vars, language probes).
 
 | Tool                       | Purpose                       | Input                                                                                                                          | Returns to orchestrator                                                  |
 | -------------------------- | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------ |
-| `spawn_analyst`            | dispatch to analyst           | `kernel_source: string` (must contain a labeled tolerance block: `target_kind`, `target_value`, `source`)                      | analyst's structured output, or `{"status":"rejected_by_user"}`          |
+| `spawn_candidate_finder`   | dispatch to candidate_finder (step 1 of the per-variable analyst pipeline) | `kernel_source: string` (must contain a labeled tolerance block: `target_kind`, `target_value`, `source`); at most once per rewrite cycle | candidate_finder's structured output (`variables[{name, downcast_candidate, rank, rationale}]`, `overall_notes`), or `{"status":"rejected_by_user"}` |
+| `spawn_variable_analyst`   | dispatch to variable_analyst (step 2 of the per-variable analyst pipeline) | `kernel_source: string` (with tolerance block), `candidate_finder_result_json: string`, `target_variable: string` (a `downcast_candidate=true` name from the finder); called once per candidate | variable_analyst's structured output (`{variable{name, action, target_precision, emulation_type, reason}, notes}`), or `{"status":"rejected_by_user"}` |
+| `spawn_analyst_finalizer`  | dispatch to analyst_finalizer (final step of the per-variable analyst pipeline; synthesis-only) | `kernel_source: string` (with tolerance block), `assembled_verdict_json: string` (orchestrator-composed `variables[]` from steps 1–5 of the pipeline) | analyst_finalizer's structured output, same shape as `ANALYST_OUTPUT_SCHEMA` (`variables`, `rework`, `precision_budget`, `overall_notes`); per-variable `name/action/target_precision/emulation_type` echoed verbatim, or `{"status":"rejected_by_user"}` |
 | `spawn_rewriter`           | dispatch to rewriter          | `task_prompt: string`                                                                                                          | rewriter's structured output, or `{"status":"rejected_by_user"}`         |
 | `spawn_verifier`           | dispatch to verifier          | `original_source: string`, `rewritten_source: string`, `analyst_verdict_json: string`, `tolerance_json: string`                | verifier's structured output, or `{"status":"rejected_by_user"}`         |
 | `spawn_baseline_harness_<id>` | dispatch to the language-specific baseline_harness agent | `kernel_source: string`, `kernel_stem: string` (one harness per `LanguageProfile.id`; at most once per run; only when `profile.dynamic_verification` is `True`) | harness output + `driver_path` (orchestrator writes `baselines/<kernel_stem>/<driver_filename>` — `.cpp`/`.cu`/`.hip` per profile), or `{"status":"rejected_by_user"}` |
@@ -315,7 +330,10 @@ profile contracts (precision aliases, env vars, language probes).
 | `run_rewritten_driver`     | exec the rewritten driver to capture its reference output (deterministic, non-LLM; never touches the baseline tree) | `kernel_stem: string` (at most once per accepted verifier verdict; only after a successful `compile_rewritten_driver` with same stem; bounded by `AGENT_PRECISION_RUN_TIMEOUT_SEC`) | `{status, stdout, stderr, artifacts}` (artifacts = `[baselines/<stem>/rewritten/reference.json]` on success, `[]` otherwise), or `{"status":"rejected_by_user"}` |
 | `compare_outputs`          | numerically diff baseline vs rewritten `reference.json` under tolerance; gates `finish` on `.cpp` (deterministic, non-LLM; no subprocess) | `kernel_stem: string`, `tolerance_json: string` (same `{kind,value,source}` string passed to `spawn_verifier`; at most once per accepted verifier verdict; only after a successful `run_rewritten_driver`) | `{status, stdout, stderr, artifacts}` (artifacts = `[baselines/<stem>/rewritten/comparison.json]` on both pass and fail; `status='ok'` iff every value agrees and no shape mismatch), or `{"status":"rejected_by_user"}` |
 | `probe_step`               | fused compile+run of one per-(precision, seed) probe driver (deterministic, non-LLM; Kokkos only in v0; not finish-gating) | `kernel_stem: string`, `precision: string` (one of `LanguageProfile.probe_precisions`), `seed: integer` (one of `_PROBE_SEEDS = (42, 43)`); 8 calls per Kokkos run; only after a successful `run_baseline_driver` with same stem; `language_id` is injected by `_execute_tool`, never passed by the LLM | `{status, stdout, stderr, artifacts}` (artifacts = `[baselines/<stem>/probe/<precision>_seed<N>/reference.json]` on success, `[]` otherwise), or `{"status":"rejected_by_user"}` |
-| `probe_compare`            | aggregate the 8 probe references into `evidence.json` for the next `spawn_analyst` (deterministic, non-LLM; no subprocess; Kokkos only in v0; not finish-gating) | `kernel_stem: string`; one call per Kokkos run; only after all 8 `probe_step` calls; `language_id` is injected by `_execute_tool`, never passed by the LLM | `{status, stdout, stderr, artifacts}` (artifacts = `[baselines/<stem>/probe/evidence.json]`; only a missing `quad_seed42` cell hard-errors — every other per-cell problem is reported per-entry in `evidence.json`), or `{"status":"rejected_by_user"}` |
+| `probe_compare`            | aggregate the 8 probe references into `evidence.json` for the analyst pipeline (deterministic, non-LLM; no subprocess; Kokkos only in v0; not finish-gating) | `kernel_stem: string`; one call per Kokkos run; only after all 8 `probe_step` calls; `language_id` is injected by `_execute_tool`, never passed by the LLM | `{status, stdout, stderr, artifacts}` (artifacts = `[baselines/<stem>/probe/evidence.json]`; only a missing `quad_seed42` cell hard-errors — every other per-cell problem is reported per-entry in `evidence.json`), or `{"status":"rejected_by_user"}` |
+| `test_variable_downcast`   | empirical singleton downcast test for one variable at one target precision (deterministic, non-LLM; splice + compile + run + diff against the oracle under operator tolerance; step 3 of the per-variable analyst pipeline) | `kernel_stem: string`, `variable_name: string`, `target_precision: string` (one of `_SUPPORTED_TARGET_PRECISIONS = {'float'}` in v0), `tolerance_json: string`; called once per per-variable `action='downcast'` verdict from `spawn_variable_analyst`; `language_id` is injected by `_execute_tool` | `{status, stdout, stderr, artifacts}` (`status='ok'` even on numerical mismatch — check first line of stdout for `VERDICT: pass` vs `VERDICT: fail`; `status='error'` reserved for infra failures like compile error / timeout / missing artifact), or `{"status":"rejected_by_user"}` |
+| `test_variable_union_downcast` | empirical union downcast test — splice every step-3-passing variable simultaneously and diff (deterministic, non-LLM; catches interactions the singleton tests can't see; step 4 of the per-variable analyst pipeline) | `kernel_stem: string`, `variable_specs_json: string` (list of `{name, target_precision}` for the step-3-passing set), `tolerance_json: string`; called exactly once after all `test_variable_downcast` calls; `language_id` is injected by `_execute_tool` | `{status, stdout, stderr, artifacts}` (same VERDICT semantics as `test_variable_downcast`), or `{"status":"rejected_by_user"}` |
+| `bisect_variable_downcast` | drop candidates in candidate-finder rank order until the remaining subset passes (deterministic, non-LLM; called only when `test_variable_union_downcast` fails; step 5 of the per-variable analyst pipeline) | `kernel_stem: string`, `variable_names: string[]` (in candidate-finder rank order — earliest-dropped first), `variable_specs_json: string`, `tolerance_json: string`; `language_id` is injected by `_execute_tool` | `{status, stdout, stderr, artifacts}` (artifacts = `[baselines/<stem>/varprobe/bisect_result.json]`; `status='ok'` on both a nonempty passing subset and an all-dropped outcome — the passing subset is the write-through data), or `{"status":"rejected_by_user"}` |
 | `finish`                   | end the workflow              | `rewritten_code`, `notes`                                                                                                      | (terminates; nothing fed back) — but the orchestrator's `_FinishGateState` blocks the call (with a synthetic `is_error` tool result) until the gate is satisfied: verifier `verdict='accept'`, plus `compare_outputs status='ok'` for any profile with `dynamic_verification=True` (currently all five) |
 
 The orchestrator's system prompt enforces that exactly one
@@ -327,12 +345,20 @@ seven-step deterministic chain — `compile_baseline_driver` →
 `compile_rewritten_driver` → `run_rewritten_driver` → `compare_outputs`
 — each fires at most once per accepted verifier verdict, only as the
 deterministic follow-up to a successful preceding step, and always with
-the same `kernel_stem`; and that on profiles whose
+the same `kernel_stem`; that on profiles whose
 `LanguageProfile.probe_precisions` is non-empty (Kokkos in v0) the
-probe pipeline runs once between `run_baseline_driver` and
-`spawn_analyst` — 8× `probe_step` (one per (precision, seed) cell)
-followed by 1× `probe_compare` — unless `--no-probe` is passed. The
-probe is NOT finish-gating. Those rules are trusted to the orchestrator
+probe pipeline runs once between `run_baseline_driver` and the
+per-variable analyst pipeline — 8× `probe_step` (one per (precision,
+seed) cell) followed by 1× `probe_compare` — unless `--no-probe` is
+passed (the probe is NOT finish-gating); and that the per-variable
+analyst pipeline runs `spawn_candidate_finder` → N ×
+`spawn_variable_analyst` (once per `downcast_candidate=true` entry in
+rank order) → N × `test_variable_downcast` (once per per-variable
+`action='downcast'` verdict) → `test_variable_union_downcast` (once)
+→ `bisect_variable_downcast` (only when the union test fails) →
+`spawn_analyst_finalizer` (once), where the finalizer must echo per-
+variable `name/action/target_precision/emulation_type` verbatim from
+the orchestrator-assembled verdict. Those rules are trusted to the orchestrator
 LLM. Three things are policed in Python instead: (1) the filesystem
 write for `spawn_baseline_harness_<id>` and the splice writes both
 compute their paths from the orchestrator-supplied `kernel_stem` (not
@@ -390,9 +416,12 @@ exiting.
   - `orchestrator.py` — router + HITL loop. One tool per agent type plus
     `finish`. `--auto` mode bypasses the HITL pause and journals every
     executed tool to `baselines/<kernel_stem>/orchestrator_trace.jsonl`.
-    Ensemble/panel dispatch lives in `_execute_tool`'s `spawn_analyst`
-    and `spawn_verifier` branches, gated on the `AGENT_PRECISION_*_K`
-    env vars.
+    Verifier panel dispatch lives in `_execute_tool`'s `spawn_verifier`
+    branch, gated on the `AGENT_PRECISION_VERIFIER_K` env var.
+    `spawn_analyst` is no longer LLM-visible (the per-variable pipeline
+    replaced it); its `_execute_tool` branch — which still consults
+    `AGENT_PRECISION_ANALYST_K` — is retained only as a tests-only
+    backdoor for the aggregator machinery.
   - `run.py` — CLI entrypoint
     (`python -m workflow.run <kernel_file> [--sig-figs N | --decimal-digits N] [--auto]`).
     Normalizes tolerance flags into `{kind, value, source='user_cli'}`
