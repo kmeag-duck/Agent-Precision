@@ -469,70 +469,75 @@ Your job after the tolerance is fixed:
    artifact); that is the SURVIVING DOWNCAST SET for step 2. Any
    singleton-passing variable NOT in passed_subset gets demoted in
    step 2. Only reach this step when step 1.6 returned 'fail'.
-2. Assemble a self-contained task_prompt for the rewriter. Let the
-   SURVIVING DOWNCAST SET be:
+2. Assemble the per-variable verdict list. Let the SURVIVING DOWNCAST
+   SET be:
      - the full singleton-passing set from step 1.5, if step 1.6 was
        skipped (empty singleton-passing set — trivially the empty
        set) OR step 1.6's outcome was 'pass';
      - `passed_subset` from step 1.7's bisect_result.json, if step
        1.7 ran.
-   The prompt must include:
-     - the full kernel source,
-     - the agreed tolerance,
-     - a per-variable verdict list built by concatenating:
-       (a) for each candidate_finder entry with downcast_candidate=true:
-           * if the spawn_variable_analyst verdict had action='keep' or
-             action='emulate', echo it verbatim;
-           * if the spawn_variable_analyst verdict had action='downcast'
-             AND the variable is in the SURVIVING DOWNCAST SET, echo
-             it verbatim;
-           * if the spawn_variable_analyst verdict had action='downcast'
-             AND the variable is NOT in the SURVIVING DOWNCAST SET,
-             DEMOTE it to
-             {name, action:'keep', target_precision:'',
-              emulation_type:'',
-              reason:'<one of: singleton downcast to <target_precision>
-              did not meet tolerance | joint downcast dropped by bisect
-              (interaction with other downcasts violated tolerance)>:
-              <one-line stdout excerpt>'};
-       (b) a fixed `{name, action:'keep', target_precision:'',
-           emulation_type:'', reason:'not a downcast candidate per
-           finder: <finder rationale>'}` entry for each
-           candidate_finder entry with downcast_candidate=false.
+   Build the per-variable list by concatenating:
+     (a) for each candidate_finder entry with downcast_candidate=true:
+         * if the spawn_variable_analyst verdict had action='keep' or
+           action='emulate', echo it verbatim;
+         * if the spawn_variable_analyst verdict had action='downcast'
+           AND the variable is in the SURVIVING DOWNCAST SET, echo
+           it verbatim;
+         * if the spawn_variable_analyst verdict had action='downcast'
+           AND the variable is NOT in the SURVIVING DOWNCAST SET,
+           DEMOTE it to
+           {name, action:'keep', target_precision:'',
+            emulation_type:'',
+            reason:'<one of: singleton downcast to <target_precision>
+            did not meet tolerance | joint downcast dropped by bisect
+            (interaction with other downcasts violated tolerance)>:
+            <one-line stdout excerpt>'};
+     (b) a fixed `{name, action:'keep', target_precision:'',
+         emulation_type:'', reason:'not a downcast candidate per
+         finder: <finder rationale>'}` entry for each
+         candidate_finder entry with downcast_candidate=false.
    The concatenated list MUST cover every finder entry — coverage is
    the invariant that keeps the downstream verifier / rewriter
    contracts intact. Do not editorialize — faithfully convey the
    per-variable analysts' calls (as gated by steps 1.5 through 1.7)
    and do not choose a method they did not ask for.
-3. Call spawn_rewriter with that task_prompt.
-4. Call spawn_verifier with (original_source, rewritten_source from the
-   rewriter, analyst_verdict_json, tolerance_json). The
-   analyst_verdict_json argument must be a JSON object of the shape
-     {
-       "variables": [ ...the concatenated per-variable list from
-                      step 2... ],
-       "rework": {"suggested": false, "transformation": "",
-                  "rationale": "", "affected_variables": []},
-       "precision_budget": {"target_kind": <from tolerance>,
-                            "target_value": <from tolerance>,
-                            "source": <from tolerance>,
-                            "claimed_output_precision": "",
-                            "headroom_argument": ""},
-       "overall_notes": ""
-     }
-   serialized as a JSON string. The rework and precision_budget
-   stubs are intentional: the per-variable analysts do not emit
-   those blocks in this phase (a future finalizer agent will).
-   The tolerance_json argument must be the agreed tolerance
-   serialized as a JSON string.
+2b. Call spawn_analyst_finalizer ONCE with:
+     - kernel_source: the full kernel source AND the tolerance block
+       (same format the earlier analyst agents received in this
+       cycle);
+     - assembled_verdict_json: {"variables": [ ...the concatenated
+       per-variable list from step 2... ]} serialized as a JSON
+       string.
+    The finalizer will echo every entry's name / action /
+    target_precision / emulation_type verbatim and fill in the
+    whole-kernel wrapper blocks (precision_budget, rework,
+    overall_notes) so the result conforms to the analyst schema the
+    verifier expects. Save its full `result` dict — you will pass
+    that dict's JSON serialization to spawn_verifier in step 4 as
+    analyst_verdict_json, and you will use the per-variable list
+    from step 2 to assemble the rewriter's task_prompt in step 3.
+3. Assemble a self-contained task_prompt for the rewriter. It must
+   include:
+     - the full kernel source,
+     - the agreed tolerance,
+     - the per-variable verdict list from step 2.
+   Then call spawn_rewriter with that task_prompt.
+4. Call spawn_verifier with (original_source, rewritten_source from
+   the rewriter, analyst_verdict_json, tolerance_json). The
+   analyst_verdict_json argument must be the finalizer's `result`
+   dict from step 2b, serialized as a JSON string — no
+   restructuring, no field substitutions. The tolerance_json
+   argument must be the agreed tolerance serialized as a JSON
+   string.
 5. If the verifier returns verdict='accept', call finish with the
    rewritten code. If verdict='reject', either call spawn_rewriter again
    with a task_prompt that incorporates the verifier's per-variable
    mismatches and concerns, or — if the verifier's `concerns` implicate
    a specific variable's verdict — call spawn_variable_analyst again
    for that variable (and re-assemble the verdict for the rewriter as
-   in step 2) with the same tolerance. After any re-run, you must
-   call spawn_verifier again on the new rewrite before calling finish.
+   in step 2, then re-run spawn_analyst_finalizer per step 2b) with
+   the same tolerance. After any re-run, you must call spawn_verifier
+   again on the new rewrite before calling finish.
 
 Hard rules:
 - You may not call finish unless the most recent spawn_verifier call
@@ -625,6 +630,62 @@ ORCHESTRATOR_TOOLS = [
                 },
             },
             "required": ["kernel_source", "target_variable"],
+        },
+    },
+    {
+        "name": "spawn_analyst_finalizer",
+        "description": (
+            "Run the analyst_finalizer agent to synthesize the full "
+            "analyst verdict (ANALYST_OUTPUT_SCHEMA) from a per-"
+            "variable list the orchestrator has already assembled. "
+            "The finalizer echoes the per-variable entries verbatim "
+            "and writes the whole-kernel wrapper blocks "
+            "(precision_budget, rework, overall_notes) that the "
+            "per-variable analysts do not emit. Call this ONCE per "
+            "rewrite cycle, AFTER all spawn_variable_analyst / "
+            "test_variable_downcast / "
+            "test_variable_union_downcast / bisect_variable_downcast "
+            "calls have completed and you have assembled the "
+            "per-variable list per the orchestrator's step 2, and "
+            "BEFORE spawn_rewriter. The orchestrator auto-attaches "
+            "the aggregated probe evidence (when present); you do "
+            "not need to thread it through yourself. Returns a full "
+            "ANALYST_OUTPUT_SCHEMA-shaped dict; pass that dict's "
+            "JSON serialization to spawn_verifier as "
+            "analyst_verdict_json."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "kernel_source": {
+                    "type": "string",
+                    "description": (
+                        "The full kernel source with a clearly-"
+                        "labeled tolerance block. Same format used "
+                        "by the earlier analyst agents in this "
+                        "cycle."
+                    ),
+                },
+                "assembled_verdict_json": {
+                    "type": "string",
+                    "description": (
+                        "A JSON object with a single key `variables` "
+                        "whose value is the concatenated per-variable "
+                        "list you built per the orchestrator's step "
+                        "2 (spawn_variable_analyst outputs, gated by "
+                        "step 1.5 through 1.7, plus fixed 'keep' "
+                        "entries for finder non-candidates). Each "
+                        "entry MUST have the shape {name, action, "
+                        "target_precision, emulation_type, reason} "
+                        "used by ANALYST_OUTPUT_SCHEMA.variables[]. "
+                        "The finalizer will NOT change any entry's "
+                        "name / action / target_precision / "
+                        "emulation_type — those are the pipeline's "
+                        "decision, not the finalizer's."
+                    ),
+                },
+            },
+            "required": ["kernel_source", "assembled_verdict_json"],
         },
     },
     {
@@ -1642,6 +1703,59 @@ def _execute_tool(
                         f"{evidence_text}"
                     )
         result = run_agent("variable_analyst", variable_task)
+        return {"status": "ok", "result": result}
+    if tool_name == "spawn_analyst_finalizer":
+        # Analyst finalizer. Synthesis-only agent that consumes an
+        # already-assembled per-variable verdict list and produces the
+        # full ANALYST_OUTPUT_SCHEMA-shaped dict expected by the
+        # verifier. Probe evidence is auto-injected using the same
+        # mechanism as spawn_candidate_finder / spawn_analyst /
+        # spawn_variable_analyst (single source of truth for WHERE
+        # evidence lives on disk). The assembled_verdict_json is
+        # spliced in as an ASSEMBLED VERDICT (JSON) block AFTER the
+        # kernel source and BEFORE the probe-evidence block, so the
+        # finalizer sees the per-variable list in the same reading
+        # order as the earlier analyst agents saw the CANDIDATE
+        # FINDER RESULT block. Single-shot only (no ensemble): the
+        # per-variable list is mechanically fixed by the pipeline
+        # upstream, so K-way voting on the finalizer's prose would
+        # be low-value. No consistency gate either (that concern was
+        # already checked at spawn_variable_analyst time on the
+        # per-variable calls).
+        finalizer_task = (
+            f"{tool_input['kernel_source']}\n\n"
+            "ASSEMBLED VERDICT (JSON): the orchestrator built the "
+            "per-variable list below by folding the per-variable "
+            "analysts' outputs with the empirical singleton and "
+            "bisect gating. Echo every entry's name, action, "
+            "target_precision, and emulation_type verbatim; you are "
+            "not authorized to change those fields.\n"
+            f"{tool_input['assembled_verdict_json']}"
+        )
+        if kernel_stem is not None:
+            evidence_path = (
+                Path("baselines") / kernel_stem / "probe" / "evidence.json"
+            )
+            if evidence_path.is_file():
+                try:
+                    evidence_text = evidence_path.read_text()
+                except OSError:
+                    evidence_text = None
+                if evidence_text is not None:
+                    finalizer_task = (
+                        f"{finalizer_task}\n\n"
+                        "PROBE EVIDENCE (JSON): the orchestrator ran a "
+                        "precision probe on this kernel before invoking "
+                        "you. The aggregated evidence below shows, for "
+                        "each (precision, seed) cell that succeeded, "
+                        "per-output stats against the quad/seed=42 "
+                        "ground truth, plus cross-seed deltas. Use it "
+                        "to ground your headroom_argument in observed "
+                        "numbers when it corroborates the per-variable "
+                        "list. Missing / errored cells are no signal.\n"
+                        f"{evidence_text}"
+                    )
+        result = run_agent("analyst_finalizer", finalizer_task)
         return {"status": "ok", "result": result}
     if tool_name == "spawn_rewriter":
         result = run_agent("rewriter", tool_input["task_prompt"])

@@ -2,6 +2,7 @@
 
 from workflow.registry import (
     AGENTS,
+    ANALYST_FINALIZER_OUTPUT_SCHEMA,
     ANALYST_OUTPUT_SCHEMA,
     BASELINE_HARNESS_OUTPUT_SCHEMA,
     CANDIDATE_FINDER_OUTPUT_SCHEMA,
@@ -16,6 +17,7 @@ def test_known_agent_types():
         "candidate_finder",
         "variable_analyst",
         "analyst",
+        "analyst_finalizer",
         "rewriter",
         "verifier",
         "baseline_harness",
@@ -1217,4 +1219,49 @@ def test_variable_analyst_prompt_mentions_tolerance_as_hard_constraint():
     """The tolerance is a hard downstream constraint (same rule as the monolithic analyst). Without this the per-variable specialist could recommend downcasts that violate the operator's target when composed with other per-variable verdicts."""
     prompt = AGENTS["variable_analyst"]["system_prompt"]
     assert "tolerance" in prompt.lower()
+
+
+def test_analyst_finalizer_registered():
+    """analyst_finalizer is a registered agent, distinct from analyst / variable_analyst / candidate_finder, wiring the finalizer prompt to the reused ANALYST_OUTPUT_SCHEMA. Step 5a of the per-variable refactor introduces this agent; it is the single-shot synthesis step that consumes the assembled per-variable list and writes the whole-kernel wrapper the verifier reads."""
+    assert "analyst_finalizer" in AGENTS
+    finalizer = AGENTS["analyst_finalizer"]
+    assert finalizer is not AGENTS["analyst"]
+    assert finalizer is not AGENTS["variable_analyst"]
+    assert finalizer is not AGENTS["candidate_finder"]
+    assert finalizer["system_prompt"].strip()
+    assert finalizer["output_schema"] is ANALYST_FINALIZER_OUTPUT_SCHEMA
+
+
+def test_analyst_finalizer_schema_reuses_analyst_schema():
+    """The finalizer's output schema is ANALYST_OUTPUT_SCHEMA verbatim (same object identity, not a copy). Reusing the schema is the whole point: the verifier reads analyst_verdict_json and must not distinguish 'written by the old monolithic analyst' from 'written by the finalizer'. A schema copy would work at the JSON level but would invite silent drift over time — the identity assertion is the guardrail."""
+    assert ANALYST_FINALIZER_OUTPUT_SCHEMA is ANALYST_OUTPUT_SCHEMA
+
+
+def test_analyst_finalizer_prompt_mentions_assembled_verdict_and_probe():
+    """The finalizer prompt must tell the agent (a) it receives an ASSEMBLED VERDICT (JSON) block containing a `variables` list — this is the pipeline's decision, not the finalizer's; (b) it MUST echo name/action/target_precision/emulation_type verbatim on every entry; (c) it may receive a PROBE EVIDENCE block. These are dispatch-time contracts enforced by the orchestrator's `_execute_tool` (the assembled verdict is passed as a tool argument, probe evidence is auto-injected when present); the prompt is where the LLM learns the shape."""
+    prompt = AGENTS["analyst_finalizer"]["system_prompt"]
+    assert "ASSEMBLED VERDICT" in prompt
+    assert "PROBE EVIDENCE" in prompt
+    assert "verbatim" in prompt.lower()
+
+
+def test_analyst_finalizer_prompt_forbids_changing_per_variable_actions():
+    """The finalizer must not change name / action / target_precision / emulation_type on any entry, and must not add or drop entries. This is the invariant that makes the finalizer safe to bolt onto the empirically-gated pipeline: the singleton and bisect gates upstream chose which downcasts survive, and the finalizer is not allowed to overrule them."""
+    prompt = AGENTS["analyst_finalizer"]["system_prompt"]
+    lower = prompt.lower()
+    # The prompt names the four fields it MUST NOT change.
+    assert "action" in lower
+    assert "target_precision" in lower
+    assert "emulation_type" in lower
+    # And states that add / drop of entries is forbidden.
+    assert "add or drop" in lower or "not add" in lower
+
+
+def test_analyst_finalizer_prompt_mentions_tolerance_as_hard_constraint():
+    """Same tolerance rule as the earlier analyst agents. The finalizer writes precision_budget by copying target_kind / target_value / source verbatim from the tolerance block, so the prompt must call out that block by name."""
+    prompt = AGENTS["analyst_finalizer"]["system_prompt"]
+    lower = prompt.lower()
+    assert "tolerance" in lower
+    assert "target_kind" in lower
+    assert "target_value" in lower
     assert "hard" in prompt.lower() or "constraint" in prompt.lower()

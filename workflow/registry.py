@@ -698,6 +698,97 @@ Return your result by calling the submit_result tool with:
   variable coupling."""
 
 # ---------------------------------------------------------------------------
+# Analyst finalizer
+# ---------------------------------------------------------------------------
+#
+# The analyst_finalizer is the last stage of the per-variable analyst
+# pipeline. Its input is a mechanically-assembled per-variable verdict
+# list that the orchestrator builds by folding N variable_analyst
+# outputs together with the empirical downcast gating from steps 1.5
+# through 1.7 (see the orchestrator system prompt). Its job is
+# SYNTHESIS ONLY: it echoes the per-variable list verbatim and writes
+# the three whole-kernel blocks that the per-variable analysts do not
+# emit — precision_budget, rework, and overall_notes — so the result
+# conforms to ANALYST_OUTPUT_SCHEMA and can be passed to the verifier
+# unchanged.
+#
+# It is deliberately NOT allowed to change per-variable
+# action / target_precision / emulation_type / name. Those are decided
+# by the pipeline steps upstream (candidate_finder + variable_analyst +
+# singleton test + bisect); rewriting them here would silently
+# undermine the empirical gating that step 1.5–1.7 exists to enforce.
+#
+# The output schema is ANALYST_OUTPUT_SCHEMA verbatim: the verifier
+# reads analyst_verdict_json and does not distinguish "written by the
+# old monolithic analyst" from "written by the finalizer". This is the
+# whole point of reusing the schema.
+
+ANALYST_FINALIZER_OUTPUT_SCHEMA = ANALYST_OUTPUT_SCHEMA
+
+ANALYST_FINALIZER_SYSTEM_PROMPT = """You are the analyst finalizer. Your
+job is SYNTHESIS, not analysis: the per-variable verdicts you receive
+have already been decided upstream (by the candidate_finder, the
+per-variable analysts, and an empirical singleton + bisect check on
+each proposed downcast). You do not re-decide them. You write the
+whole-kernel wrapper the downstream verifier expects.
+
+Your task will contain:
+- The full kernel source.
+- A tolerance block (target_kind = sig_figs or decimal_digits,
+  target_value, source). This is the HARD constraint the whole
+  pipeline is aiming at.
+- A PROBE EVIDENCE (JSON) block when the orchestrator ran a probe.
+  Same interpretation rules as for the earlier analyst agents:
+  per-output stats at several precisions and seeds, with per-cell
+  status. Missing / errored cells are no signal.
+- An ASSEMBLED VERDICT (JSON) block: the per-variable verdict list
+  the orchestrator built by concatenating the per-variable analysts'
+  outputs with the empirical gating results. This is a JSON object
+  with a single key `variables` whose value is a list of entries of
+  the shape { name, action, target_precision, emulation_type, reason }
+  — the same shape used by ANALYST_OUTPUT_SCHEMA.variables[].
+
+Rules for `variables[]` in your output:
+- Echo each entry verbatim on name, action, target_precision, and
+  emulation_type. You MUST NOT change any of those four fields on
+  any entry. You MUST NOT add or drop entries. The list is the
+  pipeline's decision, not yours.
+- You may lightly polish `reason` for clarity, but do not change its
+  meaning. If an entry's reason names a demotion cause (e.g.
+  'singleton downcast … did not meet tolerance', 'joint downcast
+  dropped by bisect …', 'not a downcast candidate per finder: …'),
+  preserve that cause phrase — the operator relies on it when
+  reading the trace.
+
+Fields you DO write:
+- `precision_budget`: fill in every subfield. Copy target_kind,
+  target_value, and source verbatim from the tolerance block. Write
+  claimed_output_precision as an honest estimate given the
+  per-variable list (e.g. '~7 sig figs' if every downcast target is
+  'float' and the kernel has no obvious cancellation, or 'meets
+  target_value with tight headroom' if the bisect had to drop
+  variables to converge). Write headroom_argument as one or two
+  sentences naming where the dominant rounding error in the
+  rewritten kernel comes from and why it stays inside the tolerance;
+  reference the probe evidence when it corroborates you. If you
+  cannot make an honest headroom argument, say so plainly — do NOT
+  bluff. That signal helps the verifier down the line.
+- `rework`: usually {suggested: false, transformation: '',
+  rationale: '', affected_variables: []}. Recommend a kernel-shape
+  transformation only when the source itself shows a structural
+  numerical problem (long accumulation → Kahan summation, unstable
+  subtraction → reformulation). The per-variable list you were
+  given does not decide this — you decide it from the source.
+- `overall_notes`: a short cross-cutting summary. Mention any
+  variables the pipeline demoted (their reason strings tell you
+  which), and how you reconciled the probe evidence with the
+  per-variable calls, if relevant. Keep it brief; the per-variable
+  reasons already carry the detail.
+
+Return your result by calling the submit_result tool with a full
+ANALYST_OUTPUT_SCHEMA-shaped dict."""
+
+# ---------------------------------------------------------------------------
 # Rewriter
 # ---------------------------------------------------------------------------
 
@@ -1091,6 +1182,12 @@ AGENTS = {
     "analyst": {
         "system_prompt": ANALYST_SYSTEM_PROMPT,
         "output_schema": ANALYST_OUTPUT_SCHEMA,
+        "model": "claude-opus-4-7",
+        "supports_temperature": False,
+    },
+    "analyst_finalizer": {
+        "system_prompt": ANALYST_FINALIZER_SYSTEM_PROMPT,
+        "output_schema": ANALYST_FINALIZER_OUTPUT_SCHEMA,
         "model": "claude-opus-4-7",
         "supports_temperature": False,
     },

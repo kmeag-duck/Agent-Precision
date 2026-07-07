@@ -3307,6 +3307,10 @@ def test_layer2_score_known_tools_includes_probe_step_and_probe_compare():
     # fallback. Same closed-set-drift risk as every tool above.
     assert "test_variable_union_downcast" in _KNOWN_TOOLS
     assert "bisect_variable_downcast" in _KNOWN_TOOLS
+    # Per-variable pipeline tool (Step 5a): analyst_finalizer. The
+    # synthesis step the orchestrator calls once per rewrite cycle
+    # AFTER the assembled per-variable list and BEFORE spawn_rewriter.
+    assert "spawn_analyst_finalizer" in _KNOWN_TOOLS
 
 
 def test_run_cli_no_probe_flag_threads_run_probe_false(monkeypatch, tmp_path):
@@ -3663,3 +3667,183 @@ def test_execute_tool_bisect_variable_downcast_under_cuda_profile_injects_cuda_l
         CUDA_PROFILE,
     )
     assert captured == {"language_id": "cuda"}
+
+
+# ---------- spawn_analyst_finalizer (Step 5a wiring) ----------
+
+
+def test_orchestrator_tools_expose_spawn_analyst_finalizer_with_required_args():
+    """ORCHESTRATOR_TOOLS exposes spawn_analyst_finalizer with exactly {kernel_source, assembled_verdict_json} as required inputs. The tolerance block travels inside kernel_source (same convention as the earlier analyst agents in the cycle), and the per-variable list travels as a JSON string in assembled_verdict_json so the finalizer's task is a plain string the run_agent path can pass through without shape gymnastics. Keeps the tool schema minimal — the finalizer decides nothing that isn't derivable from those two inputs plus the auto-injected probe evidence."""
+    tool = next(
+        t for t in orchestrator.ORCHESTRATOR_TOOLS
+        if t["name"] == "spawn_analyst_finalizer"
+    )
+    schema = tool["input_schema"]
+    assert schema["type"] == "object"
+    assert set(schema["required"]) == {"kernel_source", "assembled_verdict_json"}
+
+
+def test_execute_tool_dispatches_spawn_analyst_finalizer(monkeypatch):
+    """_execute_tool routes spawn_analyst_finalizer to run_agent('analyst_finalizer', task) where task is <kernel_source> followed by an ASSEMBLED VERDICT (JSON) block containing the raw assembled_verdict_json string. Single-shot only (mirrors variable_analyst Step 2 rationale): the per-variable list is mechanically fixed upstream, so ensembling the finalizer's synthesis prose would only add variance in the wrapper blocks. No probe-consistency gate (the consistency concern was already checked per-variable at spawn_variable_analyst time; re-checking here would be double-work on the same signal)."""
+    calls = []
+
+    def stub_run_agent(type_, task):
+        calls.append((type_, task))
+        return {
+            "variables": [
+                {
+                    "name": "x",
+                    "action": "downcast",
+                    "target_precision": "float",
+                    "emulation_type": "",
+                    "reason": "bounded input",
+                }
+            ],
+            "rework": {
+                "suggested": False,
+                "transformation": "",
+                "rationale": "",
+                "affected_variables": [],
+            },
+            "precision_budget": {
+                "target_kind": "sig_figs",
+                "target_value": 6,
+                "source": "user_cli",
+                "claimed_output_precision": "~7 sig figs",
+                "headroom_argument": "single downcast, no cancellation",
+            },
+            "overall_notes": "",
+        }
+
+    def fail_ensemble(*a, **kw):
+        raise AssertionError(
+            "analyst_finalizer is single-shot; run_agent_ensemble must not fire"
+        )
+
+    monkeypatch.setattr(orchestrator, "run_agent", stub_run_agent)
+    monkeypatch.setattr(orchestrator, "run_agent_ensemble", fail_ensemble)
+
+    assembled = (
+        '{"variables": [{"name": "x", "action": "downcast", '
+        '"target_precision": "float", "emulation_type": "", '
+        '"reason": "bounded input"}]}'
+    )
+    result = _execute_tool(
+        "spawn_analyst_finalizer",
+        {"kernel_source": "SOURCE", "assembled_verdict_json": assembled},
+        KOKKOS_PROFILE,
+    )
+
+    assert result["status"] == "ok"
+    assert result["result"]["variables"][0]["name"] == "x"
+    assert len(calls) == 1
+    type_, task = calls[0]
+    assert type_ == "analyst_finalizer"
+    assert task.startswith("SOURCE")
+    assert "ASSEMBLED VERDICT (JSON):" in task
+    assert assembled in task
+    # Never carries aggregator_metadata — single-shot, no ensemble.
+    assert "aggregator_metadata" not in result
+
+
+def test_execute_tool_spawn_analyst_finalizer_injects_probe_evidence_when_present(
+    monkeypatch, tmp_path,
+):
+    """spawn_analyst_finalizer shares the finder/analyst/variable_analyst probe-evidence auto-injection: when baselines/<kernel_stem>/probe/evidence.json exists, the task gets a PROBE EVIDENCE (JSON) block appended AFTER the ASSEMBLED VERDICT block. Ordering — kernel_source, then ASSEMBLED VERDICT, then PROBE EVIDENCE — matches the reading order the earlier analyst agents saw for their CANDIDATE FINDER RESULT block, so the finalizer can cross-reference the per-variable list against the probe numbers when it writes headroom_argument."""
+    monkeypatch.chdir(tmp_path)
+    evidence_dir = tmp_path / "baselines" / "nbody_force" / "probe"
+    evidence_dir.mkdir(parents=True)
+    evidence_payload = {"cells": {"float_seed42": {"status": "ok"}}}
+    (evidence_dir / "evidence.json").write_text(json.dumps(evidence_payload))
+
+    captured = {}
+
+    def stub_run_agent(type_, task):
+        captured["type"] = type_
+        captured["task"] = task
+        return {
+            "variables": [],
+            "rework": {
+                "suggested": False,
+                "transformation": "",
+                "rationale": "",
+                "affected_variables": [],
+            },
+            "precision_budget": {
+                "target_kind": "sig_figs",
+                "target_value": 6,
+                "source": "user_cli",
+                "claimed_output_precision": "",
+                "headroom_argument": "",
+            },
+            "overall_notes": "",
+        }
+
+    monkeypatch.setattr(orchestrator, "run_agent", stub_run_agent)
+
+    assembled = '{"variables": []}'
+    result = _execute_tool(
+        "spawn_analyst_finalizer",
+        {"kernel_source": "ORIGINAL KERNEL SOURCE", "assembled_verdict_json": assembled},
+        KOKKOS_PROFILE,
+        kernel_stem="nbody_force",
+    )
+
+    assert result["status"] == "ok"
+    assert captured["type"] == "analyst_finalizer"
+    task = captured["task"]
+    assert task.startswith("ORIGINAL KERNEL SOURCE")
+    assert "ASSEMBLED VERDICT (JSON):" in task
+    assert "PROBE EVIDENCE (JSON):" in task
+    assert "float_seed42" in task
+    # Enforce section ordering: kernel_source, then ASSEMBLED VERDICT,
+    # then PROBE EVIDENCE, then the JSON payload.
+    src_idx = task.index("ORIGINAL KERNEL SOURCE")
+    av_idx = task.index("ASSEMBLED VERDICT (JSON):")
+    probe_idx = task.index("PROBE EVIDENCE (JSON):")
+    cells_idx = task.index('"cells"')
+    assert src_idx < av_idx < probe_idx < cells_idx
+
+
+def test_execute_tool_spawn_analyst_finalizer_no_evidence_file_unchanged_task(
+    monkeypatch, tmp_path,
+):
+    """When evidence.json is absent, spawn_analyst_finalizer silently falls back to the un-augmented task (kernel_source + ASSEMBLED VERDICT block only) — same silent-skip rule the finder/analyst/variable_analyst branches already follow. Missing evidence is informational-absent, never a hard stop; a kernel run without --probe (or on a profile with an empty probe_precisions) must still be able to synthesize the finalizer verdict."""
+    monkeypatch.chdir(tmp_path)
+    captured = {}
+
+    def stub_run_agent(type_, task):
+        captured["task"] = task
+        return {
+            "variables": [],
+            "rework": {
+                "suggested": False,
+                "transformation": "",
+                "rationale": "",
+                "affected_variables": [],
+            },
+            "precision_budget": {
+                "target_kind": "sig_figs",
+                "target_value": 6,
+                "source": "user_cli",
+                "claimed_output_precision": "",
+                "headroom_argument": "",
+            },
+            "overall_notes": "",
+        }
+
+    monkeypatch.setattr(orchestrator, "run_agent", stub_run_agent)
+
+    assembled = '{"variables": []}'
+    _execute_tool(
+        "spawn_analyst_finalizer",
+        {"kernel_source": "ORIGINAL KERNEL SOURCE", "assembled_verdict_json": assembled},
+        KOKKOS_PROFILE,
+        kernel_stem="nbody_force",
+    )
+
+    task = captured["task"]
+    assert "PROBE EVIDENCE" not in task
+    assert task.startswith("ORIGINAL KERNEL SOURCE")
+    assert "ASSEMBLED VERDICT (JSON):" in task
+    assert assembled in task

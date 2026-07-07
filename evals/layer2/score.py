@@ -31,6 +31,7 @@ _KNOWN_TOOLS = frozenset({
     "spawn_analyst",
     "spawn_candidate_finder",
     "spawn_variable_analyst",
+    "spawn_analyst_finalizer",
     "spawn_rewriter",
     "spawn_verifier",
     "spawn_baseline_harness",
