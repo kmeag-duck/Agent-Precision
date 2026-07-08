@@ -507,7 +507,8 @@ def test_execute_tool_dispatches_spawn_rewriter(monkeypatch):
 
 
 def test_run_orchestrator_happy_path(monkeypatch, fake_anthropic, tmp_path):
-    """run_orchestrator drives analyst -> rewriter -> verifier(accept) -> baseline harness chain -> compare_outputs -> finish end-to-end with HITL approvals."""
+    """run_orchestrator drives analyst -> rewriter -> verifier(accept) -> baseline harness chain -> compare_outputs -> finish end-to-end with HITL approvals. Forces AGENT_PRECISION_VERIFIER_K=1 so the verifier takes the single-shot path (the scripted FakeResponse queue has one verifier response; the current default K=3 would need three)."""
+    monkeypatch.setenv("AGENT_PRECISION_VERIFIER_K", "1")
     # Uses a .cpp kernel which under KOKKOS_PROFILE (dynamic_verification=True)
     # requires the full dynamic-verification chain before finish. Phase B
     # unified .cu and .cpp gating, so there is no shorter happy path
@@ -699,7 +700,8 @@ def test_run_orchestrator_happy_path(monkeypatch, fake_anthropic, tmp_path):
 def test_run_orchestrator_rejection_feeds_back_sentinel(
     monkeypatch, fake_anthropic, tmp_path
 ):
-    """A HITL 'n' rejects the tool call without invoking run_agent and feeds {'status':'rejected_by_user'} back to the orchestrator."""
+    """A HITL 'n' rejects the tool call without invoking run_agent and feeds {'status':'rejected_by_user'} back to the orchestrator. Forces AGENT_PRECISION_VERIFIER_K=1 so the verifier takes the single-shot path (the scripted FakeResponse queue has one verifier response; the current default K=3 would need three)."""
+    monkeypatch.setenv("AGENT_PRECISION_VERIFIER_K", "1")
     # Uses a .cpp kernel under KOKKOS_PROFILE (Phase B unified .cu and
     # .cpp gating, so there is no shorter path to finish for either
     # extension). Ten orchestrator turns: rejected spawn_analyst, then
@@ -975,7 +977,8 @@ def test_format_tolerance_block_does_not_mention_advisor():
 
 
 def test_execute_tool_spawn_verifier_includes_tolerance_in_task(monkeypatch):
-    """_execute_tool builds the verifier's task string from original_source, rewritten_source, analyst_verdict_json, AND tolerance_json — so the verifier sees the same tolerance the analyst saw."""
+    """_execute_tool builds the verifier's task string from original_source, rewritten_source, analyst_verdict_json, AND tolerance_json — so the verifier sees the same tolerance the analyst saw. Forces K=1 so the single-shot run_agent path is exercised (the current default K=3 would route through run_verifier_panel and hide the task-string construction under a different call site)."""
+    monkeypatch.setenv("AGENT_PRECISION_VERIFIER_K", "1")
     captured = {}
 
     def stub_run_agent(type_, task):
@@ -1018,9 +1021,9 @@ def _verifier_task_args() -> dict:
     }
 
 
-def test_execute_tool_spawn_verifier_default_k_uses_single_shot(monkeypatch):
-    """Without AGENT_PRECISION_VERIFIER_K set, _execute_tool stays on the single-shot run_agent('verifier', ...) path and does NOT invoke run_verifier_panel — preserves existing behavior for callers who have not opted into the panel."""
-    monkeypatch.delenv("AGENT_PRECISION_VERIFIER_K", raising=False)
+def test_execute_tool_spawn_verifier_k_one_uses_single_shot(monkeypatch):
+    """With AGENT_PRECISION_VERIFIER_K=1 (the explicit opt-out), _execute_tool stays on the single-shot run_agent('verifier', ...) path and does NOT invoke run_verifier_panel. The default is now K=3 (see the paired default-runs-panel test); K=1 is how operators opt back into the pre-panel single-shot behavior."""
+    monkeypatch.setenv("AGENT_PRECISION_VERIFIER_K", "1")
 
     def stub_run_agent(type_, task):
         assert type_ == "verifier"
@@ -1028,7 +1031,7 @@ def test_execute_tool_spawn_verifier_default_k_uses_single_shot(monkeypatch):
 
     def fail_panel(*a, **kw):
         raise AssertionError(
-            "run_verifier_panel must not be called when K is unset (defaults to 1)"
+            "run_verifier_panel must not be called when K is explicitly 1"
         )
 
     monkeypatch.setattr(orchestrator, "run_agent", stub_run_agent)
@@ -1043,6 +1046,40 @@ def test_execute_tool_spawn_verifier_default_k_uses_single_shot(monkeypatch):
     # key is the signal to downstream tooling (and to the trace reader) that
     # a panel actually ran.
     assert "verifier_aggregator_metadata" not in result
+
+
+def test_execute_tool_spawn_verifier_default_k_runs_full_panel(monkeypatch):
+    """Without AGENT_PRECISION_VERIFIER_K set, _execute_tool defaults to K=3 (the full panel: faithfulness + budget + edge_cases) and invokes run_verifier_panel with all three lenses. This is the new default (previously K=1); operators who need the old single-shot behavior must export AGENT_PRECISION_VERIFIER_K=1."""
+    monkeypatch.delenv("AGENT_PRECISION_VERIFIER_K", raising=False)
+    monkeypatch.delenv("AGENT_PRECISION_VERIFIER_T", raising=False)
+
+    def fail_run_agent(type_, task):
+        raise AssertionError(
+            "run_agent must not be called on the default panel path"
+        )
+
+    captured = {}
+
+    def stub_panel(task, lenses, temperature):
+        captured["lenses"] = lenses
+        captured["temperature"] = temperature
+        # All three lenses accept with an empty per-variable list.
+        return [
+            {"verdict": "accept", "per_variable": [], "concerns": []}
+            for _ in lenses
+        ]
+
+    monkeypatch.setattr(orchestrator, "run_agent", fail_run_agent)
+    monkeypatch.setattr(orchestrator, "run_verifier_panel", stub_panel)
+
+    result = _execute_tool("spawn_verifier", _verifier_task_args(), KOKKOS_PROFILE)
+    assert result["status"] == "ok"
+    assert result["result"]["verdict"] == "accept"
+    # Full panel = all three lenses at the default temperature 0.7.
+    assert len(captured["lenses"]) == 3
+    assert captured["temperature"] == 0.7
+    # The panel path MUST carry verifier_aggregator_metadata.
+    assert "verifier_aggregator_metadata" in result
 
 
 def test_execute_tool_spawn_verifier_k_gt_one_runs_panel_and_aggregates(
@@ -2583,7 +2620,8 @@ def _finish_response(turn_id):
 def test_finish_gate_cpp_verifier_accept_and_compare_ok_allows_finish(
     monkeypatch, fake_anthropic, tmp_path
 ):
-    """For a .cpp kernel, finish is allowed when the most recent spawn_verifier returned verdict='accept' AND the most recent compare_outputs returned status='ok' for the current rewrite cycle."""
+    """For a .cpp kernel, finish is allowed when the most recent spawn_verifier returned verdict='accept' AND the most recent compare_outputs returned status='ok' for the current rewrite cycle. Forces AGENT_PRECISION_VERIFIER_K=1 so the verifier takes the single-shot path (the scripted FakeResponse queue has one verifier response)."""
+    monkeypatch.setenv("AGENT_PRECISION_VERIFIER_K", "1")
     monkeypatch.chdir(tmp_path)
     fake = fake_anthropic([
         _verifier_accept_response("tu_v"),
@@ -2622,7 +2660,8 @@ def test_finish_gate_cpp_verifier_accept_and_compare_ok_allows_finish(
 def test_finish_gate_cpp_verifier_accept_but_compare_error_blocks_finish(
     monkeypatch, fake_anthropic, tmp_path
 ):
-    """For a .cpp kernel, even with a verifier-accept on file, a comparator status='error' blocks finish; the loop injects a synthetic tool_result naming what's missing instead of returning the finish args."""
+    """For a .cpp kernel, even with a verifier-accept on file, a comparator status='error' blocks finish; the loop injects a synthetic tool_result naming what's missing instead of returning the finish args. Forces AGENT_PRECISION_VERIFIER_K=1 so the verifier takes the single-shot path (the scripted FakeResponse queue has one verifier response)."""
+    monkeypatch.setenv("AGENT_PRECISION_VERIFIER_K", "1")
     monkeypatch.chdir(tmp_path)
     fake = fake_anthropic([
         _verifier_accept_response("tu_v"),
@@ -2680,7 +2719,8 @@ def test_finish_gate_cpp_verifier_accept_but_compare_error_blocks_finish(
 def test_finish_gate_cpp_compare_never_called_blocks_finish(
     monkeypatch, fake_anthropic, tmp_path
 ):
-    """For a .cpp kernel, a verifier-accept alone is not enough to allow finish; the comparator must have actually been called this rewrite cycle. Missing compare_outputs is treated as compare_status=None, which the gate blocks."""
+    """For a .cpp kernel, a verifier-accept alone is not enough to allow finish; the comparator must have actually been called this rewrite cycle. Missing compare_outputs is treated as compare_status=None, which the gate blocks. Forces AGENT_PRECISION_VERIFIER_K=1 so the verifier takes the single-shot path (the scripted FakeResponse queue has one verifier response)."""
+    monkeypatch.setenv("AGENT_PRECISION_VERIFIER_K", "1")
     monkeypatch.chdir(tmp_path)
     fake = fake_anthropic([
         _verifier_accept_response("tu_v"),
@@ -2723,7 +2763,8 @@ def test_finish_gate_cpp_compare_never_called_blocks_finish(
 def test_finish_gate_cu_verifier_accept_alone_blocks_finish_post_phase_b(
     monkeypatch, fake_anthropic, tmp_path
 ):
-    """For a .cu kernel under CUDA_PROFILE (dynamic_verification=True post-Phase-B), the finish-gate now requires compare_outputs status='ok' too — a verifier-accept alone is no longer enough. Phase B added CUDA to the dynamic-verification chain, so the .cu and .cpp gating semantics are unified: this test mirrors test_finish_gate_cpp_compare_never_called_blocks_finish above but for .cu."""
+    """For a .cu kernel under CUDA_PROFILE (dynamic_verification=True post-Phase-B), the finish-gate now requires compare_outputs status='ok' too — a verifier-accept alone is no longer enough. Phase B added CUDA to the dynamic-verification chain, so the .cu and .cpp gating semantics are unified: this test mirrors test_finish_gate_cpp_compare_never_called_blocks_finish above but for .cu. Forces AGENT_PRECISION_VERIFIER_K=1 so the verifier takes the single-shot path (the scripted FakeResponse queue has one verifier response)."""
+    monkeypatch.setenv("AGENT_PRECISION_VERIFIER_K", "1")
     monkeypatch.chdir(tmp_path)
     fake = fake_anthropic([
         _verifier_accept_response("tu_v"),

@@ -1140,7 +1140,7 @@ per_variable, and concerns."""
 # names at the bottom of this file for back-compat with external imports.
 
 
-_BASELINE_HARNESS_MODEL = "claude-opus-4-7"
+_BASELINE_HARNESS_MODEL = "claude-sonnet-4-6"
 
 # Per-language baseline-harness entries. The orchestrator's
 # spawn_baseline_harness tool dispatches to `baseline_harness_<id>`
@@ -1157,51 +1157,52 @@ from .languages import PROFILES as _PROFILES  # noqa: E402
 
 # Per-entry `supports_temperature` declares whether the model behind
 # this agent will accept a `temperature` kwarg on messages.create.
-# Argo's `claude-opus-4-7` snapshot rejects temperature outright
-# (HTTP 400 `temperature is deprecated for this model`), so the
-# default is False and `run_agent` drops the kwarg unless this flag
-# is explicitly True. Flip to True per-entry when (and only when)
-# you've verified the model accepts it; the ensemble path will still
-# request K calls but they'll all run at the model's internal
-# sampling, with a warning so the operator knows diversity is
-# reduced. See AGENTS.md for the rationale and `run_agent` for the
-# enforcement point.
+# `claude-sonnet-4-6` (the current model across all entries) accepts
+# temperature, so every entry sets True and the ensemble path (analyst
+# K, verifier K) gets real sampling diversity instead of collapsing
+# to the model's internal sampling. If you swap in a model that
+# rejects temperature (e.g. Argo's `claude-opus-4-7` snapshot, which
+# returns HTTP 400 `temperature is deprecated for this model`), flip
+# the corresponding entry to False; `run_agent` will then drop the
+# kwarg and emit a one-shot stderr warning per (process, agent type)
+# so the operator knows diversity is reduced. See AGENTS.md for the
+# rationale and `run_agent` for the enforcement point.
 AGENTS = {
     "candidate_finder": {
         "system_prompt": CANDIDATE_FINDER_SYSTEM_PROMPT,
         "output_schema": CANDIDATE_FINDER_OUTPUT_SCHEMA,
-        "model": "claude-opus-4-7",
-        "supports_temperature": False,
+        "model": "claude-sonnet-4-6",
+        "supports_temperature": True,
     },
     "variable_analyst": {
         "system_prompt": VARIABLE_ANALYST_SYSTEM_PROMPT,
         "output_schema": VARIABLE_ANALYST_OUTPUT_SCHEMA,
-        "model": "claude-opus-4-7",
-        "supports_temperature": False,
+        "model": "claude-sonnet-4-6",
+        "supports_temperature": True,
     },
     "analyst": {
         "system_prompt": ANALYST_SYSTEM_PROMPT,
         "output_schema": ANALYST_OUTPUT_SCHEMA,
-        "model": "claude-opus-4-7",
-        "supports_temperature": False,
+        "model": "claude-sonnet-4-6",
+        "supports_temperature": True,
     },
     "analyst_finalizer": {
         "system_prompt": ANALYST_FINALIZER_SYSTEM_PROMPT,
         "output_schema": ANALYST_FINALIZER_OUTPUT_SCHEMA,
-        "model": "claude-opus-4-7",
-        "supports_temperature": False,
+        "model": "claude-sonnet-4-6",
+        "supports_temperature": True,
     },
     "rewriter": {
         "system_prompt": REWRITER_SYSTEM_PROMPT,
         "output_schema": REWRITER_OUTPUT_SCHEMA,
-        "model": "claude-opus-4-7",
-        "supports_temperature": False,
+        "model": "claude-sonnet-4-6",
+        "supports_temperature": True,
     },
     "verifier": {
         "system_prompt": VERIFIER_SYSTEM_PROMPT,
         "output_schema": VERIFIER_OUTPUT_SCHEMA,
-        "model": "claude-opus-4-7",
-        "supports_temperature": False,
+        "model": "claude-sonnet-4-6",
+        "supports_temperature": True,
     },
 }
 
@@ -1210,7 +1211,7 @@ for _profile in _PROFILES.values():
         "system_prompt": _profile.baseline_harness_system_prompt,
         "output_schema": _profile.baseline_harness_output_schema,
         "model": _BASELINE_HARNESS_MODEL,
-        "supports_temperature": False,
+        "supports_temperature": True,
     }
 
 # Back-compat alias for callers that still target the unsuffixed name.

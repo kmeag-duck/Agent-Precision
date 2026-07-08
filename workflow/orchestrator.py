@@ -50,7 +50,7 @@ from .verifier_panel import (
     run_verifier_panel,
 )
 
-ORCHESTRATOR_MODEL = "claude-opus-4-7"
+ORCHESTRATOR_MODEL = "claude-sonnet-4-6"
 
 # Hard upper bound on orchestrator API turns per run. The HITL pause is the
 # primary safety net (the user can press 'q' at any time); this constant is a
@@ -1837,18 +1837,19 @@ def _execute_tool(
             "TOLERANCE (JSON):\n"
             f"{tool_input['tolerance_json']}\n"
         )
-        # Optional perspective-diverse panel: when
-        # AGENT_PRECISION_VERIFIER_K is > 1, run the verifier K times in
-        # parallel under K different lenses (faithfulness, budget,
-        # edge_cases) at AGENT_PRECISION_VERIFIER_T (default 0.7) and
-        # fold the K verdicts through aggregate_verifier_verdicts. K
-        # must be <= len(VERIFIER_LENSES); the lenses ARE the panel, so
-        # asking for more is a configuration error. Default K=1
-        # preserves the single-shot behavior so existing runs are
-        # unaffected unless the operator opts in. The aggregator output
-        # conforms to the verifier schema, so the finish-gate code that
-        # reads result['verdict'] needs no changes.
-        k = int(os.environ.get("AGENT_PRECISION_VERIFIER_K", "1"))
+        # Perspective-diverse panel: when AGENT_PRECISION_VERIFIER_K is
+        # > 1, run the verifier K times in parallel under K different
+        # lenses (faithfulness, budget, edge_cases) at
+        # AGENT_PRECISION_VERIFIER_T (default 0.7) and fold the K
+        # verdicts through aggregate_verifier_verdicts. K must be <=
+        # len(VERIFIER_LENSES); the lenses ARE the panel, so asking for
+        # more is a configuration error. The default is K=3 (the full
+        # panel) so every run gets strict-accept multi-lens gating out
+        # of the box; operators can opt back into single-shot behavior
+        # by exporting AGENT_PRECISION_VERIFIER_K=1. The aggregator
+        # output conforms to the verifier schema, so the finish-gate
+        # code that reads result['verdict'] needs no changes.
+        k = int(os.environ.get("AGENT_PRECISION_VERIFIER_K", "3"))
         if k > 1:
             if k > len(VERIFIER_LENSES):
                 raise ValueError(

@@ -234,7 +234,7 @@ def test_verifier_lens_names_are_unique():
 def test_run_verifier_panel_dispatches_one_call_per_lens(
     fake_anthropic, monkeypatch
 ):
-    """run_verifier_panel sends K calls to messages.create — one per lens — each carrying its own system suffix and all sharing the same task + temperature (with supports_temperature flipped on for verifier so the kwarg actually reaches the wire; the default registry value is False because Argo's claude-opus-4-7 rejects temperature)."""
+    """run_verifier_panel sends K calls to messages.create — one per lens — each carrying its own system suffix and all sharing the same task + temperature. The setitem call is defensive: the current registry has supports_temperature=True for verifier (claude-sonnet-4-6 accepts it), but pinning it True here keeps the test independent of any future registry flip."""
     from workflow.registry import AGENTS
     monkeypatch.setitem(AGENTS["verifier"], "supports_temperature", True)
 

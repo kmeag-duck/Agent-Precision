@@ -135,16 +135,20 @@ def run_agent(
         "timeout": 600.0,
     }
 
-    # Temperature handling. Argo's `claude-opus-4-7` snapshot rejects
-    # the `temperature` kwarg outright (HTTP 400
-    # "temperature is deprecated for this model"), so the per-entry
-    # `supports_temperature` flag in the registry gates whether we
-    # forward it at all. When the flag is False (the default), the
-    # kwarg is dropped — including the single-shot default of 0.0 —
-    # and the model's internal sampling is used. If an explicit
-    # temperature was requested but dropped, warn once per process
-    # per agent type: this is the only signal the operator gets that
-    # K-of-K ensemble calls aren't actually diversified by
+    # Temperature handling. Some model snapshots reject the
+    # `temperature` kwarg outright (HTTP 400
+    # "temperature is deprecated for this model" — Argo's
+    # `claude-opus-4-7` snapshot is the motivating case), so the
+    # per-entry `supports_temperature` flag in the registry gates
+    # whether we forward it at all. The current registry uses
+    # `claude-sonnet-4-6`, which accepts temperature, so every entry
+    # sets True; the drop path stays wired for the day a future
+    # registry entry points at a model that doesn't. When the flag is
+    # False, the kwarg is dropped — including the single-shot default
+    # of 0.0 — and the model's internal sampling is used. If an
+    # explicit temperature was requested but dropped, warn once per
+    # process per agent type: this is the only signal the operator
+    # gets that K-of-K ensemble calls aren't actually diversified by
     # temperature anymore.
     supports_temperature = spec.get("supports_temperature", False)
     if supports_temperature:

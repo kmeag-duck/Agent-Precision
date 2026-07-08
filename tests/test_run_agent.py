@@ -195,12 +195,13 @@ def reset_temperature_warning():
 
 @pytest.fixture
 def temperature_enabled_rewriter(monkeypatch):
-    """Patch AGENTS['rewriter']['supports_temperature'] = True for the test.
+    """Ensure AGENTS['rewriter']['supports_temperature'] = True for the test.
 
-    The registry default is False (Argo's claude-opus-4-7 rejects the
-    kwarg). Tests that need to assert temperature reaches messages.create
-    flip the flag for the rewriter entry specifically — picked because
-    most tests in this file use the rewriter as their canary agent.
+    The registry default is currently True (claude-sonnet-4-6 accepts
+    temperature), so this fixture is a no-op on the current registry.
+    It's kept as an explicit precondition so tests that depend on
+    temperature reaching messages.create won't silently start dropping
+    it if the registry default flips again.
     """
     from workflow.registry import AGENTS
     monkeypatch.setitem(AGENTS["rewriter"], "supports_temperature", True)
@@ -213,10 +214,23 @@ def temperature_enabled_verifier(monkeypatch):
     monkeypatch.setitem(AGENTS["verifier"], "supports_temperature", True)
 
 
+@pytest.fixture
+def temperature_disabled_rewriter(monkeypatch):
+    """Force AGENTS['rewriter']['supports_temperature'] = False for the test.
+
+    Used by tests that exercise the drop-and-warn path. The registry
+    default is True today; this fixture makes the drop-path tests
+    independent of that default so they still cover the mechanism if
+    the registry stays on a temperature-accepting model.
+    """
+    from workflow.registry import AGENTS
+    monkeypatch.setitem(AGENTS["rewriter"], "supports_temperature", False)
+
+
 def test_temperature_dropped_by_default_when_unsupported(
-    fake_anthropic, reset_temperature_warning, capsys
+    fake_anthropic, reset_temperature_warning, capsys, temperature_disabled_rewriter
 ):
-    """When the registry entry has supports_temperature=False (the default), run_agent does NOT forward `temperature` to messages.create — Argo's claude-opus-4-7 rejects the kwarg with HTTP 400, so the only safe default is to drop it."""
+    """When the registry entry has supports_temperature=False, run_agent does NOT forward `temperature` to messages.create — some model snapshots (e.g. Argo's claude-opus-4-7) reject the kwarg with HTTP 400, so the mechanism drops it in that case. Fixture forces the flag off; the current registry default is True."""
     payload = {"rewritten_code": "x", "summary_of_changes": "y"}
     fake = fake_anthropic([
         FakeResponse(
@@ -234,9 +248,9 @@ def test_temperature_dropped_by_default_when_unsupported(
 
 
 def test_temperature_explicit_request_dropped_warns_once(
-    fake_anthropic, reset_temperature_warning, capsys
+    fake_anthropic, reset_temperature_warning, capsys, temperature_disabled_rewriter
 ):
-    """When the caller explicitly requests a temperature for an agent whose registry entry sets supports_temperature=False, the kwarg is dropped (model would reject it) and a one-shot stderr warning is emitted naming the agent type and model — the operator's only signal that ensemble diversity is reduced."""
+    """When the caller explicitly requests a temperature for an agent whose registry entry sets supports_temperature=False, the kwarg is dropped (model would reject it) and a one-shot stderr warning is emitted naming the agent type and model — the operator's only signal that ensemble diversity is reduced. Fixture forces the flag off; the current registry default is True."""
     payload = {"rewritten_code": "x", "summary_of_changes": "y"}
     fake = fake_anthropic([
         FakeResponse(
@@ -409,9 +423,9 @@ def test_ensemble_k_three_returns_three_results_with_temperature(
 
 
 def test_ensemble_k_three_drops_temperature_when_unsupported(
-    fake_anthropic, reset_temperature_warning, capsys
+    fake_anthropic, reset_temperature_warning, capsys, temperature_disabled_rewriter
 ):
-    """When the registry entry has supports_temperature=False, K>1 ensemble calls each have temperature dropped on the wire — the operator gets a single-shot warning naming the agent type; ensemble runs proceed at the model's internal sampling instead of HTTP-400'ing."""
+    """When the registry entry has supports_temperature=False, K>1 ensemble calls each have temperature dropped on the wire — the operator gets a single-shot warning naming the agent type; ensemble runs proceed at the model's internal sampling instead of HTTP-400'ing. Fixture forces the flag off; the current registry default is True."""
     payloads = [
         {"rewritten_code": f"r{i}", "summary_of_changes": ""} for i in range(3)
     ]

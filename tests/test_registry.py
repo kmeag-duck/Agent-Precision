@@ -38,7 +38,7 @@ def test_known_agent_types():
 
 
 def test_each_entry_has_required_keys():
-    """Every registry entry declares system_prompt, output_schema, model, and supports_temperature (the last gates whether run_agent forwards the kwarg — Argo's claude-opus-4-7 rejects it, so the flag is mandatory and not just a default-False sentinel)."""
+    """Every registry entry declares system_prompt, output_schema, model, and supports_temperature (the last gates whether run_agent forwards the kwarg — some model snapshots reject temperature outright (Argo's claude-opus-4-7 was the motivating case; the current claude-sonnet-4-6 accepts it), so the flag is mandatory and not just a default sentinel)."""
     for name, spec in AGENTS.items():
         assert "system_prompt" in spec, f"{name} missing system_prompt"
         assert "output_schema" in spec, f"{name} missing output_schema"
@@ -489,7 +489,7 @@ def test_baseline_harness_cuda_entry_exists():
     assert spec["system_prompt"].strip()
     assert spec["output_schema"]["type"] == "object"
     assert spec["model"]
-    assert spec["supports_temperature"] is False
+    assert spec["supports_temperature"] is True
 
 
 def test_baseline_harness_cuda_schema_required_fields():
@@ -624,7 +624,7 @@ def test_baseline_harness_hip_entry_exists():
     assert spec["system_prompt"].strip()
     assert spec["output_schema"]["type"] == "object"
     assert spec["model"]
-    assert spec["supports_temperature"] is False
+    assert spec["supports_temperature"] is True
 
 
 def test_baseline_harness_hip_schema_required_fields():
@@ -781,7 +781,7 @@ def test_baseline_harness_sycl_entry_exists():
     assert spec["system_prompt"].strip()
     assert spec["output_schema"]["type"] == "object"
     assert spec["model"]
-    assert spec["supports_temperature"] is False
+    assert spec["supports_temperature"] is True
 
 
 def test_baseline_harness_sycl_schema_required_fields():
@@ -954,7 +954,7 @@ def test_baseline_harness_omp_offload_entry_exists():
     assert "output_schema" in spec
     assert "model" in spec
     assert "supports_temperature" in spec
-    assert spec["supports_temperature"] is False
+    assert spec["supports_temperature"] is True
 
 
 def test_baseline_harness_omp_offload_schema_required_fields():
