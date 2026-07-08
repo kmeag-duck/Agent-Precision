@@ -233,24 +233,39 @@ BASELINE_HARNESS_OUTPUT_SCHEMA = {
                         "`\"%.9g\"`."
                     ),
                 },
-                "mixed_io": {
+                "original": {
                     "type": "string",
                     "description": (
-                        "Driver in which kernel I/O aliases (the values "
-                        "main() constructs and reads back) resolve to the "
-                        "baseline precision (`__float128`), but any "
-                        "intermediate buffers the kernel writes and then "
-                        "reads internally (if visible from the kernel "
-                        "signature as a distinct output-then-input View) "
-                        "resolve to `float`. For kernels with no such "
-                        "intermediate, this driver may be byte-identical "
-                        "to the `quad` driver — emit it anyway. "
-                        "reference.json formatting matches the I/O "
-                        "precision (quad / quadmath_snprintf %.34Qg)."
+                        "Driver whose per-parameter `<ParamName>Type` "
+                        "aliases resolve to the EXACT types the user "
+                        "wrote in the kernel source verbatim (e.g. a "
+                        "kernel parameter declared as "
+                        "`Kokkos::View<float*> a` gets "
+                        "`using aType = Kokkos::View<float*>;` in this "
+                        "driver, even though the `double` driver would "
+                        "resolve it to `Kokkos::View<double*>`). This "
+                        "driver is the canonical splice scaffold (the "
+                        "orchestrator writes it to "
+                        "`baselines/<stem>/driver.cpp`; the rewriter "
+                        "splices its output into a copy of it) AND the "
+                        "sole source of the baseline `timing` block "
+                        "that `measure_speedup` reports as the "
+                        "pre-rewrite wall-clock. reference.json "
+                        "floating-point formatting matches the "
+                        "dominant precision of the user's kernel: "
+                        "`%.9g` if the kernel is all-float, `%.17g` if "
+                        "it contains any `double` I/O parameter (this "
+                        "is the common case for all-double kernels — "
+                        "the `original` driver is then byte-identical "
+                        "to the `double` driver and both are emitted). "
+                        "For all-double kernels this driver is "
+                        "byte-identical to `double`; emit it anyway "
+                        "(the timing measurement needs it at a known "
+                        "path)."
                     ),
                 },
             },
-            "required": ["quad", "double", "float", "mixed_io"],
+            "required": ["quad", "double", "float", "original"],
         },
         "kernel_function_name": {
             "type": "string",
@@ -303,7 +318,7 @@ You do NOT compile, run, or simulate the kernel. You do NOT invent
 numerical output values. Your only output is the four driver sources.
 
 PER-PRECISION DRIVERS. You emit FOUR drivers in a single
-submit_result call under `drivers.{quad,double,float,mixed_io}`. All
+submit_result call under `drivers.{quad,double,float,original}`. All
 four MUST share:
 
   - the same inlined kernel source (byte-identical between the
@@ -324,12 +339,13 @@ The four drivers differ ONLY in:
   - the reference.json floating-point formatting (item 8).
 
 Per-precision rules (apply to all four alias RHSes uniformly except
-in `mixed_io`):
+in `original`):
 
   - `double`: aliases resolve to `double` / `Kokkos::View<double*>`;
-    JSON values written with `"%.17g"`. This driver is also the
-    canonical splice scaffold (see SPLICE-TARGET ROLE below) — the
-    rewriter will splice lower-precision kernels into a copy of it.
+    JSON values written with `"%.17g"`. This driver exists purely to
+    feed the probe-evidence pipeline as a uniform-double point of
+    comparison against `quad` and `float`; it is NOT the splice
+    scaffold (that role belongs to `original`).
   - `float`: aliases resolve to `float` / `Kokkos::View<float*>`;
     JSON values written with `"%.9g"`.
   - `quad`: SPECIAL CASE — this driver does NOT use Kokkos at all.
@@ -381,30 +397,66 @@ in `mixed_io`):
     driver is later compared by the comparator; it is NEVER a
     splice target, so it does not need to share a Kokkos runtime
     with the other drivers.
-  - `mixed_io`: aliases for kernel arguments that main() constructs
-    AND reads back (the kernel's external I/O) resolve to `double`
-    (matching the canonical splice-scaffold precision); JSON
-    formatting matches (`"%.17g"`). The exception is any kernel
-    parameter that is clearly an intermediate buffer (a View the
-    kernel writes early and reads back later within the same kernel
-    invocation, exposed in the signature only because Kokkos requires
-    it) — those aliases resolve to `float`. If no such intermediate
-    is identifiable from the kernel signature, this driver is
-    byte-identical to the `double` driver; emit it anyway (the
-    probe pipeline still consumes it).
+  - `original`: aliases resolve to the EXACT floating-point types
+    the user wrote in the kernel source verbatim, parameter by
+    parameter. If the user's kernel declares
+    `void kernel(Kokkos::View<double*> a, Kokkos::View<float*> b,
+    double alpha)`, the aliases here are
+    `using aType = Kokkos::View<double*>;`,
+    `using bType = Kokkos::View<float*>;`,
+    `using alphaType = double;` — no coercion to a uniform precision,
+    even if the mix looks unusual. The JSON output format follows
+    the DOMINANT precision of the user's kernel I/O parameters:
+    `%.9g` if every floating-point I/O parameter is `float`, `%.17g`
+    otherwise (i.e. as soon as any I/O parameter is `double`, use
+    `%.17g` for every output value — mixed-precision JSON files
+    remain readable by the same parser as the `double` driver). This
+    driver serves two orthogonal roles: (1) it is the canonical
+    splice scaffold — the orchestrator writes it to
+    `baselines/<stem>/driver.cpp` and the rewriter splices its
+    kernel into a copy of it, so `main()` outside the sentinels must
+    already match the user's original kernel signature; (2) it is
+    the sole source of the baseline `timing` block that
+    `measure_speedup` reports as the pre-rewrite wall-clock — the
+    quad and double drivers' timings are numerically meaningless as
+    "the user's baseline" because quad is plain-C++/quadmath (not
+    Kokkos) and double is a uniform-precision rewrite of a
+    potentially-mixed kernel. For all-double kernels this driver is
+    byte-identical to the `double` driver; emit it anyway (both
+    paths — probe evidence and speedup baseline — need it at its
+    own known path).
 
-SPLICE-TARGET ROLE. The orchestrator writes `drivers["double"]` (NOT
-`drivers["quad"]`) to `baselines/<stem>/driver.cpp` as the canonical
-splice scaffold. The rewriter later splices its kernel between the
-sentinels of that file to produce `baselines/<stem>/rewritten/
-driver.cpp`. The other three drivers (quad, float, mixed_io) live
-only under `baselines/<stem>/probe/<precision>/` and feed the probe-
-evidence pipeline. The quad driver additionally serves as the
-ground-truth oracle: its `reference.json` from seed=42 is promoted
-to `baselines/<stem>/reference.json` (overwriting whatever
-`run_baseline_driver` wrote there from the double driver) so the
+SPLICE-TARGET ROLE. The orchestrator writes `drivers["original"]`
+(NOT `drivers["double"]`, NOT `drivers["quad"]`) to
+`baselines/<stem>/driver.cpp` as the canonical splice scaffold. The
+rewriter later splices its kernel between the sentinels of that
+file to produce `baselines/<stem>/rewritten/driver.cpp`. Because
+`main()` in the `original` driver already constructs kernel
+arguments through aliases that match the user's exact parameter
+types, the rewriter can redefine those aliases (e.g. downcast an
+`aType` from `Kokkos::View<double*>` to `Kokkos::View<float*>`)
+without touching `main()`; the change propagates through the
+signature for free. The other three drivers (quad, double, float)
+live only under `baselines/<stem>/probe/<precision>/` and feed the
+probe-evidence pipeline.
+
+The quad driver additionally serves as the ground-truth oracle: its
+`reference.json` from seed=42 is promoted to
+`baselines/<stem>/reference.json` (overwriting whatever
+`run_baseline_driver` wrote there from the original driver) so the
 finish-gate comparator measures the rewritten kernel against true
 quad ground truth, not against a same-or-lower-precision reference.
+
+The `original` driver additionally serves as the pre-rewrite
+wall-clock reference for `measure_speedup`: its `timing` block from
+seed=42 is read directly out of
+`baselines/<stem>/probe/original_seed42/reference.json` as the
+"baseline" side of the speedup ratio. The `timing` block is present
+in every driver (item 11) but the double and quad blocks are NOT
+used for speedup — the double driver is a uniform-precision rewrite
+of a potentially-mixed kernel and the quad driver is plain
+C++/quadmath (not Kokkos), so neither represents what "the user's
+kernel before rewriting" actually runs at.
 
 None of these driver variants changes the kernel function body
 (except the `quad` driver, which rewrites Kokkos math calls to
@@ -566,11 +618,13 @@ Hard requirements on the driver:
 
 8. Each driver writes its reference output to './reference.json'
    (relative to its own working directory; the orchestrator will
-   place each driver in a separate directory before running it) using
-   std::ofstream. Floating-point formatting follows the per-precision
-   rules above: `%.17g` for `double`, `%.9g` for `float`,
-   `quadmath_snprintf("%.34Qg", ...)` for `quad` and `mixed_io`. Do
-   NOT pull in a third-party JSON library — hand-roll the writer;
+    place each driver in a separate directory before running it) using
+    std::ofstream. Floating-point formatting follows the per-precision
+    rules above: `%.17g` for `double`, `%.9g` for `float`,
+    `quadmath_snprintf("%.34Qg", ...)` for `quad`, and for `original`
+    the DOMINANT-precision rule from the `original` bullet (`%.9g` if
+    every I/O parameter is `float`, `%.17g` otherwise). Do
+    NOT pull in a third-party JSON library — hand-roll the writer;
    output arrays are flat arrays of one floating-point type, so a few
    loops with manual braces, commas, and newlines are sufficient.
 
@@ -609,7 +663,7 @@ Hard requirements on the driver:
     untimed warmup call followed by 10 timed trials. Time only the
     kernel call itself — NOT input allocation, RNG fill, or JSON
     emission. For the three Kokkos-based drivers (double, float,
-    mixed_io), wrap each timed call in `Kokkos::Timer` (call
+    original), wrap each timed call in `Kokkos::Timer` (call
     `.reset()` immediately before the parallel_for and
     `.seconds()` immediately after; add a `Kokkos::fence()` after
     the parallel_for and before `.seconds()` so device work
@@ -639,7 +693,7 @@ under "outputs" by some name, that same name must appear in
 output_arrays.
 
 Populate `drivers.quad`, `drivers.double`, `drivers.float`, and
-`drivers.mixed_io` with the four full driver sources as described in
+`drivers.original` with the four full driver sources as described in
 PER-PRECISION DRIVERS above. All four are required; an absent or
 empty driver fails the schema.
 
@@ -664,14 +718,16 @@ KOKKOS_PROFILE = LanguageProfile(
     # drift against true ground truth rather than against a same-or-
     # lower-precision reference. probe_precisions enumerates the
     # additional configurations the probe runs before invoking the
-    # analyst; `mixed_io` keeps outputs at baseline precision but
-    # downcasts intermediates to float, giving the analyst a coarse
-    # signal on output-vs-intermediate sensitivity without per-variable
-    # instrumentation. Kokkos is the only v1 profile with a populated
-    # probe set; CUDA/HIP/SYCL/OMP-offload remain `probe_precisions=()`
-    # until the deferred Commit 6 lands.
+    # analyst; `original` preserves the user's exact per-parameter
+    # kernel types verbatim (no coercion to uniform double), and
+    # serves double duty as the canonical splice scaffold AND the
+    # `measure_speedup` baseline timing source (see the `original`
+    # bullet in BASELINE_HARNESS_SYSTEM_PROMPT). Kokkos is the only
+    # v1 profile with a populated probe set; CUDA/HIP/SYCL/OMP-
+    # offload remain `probe_precisions=()` until the deferred
+    # Commit 6 lands.
     baseline_precision="quad",
-    probe_precisions=("quad", "double", "float", "mixed_io"),
+    probe_precisions=("quad", "double", "float", "original"),
 )
 
 
