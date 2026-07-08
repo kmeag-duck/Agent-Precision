@@ -4130,7 +4130,7 @@ def test_check_skips_when_probe_cell_status_is_not_ok():
 
 
 def test_check_skips_when_target_precision_has_no_matching_probe_cell():
-    """A downcast-to-half verdict is not flagged when the probe matrix only covered float / mixed_io (no half cell to compare against)."""
+    """A downcast-to-half verdict is not flagged when the probe matrix only covered float / original (no half cell to compare against)."""
     verdict = _mk_verdict(("vy", "downcast", "half"))
     evidence = _mk_evidence({"float_seed42": {"vy": 3.4e-4}})
     tolerance = {"kind": "sig_figs", "value": 6, "source": "user_cli"}
@@ -5808,12 +5808,13 @@ def _ref_with_timing(outputs, timing):
 
 
 def _stage_measure_speedup(tmp_path, stem, baseline_ref, rewritten_ref):
-    """Write baseline + rewritten reference.json files under baselines/<stem>/."""
+    """Write baseline + rewritten reference.json files for the Kokkos measure_speedup path. On Kokkos-like profiles (probe_precisions non-empty) the baseline reference.json is read from baselines/<stem>/probe/original_seed42/ — the 'original' probe driver captures the user's kernel timing before quad-oracle promotion clobbers baselines/<stem>/reference.json. All measure_speedup tests in this module use language_id='kokkos', so we stage into the probe path unconditionally."""
     baseline_dir = tmp_path / "baselines" / stem
+    baseline_probe_dir = baseline_dir / "probe" / "original_seed42"
     rewritten_dir = baseline_dir / "rewritten"
-    baseline_dir.mkdir(parents=True, exist_ok=True)
+    baseline_probe_dir.mkdir(parents=True, exist_ok=True)
     rewritten_dir.mkdir(parents=True, exist_ok=True)
-    (baseline_dir / "reference.json").write_text(json.dumps(baseline_ref))
+    (baseline_probe_dir / "reference.json").write_text(json.dumps(baseline_ref))
     (rewritten_dir / "reference.json").write_text(json.dumps(rewritten_ref))
     return baseline_dir, rewritten_dir
 
@@ -5867,7 +5868,7 @@ def test_measure_speedup_reports_slowdown_without_policy(monkeypatch, tmp_path):
 
 
 def test_measure_speedup_errors_when_baseline_missing(monkeypatch, tmp_path):
-    """If baselines/<stem>/reference.json does not exist, measure_speedup returns status='error' naming run_baseline_driver and writes NO timing.json."""
+    """On Kokkos (probe_precisions non-empty), if baselines/<stem>/probe/original_seed42/reference.json does not exist, measure_speedup returns status='error' naming probe_step and the (precision='original', seed=42) cell (NOT run_baseline_driver — on profiles with a probe pipeline the baseline timing comes from the 'original' probe driver, not from the canonical baselines/<stem>/reference.json which has been clobbered by quad-oracle promotion). Writes NO timing.json."""
     monkeypatch.chdir(tmp_path)
     rewritten_dir = tmp_path / "baselines" / "k" / "rewritten"
     rewritten_dir.mkdir(parents=True)
@@ -5878,17 +5879,23 @@ def test_measure_speedup_errors_when_baseline_missing(monkeypatch, tmp_path):
     result = measure_speedup("k", "kokkos")
 
     assert result["status"] == "error"
-    assert "run_baseline_driver" in result["stderr"]
+    # Error message must name probe_step and the specific missing cell
+    # so the operator knows to re-run that stage of the probe pipeline.
+    assert "probe_step" in result["stderr"]
+    assert "original" in result["stderr"]
+    assert "42" in result["stderr"]
     assert result["artifacts"] == []
     assert not (rewritten_dir / "timing.json").exists()
 
 
 def test_measure_speedup_errors_when_rewritten_missing(monkeypatch, tmp_path):
-    """If baselines/<stem>/rewritten/reference.json does not exist, measure_speedup returns status='error' naming run_rewritten_driver and writes NO timing.json."""
+    """If baselines/<stem>/rewritten/reference.json does not exist, measure_speedup returns status='error' naming run_rewritten_driver and writes NO timing.json. Baseline is staged at the Kokkos-gated probe path (probe/original_seed42/reference.json) so the baseline preflight passes and the rewritten preflight is the one that fails."""
     monkeypatch.chdir(tmp_path)
-    baseline_dir = tmp_path / "baselines" / "k"
-    baseline_dir.mkdir(parents=True)
-    (baseline_dir / "reference.json").write_text(
+    baseline_probe_dir = (
+        tmp_path / "baselines" / "k" / "probe" / "original_seed42"
+    )
+    baseline_probe_dir.mkdir(parents=True)
+    (baseline_probe_dir / "reference.json").write_text(
         json.dumps(_ref_with_timing({"y": [1.0]}, _timing(mean=1.0)))
     )
 
@@ -5982,13 +5989,15 @@ def test_measure_speedup_errors_on_mismatched_trials(monkeypatch, tmp_path):
 
 
 def test_measure_speedup_errors_on_invalid_json(monkeypatch, tmp_path):
-    """If a reference.json is not valid JSON, measure_speedup returns a status='error' naming the file rather than raising."""
+    """If a reference.json is not valid JSON, measure_speedup returns a status='error' naming the file rather than raising. Baseline is staged at the Kokkos-gated probe path (probe/original_seed42/reference.json)."""
     monkeypatch.chdir(tmp_path)
-    baseline_dir = tmp_path / "baselines" / "k"
-    rewritten_dir = baseline_dir / "rewritten"
-    baseline_dir.mkdir(parents=True)
+    baseline_probe_dir = (
+        tmp_path / "baselines" / "k" / "probe" / "original_seed42"
+    )
+    rewritten_dir = tmp_path / "baselines" / "k" / "rewritten"
+    baseline_probe_dir.mkdir(parents=True)
     rewritten_dir.mkdir(parents=True)
-    (baseline_dir / "reference.json").write_text("{not json")
+    (baseline_probe_dir / "reference.json").write_text("{not json")
     (rewritten_dir / "reference.json").write_text(
         json.dumps(_ref_with_timing({"y": [1.0]}, _timing(mean=1.0)))
     )

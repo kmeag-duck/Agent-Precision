@@ -241,9 +241,9 @@ def test_baseline_harness_schema_required_fields():
         "quad",
         "double",
         "float",
-        "mixed_io",
+        "original",
     }
-    for precision in ("quad", "double", "float", "mixed_io"):
+    for precision in ("quad", "double", "float", "original"):
         assert drivers_schema["properties"][precision]["type"] == "string"
 
 
@@ -299,19 +299,21 @@ def test_baseline_harness_prompt_mandates_kernel_splice_sentinels():
 #
 # (1) PER-PRECISION DRIVERS: the harness emits FOUR drivers in a
 #     single submit_result call under `drivers.{quad,double,float,
-#     mixed_io}`. All four share the inlined kernel, alias names,
+#     original}`. All four share the inlined kernel, alias names,
 #     RNG_SEED line, input sizes, and output array names+lengths
 #     (the comparator depends on shape-identical reference.json
 #     across precisions); they differ only in the per-parameter alias
 #     RHSes, host-side scratch precision, and reference.json
-#     formatting. `quad` is also the canonical baseline — the
-#     orchestrator writes drivers.quad to baselines/<stem>/driver.cpp
-#     so the v0 dynamic-verification chain compares the rewritten
-#     kernel against the true (quad) ground truth, not against a
-#     same-or-lower-precision reference. `quad` requires __float128 +
-#     <quadmath.h> + quadmath_snprintf "%.34Qg" and changes the
-#     compile link line (the compile step adds -lquadmath when the
-#     emitted source contains __float128).
+#     formatting. `original` is also the canonical splice scaffold —
+#     the orchestrator writes drivers.original to
+#     baselines/<stem>/driver.cpp so the v0 dynamic-verification
+#     chain compiles / runs / times the rewrite against the user's
+#     original kernel types. `quad` fills the ground-truth-oracle
+#     role (its seed=42 reference.json is promoted into
+#     baselines/<stem>/reference.json by the probe_compare branch)
+#     and requires __float128 + <quadmath.h> + quadmath_snprintf
+#     "%.34Qg" and changes the compile link line (the compile step
+#     adds -lquadmath when the emitted source contains __float128).
 #
 # (2) Named RNG_SEED constant: the harness must declare the seed as
 #     `static constexpr int RNG_SEED = <N>;` on its own line above
@@ -323,11 +325,11 @@ def test_baseline_harness_prompt_mandates_kernel_splice_sentinels():
 
 
 def test_baseline_harness_prompt_mandates_per_precision_drivers():
-    """The Kokkos baseline harness prompt mandates the v1 PER-PRECISION DRIVERS contract: four drivers (quad, double, float, mixed_io) emitted in a single submit_result call under the `drivers` key. All four must share the inlined kernel, alias names, RNG_SEED line, input sizes, and output array names+lengths; they differ only in the per-parameter alias RHSes, host-side scratch precision, and reference.json formatting. The `quad` driver requires __float128 + <quadmath.h> + quadmath_snprintf %.34Qg (the canonical baseline; the orchestrator writes it to baselines/<stem>/driver.cpp). The `float` driver requires %.9g formatting. The `mixed_io` driver keeps I/O at the baseline precision but downcasts identified intermediate buffers to float, giving the analyst a cheap signal on output-vs-intermediate sensitivity. Without this contract the harness collapses back to a single-precision emit and the probe pipeline has nothing to consume."""
+    """The Kokkos baseline harness prompt mandates the v1 PER-PRECISION DRIVERS contract: four drivers (quad, double, float, original) emitted in a single submit_result call under the `drivers` key. All four must share the inlined kernel, alias names, RNG_SEED line, input sizes, and output array names+lengths; they differ only in the per-parameter alias RHSes, host-side scratch precision, and reference.json formatting. The `quad` driver requires __float128 + <quadmath.h> + quadmath_snprintf %.34Qg (the ground-truth oracle; probe_compare promotes its seed=42 reference into baselines/<stem>/reference.json). The `float` driver requires %.9g formatting. The `original` driver preserves the user's kernel parameter types VERBATIM (no coercion to any uniform precision) and is the canonical splice scaffold — the orchestrator writes it to baselines/<stem>/driver.cpp so the rewriter's spliced kernel compiles against the user's actual types; it additionally serves as the pre-rewrite timing reference for measure_speedup. Without this contract the harness collapses back to a single-precision emit and the probe pipeline has nothing to consume."""
     prompt = AGENTS["baseline_harness"]["system_prompt"]
     # The contract heading and the four precision tokens are spelled out.
     assert "PER-PRECISION DRIVERS" in prompt
-    for precision in ("quad", "double", "float", "mixed_io"):
+    for precision in ("quad", "double", "float", "original"):
         assert precision in prompt
     # The quad branch's load-bearing tokens — without these the harness
     # cannot actually emit a quad driver that compiles or formats JSON.
@@ -342,9 +344,11 @@ def test_baseline_harness_prompt_mandates_per_precision_drivers():
     # contract that the probe pipeline depends on).
     lower = prompt.lower()
     assert "shape-identical" in lower or "shape identical" in lower
-    # The mixed_io rule must name intermediate buffers as the thing
-    # that downcasts to float (vs. kernel I/O at baseline precision).
-    assert "intermediate" in lower
+    # The `original` rule must instruct the harness to preserve the
+    # user's kernel parameter types verbatim (no coercion to any
+    # uniform precision) so measure_speedup's baseline timing
+    # reflects what the user actually wrote.
+    assert "verbatim" in lower
 
 
 def test_baseline_harness_prompt_forbids_quad_numeric_literal_suffix():

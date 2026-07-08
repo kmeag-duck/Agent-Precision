@@ -119,12 +119,12 @@ def test_kokkos_profile_baseline_precision_is_quad():
 
 
 def test_kokkos_profile_probe_precisions_v1_set():
-    """KOKKOS_PROFILE.probe_precisions == ('quad', 'double', 'float', 'mixed_io'); these are the four probe configurations the orchestrator runs (per seed) before invoking the analyst. The `quad` entry runs the baseline configuration as a self-consistency check; `double` and `float` measure drift; `mixed_io` (outputs at baseline precision, intermediates at float) gives the analyst a coarse signal on output-vs-intermediate sensitivity without per-variable instrumentation."""
+    """KOKKOS_PROFILE.probe_precisions == ('quad', 'double', 'float', 'original'); these are the four probe configurations the orchestrator runs (per seed) before invoking the analyst. The `quad` entry runs the baseline configuration as a self-consistency check; `double` and `float` measure drift; `original` preserves the user's original kernel parameter types verbatim (both for analyst evidence AND — critically — as the baseline timing reference for measure_speedup, since the canonical baselines/<stem>/reference.json gets clobbered by quad-oracle promotion downstream)."""
     assert KOKKOS_PROFILE.probe_precisions == (
         "quad",
         "double",
         "float",
-        "mixed_io",
+        "original",
     )
 
 

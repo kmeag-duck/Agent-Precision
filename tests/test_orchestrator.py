@@ -1339,14 +1339,14 @@ def test_execute_tool_spawn_baseline_harness_overwrites_existing(
 def test_execute_tool_spawn_baseline_harness_v1_drivers_fan_out(
     monkeypatch, tmp_path
 ):
-    """_execute_tool routes the Kokkos v1 4-driver harness output: drivers['double'] is written to baselines/<stem>/driver.cpp (the canonical splice scaffold that feeds the v0 dynamic-verification chain), and every drivers[<precision>] is also written to baselines/<stem>/probe/<precision>/driver.cpp for the probe pipeline. The canonical baseline is the DOUBLE driver, NOT drivers[baseline_precision] (which is 'quad'): Kokkos has no `__float128` math overload (`Kokkos::sqrt(__float128)` does not exist), so the quad driver is plain C++ + quadmath per the harness prompt — uncompilable as a splice target for the rewriter's Kokkos kernels. The quad driver still serves as the ground-truth oracle: its seed=42 reference.json is promoted to baselines/<stem>/reference.json later in the chain by the probe_compare branch (separately asserted). The returned dict carries the canonical driver_path plus a probe_driver_paths map keyed by precision. The harness's v1 shape (drivers: dict) is detected by presence of the `drivers` key — the v0 shape (driver_source: str, still used by CUDA/HIP/SYCL/OMP-offload) remains supported on the same branch (separately asserted)."""
+    """_execute_tool routes the Kokkos v1 4-driver harness output: drivers['original'] is written to baselines/<stem>/driver.cpp (the canonical splice scaffold that feeds the v0 dynamic-verification chain), and every drivers[<precision>] is also written to baselines/<stem>/probe/<precision>/driver.cpp for the probe pipeline. The canonical baseline is the ORIGINAL driver (the user's kernel parameter types verbatim), NOT drivers[baseline_precision] (which is 'quad'): Kokkos has no `__float128` math overload (`Kokkos::sqrt(__float128)` does not exist), so the quad driver is plain C++ + quadmath per the harness prompt — uncompilable as a splice target for the rewriter's Kokkos kernels. The quad driver still serves as the ground-truth oracle: its seed=42 reference.json is promoted to baselines/<stem>/reference.json later in the chain by the probe_compare branch (separately asserted). The ORIGINAL driver additionally serves as the timing-reference baseline for measure_speedup (which reads from baselines/<stem>/probe/original_seed42/reference.json to avoid the quad-oracle clobber). The returned dict carries the canonical driver_path plus a probe_driver_paths map keyed by precision. The harness's v1 shape (drivers: dict) is detected by presence of the `drivers` key — the v0 shape (driver_source: str, still used by CUDA/HIP/SYCL/OMP-offload) remains supported on the same branch (separately asserted)."""
     monkeypatch.chdir(tmp_path)
 
     drivers_payload = {
         "quad":     "// QUAD DRIVER\nint main(){return 0;}\n",
         "double":   "// DOUBLE DRIVER\nint main(){return 0;}\n",
         "float":    "// FLOAT DRIVER\nint main(){return 0;}\n",
-        "mixed_io": "// MIXED_IO DRIVER\nint main(){return 0;}\n",
+        "original": "// ORIGINAL DRIVER\nint main(){return 0;}\n",
     }
 
     def stub_run_agent(type_, task):
@@ -1366,7 +1366,7 @@ def test_execute_tool_spawn_baseline_harness_v1_drivers_fan_out(
     )
 
     assert result["status"] == "ok"
-    # The canonical baseline is the DOUBLE driver — the splice
+    # The canonical baseline is the ORIGINAL driver — the splice
     # scaffold the rewriter targets. NOT drivers[baseline_precision]
     # (which is "quad"): Kokkos has no `__float128` overload for its
     # math intrinsics, so the quad driver is plain C++ + quadmath
@@ -1376,10 +1376,14 @@ def test_execute_tool_spawn_baseline_harness_v1_drivers_fan_out(
     # baselines/<stem>/reference.json by the probe_compare branch
     # later in the chain (see test_execute_tool_probe_compare_*).
     # KOKKOS_PROFILE.baseline_precision stays "quad" — it names the
-    # oracle precision, not the splice-scaffold precision.
+    # oracle precision, not the splice-scaffold precision. The
+    # ORIGINAL driver ALSO doubles as the timing-reference baseline
+    # for measure_speedup (whose baseline_path selection is
+    # profile-gated to read the probe/original_seed42 reference so
+    # timing survives the quad-oracle clobber).
     canonical = tmp_path / "baselines" / "vector_add" / "driver.cpp"
     assert canonical.exists()
-    assert canonical.read_text() == drivers_payload["double"]
+    assert canonical.read_text() == drivers_payload["original"]
     assert result["driver_path"] == "baselines/vector_add/driver.cpp"
 
     # Every precision variant ALSO lands under
@@ -1503,7 +1507,7 @@ def test_execute_tool_spawn_baseline_harness_gate_rejects_bad_v1_driver(
         "quad":     "// QUAD driver\n",
         "double":   "// DOUBLE driver (broken)\n",
         "float":    "// FLOAT driver\n",
-        "mixed_io": "// MIXED_IO driver\n",
+        "original": "// ORIGINAL driver\n",
     }
 
     def stub_run_agent(type_, task):
@@ -1554,7 +1558,7 @@ def test_execute_tool_spawn_baseline_harness_gate_passes_writes_all(
         "quad":     "// QUAD\nint main(){return 0;}\n",
         "double":   "// DOUBLE\nint main(){return 0;}\n",
         "float":    "// FLOAT\nint main(){return 0;}\n",
-        "mixed_io": "// MIXED_IO\nint main(){return 0;}\n",
+        "original": "// ORIGINAL\nint main(){return 0;}\n",
     }
 
     def stub_run_agent(type_, task):
@@ -3173,7 +3177,7 @@ def test_execute_tool_spawn_analyst_no_kernel_stem_unchanged_task(monkeypatch):
 
 
 def test_format_baseline_block_kokkos_with_run_probe_true_lists_matrix():
-    """On Kokkos (probe_precisions=('quad','double','float','mixed_io')), _format_baseline_block with run_probe=True (the default) appends a PROBE STEP block that names every (precision, seed) cell from the profile × _PROBE_SEEDS matrix. The orchestrator system prompt's tool docs cover the API; this block's job is to tell the LLM what concrete matrix to enumerate."""
+    """On Kokkos (probe_precisions=('quad','double','float','original')), _format_baseline_block with run_probe=True (the default) appends a PROBE STEP block that names every (precision, seed) cell from the profile × _PROBE_SEEDS matrix. The orchestrator system prompt's tool docs cover the API; this block's job is to tell the LLM what concrete matrix to enumerate."""
     block = _format_baseline_block(
         "kernels/nbody_force.cpp", None, KOKKOS_PROFILE, run_probe=True
     )
@@ -3181,13 +3185,13 @@ def test_format_baseline_block_kokkos_with_run_probe_true_lists_matrix():
     assert "'quad'" in block
     assert "'double'" in block
     assert "'float'" in block
-    assert "'mixed_io'" in block
+    assert "'original'" in block
     # _PROBE_SEEDS is (42, 43) — both must surface in the rendered matrix.
     assert "42" in block
     assert "43" in block
     # Specific cell pairs must appear so the LLM has unambiguous targets.
     assert "('quad', 42)" in block
-    assert "('mixed_io', 43)" in block
+    assert "('original', 43)" in block
 
 
 def test_format_baseline_block_kokkos_with_run_probe_false_omits_matrix():

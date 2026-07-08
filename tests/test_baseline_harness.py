@@ -33,10 +33,9 @@ def test_run_agent_baseline_harness_returns_submit_result_input(fake_anthropic):
                 "#include <Kokkos_Core.hpp>\n"
                 "int main() { Kokkos::initialize(); Kokkos::finalize(); }\n"
             ),
-            "mixed_io": (
+            "original": (
                 "// cd baselines/vector_add/ before running\n"
                 "#include <Kokkos_Core.hpp>\n"
-                "#include <quadmath.h>\n"
                 "int main() { Kokkos::initialize(); Kokkos::finalize(); }\n"
             ),
         },
@@ -78,7 +77,7 @@ def test_run_agent_baseline_harness_returns_submit_result_input(fake_anthropic):
         "quad",
         "double",
         "float",
-        "mixed_io",
+        "original",
     }
     # The user message passed to the model is exactly the task string.
     user_messages = call["messages"]
