@@ -1053,7 +1053,7 @@ ORCHESTRATOR_TOOLS = [
             "source); it is NOT a finish-gate precondition. Available "
             "only on language profiles whose probe_precisions is "
             "non-empty (currently Kokkos: quad / double / float / "
-            "mixed_io). Call once per (precision, seed) cell after a "
+            "original). Call once per (precision, seed) cell after a "
             "successful run_baseline_driver and before "
             "spawn_candidate_finder; skip cleanly on profiles where "
             "the BASELINE STEP block does not mention probe_step."
@@ -1074,7 +1074,7 @@ ORCHESTRATOR_TOOLS = [
                     "description": (
                         "Which probe driver template to use. Must be a "
                         "key the harness emitted under drivers.* "
-                        "(Kokkos: 'quad', 'double', 'float', 'mixed_io')."
+                        "(Kokkos: 'quad', 'double', 'float', 'original')."
                     ),
                 },
                 "seed": {
@@ -1913,21 +1913,33 @@ def _execute_tool(
         # {<precision>: str}`) is used by Kokkos (the only profile
         # whose probe_precisions is populated). When `drivers` is
         # present, the canonical splice scaffold at
-        # `baselines/<stem>/driver.cpp` = `drivers["double"]`, NOT
-        # `drivers[profile.baseline_precision]`. The role split
-        # exists because Kokkos has no `__float128` math overloads
-        # (`Kokkos::sqrt(__float128)` does not exist), so the quad
-        # driver is plain C++ + quadmath (per the kokkos harness
-        # prompt's quad bullet) — uncompilable as a splice target
-        # for the rewriter's Kokkos kernels. The DOUBLE driver fills
-        # the splice-scaffold role; the QUAD driver fills the
-        # ground-truth-oracle role and its seed=42 reference.json is
-        # promoted to `baselines/<stem>/reference.json` later in the
-        # chain (see the probe_compare branch below) so the finish-
-        # gate comparator measures against true quad ground truth.
-        # The remaining drivers fan out into per-precision probe
-        # subdirectories so the probe_step tool can reuse the existing
-        # compile/run helpers per directory.
+        # `baselines/<stem>/driver.cpp` = `drivers["original"]`, NOT
+        # `drivers["double"]` and NOT `drivers[profile.baseline_precision]`
+        # (which is 'quad'). The three-way role split is:
+        #   - ORIGINAL: the user's kernel with parameter types
+        #     verbatim; serves BOTH as the splice scaffold (the
+        #     rewriter's kernel is pasted between its sentinels) AND
+        #     as the speedup-baseline (measure_speedup reads its
+        #     timing block from probe/original_seed42/reference.json
+        #     so the reported speedup reflects the user's real
+        #     kernel, not a promoted quad oracle running on host
+        #     sqrtq/sinq).
+        #   - QUAD: ground-truth oracle only. Its seed=42
+        #     reference.json is promoted to
+        #     `baselines/<stem>/reference.json` later in the chain
+        #     (see the probe_compare branch below) so the finish-
+        #     gate comparator measures against true quad ground
+        #     truth. Cannot be the splice scaffold because Kokkos
+        #     has no `__float128` math overloads
+        #     (`Kokkos::sqrt(__float128)` does not exist), so the
+        #     quad driver is plain C++ + quadmath (per the kokkos
+        #     harness prompt's quad bullet) — uncompilable as a
+        #     splice target for the rewriter's Kokkos kernels.
+        #   - DOUBLE / FLOAT: probe-only. Fan out into per-precision
+        #     probe subdirectories so the probe_step tool can reuse
+        #     the existing compile/run helpers per directory and
+        #     feed per-output stats into the analyst's evidence
+        #     block.
         probe_driver_paths: dict[str, str] = {}
         # TEMPORARY DIAGNOSTIC (remove after we identify why some
         # backends return a payload missing both `drivers` and
@@ -1946,11 +1958,15 @@ def _execute_tool(
         if "drivers" in result:
             drivers = result["drivers"]
             # SPLICE-SCAFFOLD CHOICE: the canonical baseline is the
-            # DOUBLE driver (a real Kokkos driver), not the
-            # baseline_precision driver. baseline_precision="quad" is
-            # the oracle role only — see the role-split comment above
-            # for why these can't be the same file.
-            canonical = drivers["double"]
+            # ORIGINAL driver (the user's kernel with parameter types
+            # verbatim), not the baseline_precision driver.
+            # baseline_precision="quad" is the oracle role only.
+            # The 'original' driver also serves as the source of the
+            # speedup baseline (measure_speedup reads its timing
+            # block from probe/original_seed42/reference.json). See
+            # the role-split comment above for why these three roles
+            # can't all be the same file.
+            canonical = drivers["original"]
             # SYNTAX-CHECK GATE. Validate every driver source in the
             # payload BEFORE we touch the filesystem. If any driver
             # fails to parse under g++ -fsyntax-only, return an

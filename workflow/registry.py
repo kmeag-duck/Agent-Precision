@@ -329,13 +329,13 @@ You do not rewrite code. Another agent will do that based on your verdict.
 PROBE EVIDENCE (when present in your task):
 - If your task includes a 'PROBE EVIDENCE (JSON)' block at the end,
   the orchestrator already ran the kernel at several precisions
-  (currently quad / double / float / mixed_io) and seeds (currently
+  (currently quad / double / float / original) and seeds (currently
   42 and 43) before invoking you, and is showing you per-output
   numerical stats from those runs against the quad/seed=42 ground
   truth. Use this evidence to corroborate or temper your verdict —
   do NOT let it override the source-level analysis you would
   otherwise do. Specifically:
-  - A 'float_seed42' or 'mixed_io_seed42' cell whose per-output
+  - A 'float_seed42' or 'original_seed42' cell whose per-output
     stats are well below the tolerance is evidence in favor of a
     'downcast' verdict for the kernel's float-storage variables;
     a cell whose stats are AT or ABOVE the tolerance is evidence
@@ -472,7 +472,7 @@ You will be given a kernel's source AND an output-precision tolerance
 the point). If the orchestrator ran a precision probe on this kernel,
 you will ALSO be given a PROBE EVIDENCE (JSON) block at the end of
 your task showing per-output numerical stats from the kernel run at
-several precisions (currently quad / double / float / mixed_io) and
+several precisions (currently quad / double / float / original) and
 seeds (currently 42 and 43).
 
 Your job is triage, not verdict. For every named floating-point

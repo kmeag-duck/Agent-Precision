@@ -1227,11 +1227,37 @@ def _extract_timing(ref: object, side: str) -> tuple[dict | None, str | None]:
 def measure_speedup(kernel_stem: str, language_id: str) -> dict:
     """Compute a mean/stddev speedup from baseline vs rewritten timing blocks.
 
-    Reads baselines/<kernel_stem>/reference.json and
-    baselines/<kernel_stem>/rewritten/reference.json, extracts the
-    top-level `timing` block from each (contract: item 11 of every
-    baseline_harness system prompt), and writes a summary document to
+    Reads two reference.json files, extracts the top-level `timing`
+    block from each (contract: item 11 of every baseline_harness
+    system prompt), and writes a summary document to
     baselines/<kernel_stem>/rewritten/timing.json.
+
+    Baseline-path selection is profile-gated so the reported speedup
+    always reflects the USER'S ORIGINAL kernel, not an oracle:
+
+      - Profiles with a probe pipeline (probe_precisions non-empty;
+        currently Kokkos): read
+        baselines/<kernel_stem>/probe/original_seed42/reference.json.
+        The 'original' probe driver is the user's kernel with
+        parameter types verbatim (dominant-precision JSON
+        formatting), compiled and run under the same Kokkos build
+        as the rewritten driver. This path exists because on
+        Kokkos, baselines/<kernel_stem>/reference.json is
+        OVERWRITTEN mid-pipeline by probe_compare's quad-oracle
+        promotion, so its `timing` block is software quad on host
+        (sqrtq/sinq, std::vector<__float128>, no Kokkos dispatch)
+        — a meaningless baseline for any rewrite comparison.
+      - Profiles without a probe pipeline (probe_precisions empty;
+        currently CUDA / HIP / SYCL / OMP-offload): read
+        baselines/<kernel_stem>/reference.json. Nothing ever
+        overwrites this file for these profiles — it is
+        run_baseline_driver's output for the user's original kernel
+        as written — so it IS the correct baseline. Behavior for
+        these profiles is unchanged.
+
+    The rewritten path is always baselines/<kernel_stem>/rewritten/
+    reference.json (written by run_rewritten_driver), regardless of
+    profile.
 
     The summary carries:
 
@@ -1254,12 +1280,6 @@ def measure_speedup(kernel_stem: str, language_id: str) -> dict:
         must match — the harness prompt hardcodes trials_timed=10
         across all profiles, so a mismatch here is a contract bug).
 
-    `language_id` is accepted for call-shape symmetry with the rest
-    of the dynamic-verification chain, matching compare_outputs;
-    speedup extraction is fully language-agnostic because it walks
-    two reference.json files whose top-level shape is fixed by the
-    harness contract regardless of profile.
-
     Non-gating: a failure here does NOT block finish (see the
     orchestrator's _FinishGateState — it tracks compare_status only).
     On any error path (missing reference.json, malformed timing
@@ -1268,15 +1288,35 @@ def measure_speedup(kernel_stem: str, language_id: str) -> dict:
     stderr message and writes NO timing.json artifact. Only the
     happy path writes to disk.
     """
-    _resolve_profile(language_id)
+    profile = _resolve_profile(language_id)
 
     baseline_dir = Path("baselines") / kernel_stem
-    baseline_path = baseline_dir / "reference.json"
+    # Baseline-path selection: see the docstring's "Baseline-path
+    # selection is profile-gated" paragraph. On Kokkos-like profiles
+    # (probe_precisions non-empty), the canonical reference.json has
+    # been clobbered by quad-oracle promotion, so we read the
+    # 'original' probe driver's reference.json instead — which
+    # preserves the user's original-kernel timing.
+    if profile.probe_precisions:
+        baseline_path = (
+            baseline_dir / "probe" / "original_seed42" / "reference.json"
+        )
+    else:
+        baseline_path = baseline_dir / "reference.json"
     rewritten_dir = baseline_dir / "rewritten"
     rewritten_path = rewritten_dir / "reference.json"
     timing_path = rewritten_dir / "timing.json"
 
     if not baseline_path.is_file():
+        if profile.probe_precisions:
+            return _error(
+                f"Baseline reference.json not found at {baseline_path}. "
+                f"On profiles with a probe pipeline "
+                f"(probe_precisions={list(profile.probe_precisions)!r}), "
+                f"measure_speedup reads the 'original' probe driver's "
+                f"reference.json as the baseline. Did probe_step run "
+                f"for (precision='original', seed=42) and succeed?"
+            )
         return _error(
             f"Baseline reference.json not found at {baseline_path}. "
             f"Did run_baseline_driver run and succeed for this "
@@ -1440,7 +1480,7 @@ def probe_step(
     seed=42 source.
 
     `precision` is one of the keys the harness emitted (currently
-    quad / double / float / mixed_io for the Kokkos profile). `seed`
+    quad / double / float / original for the Kokkos profile). `seed`
     is an int; the v1 orchestrator drives {42, 43}. The result has
     the uniform {status, stdout, stderr, artifacts} shape; on
     success, `artifacts` is the single-element list
@@ -1677,7 +1717,7 @@ def probe_compare(kernel_stem: str, language_id: str) -> dict:
     the harness's quadmath_snprintf call but parsed back through
     Python's `json.load`, which truncates them to IEEE 754 double
     (~15-17 decimal digits). For the purpose of comparing a
-    float-precision or mixed_io driver against the quad ground
+    float-precision or original-precision driver against the quad ground
     truth, that double truncation is harmless -- the float driver's
     error floor (~2^-23 ~= 1e-7) is many orders of magnitude above
     the double round-off (~2^-52 ~= 2e-16) introduced by the parse.
@@ -1951,7 +1991,7 @@ def check_analyst_verdict_against_probe(
         if cell is None or cell.get("status") != "ok":
             # No usable probe evidence for this precision at the
             # canonical seed. Silent skip -- e.g. downcast to 'half'
-            # when the probe matrix only covered float / mixed_io.
+            # when the probe matrix only covered float / original.
             continue
         stats = cell.get("stats") or {}
         # Find the worst-offending output for this cell. If nothing
@@ -2035,7 +2075,7 @@ _ALIAS_LINE_RE_TEMPLATE = r"^using {var}Type = ([^;\n]+);$"
 # Set of target_precision tokens this tool knows how to splice for.
 # Deliberately narrow in v0: 'float' is the only precision the probe
 # pipeline empirically validates (probe_precisions = quad/double/float/
-# mixed_io on Kokkos), so it's the only precision we've smoke-tested
+# original on Kokkos), so it's the only precision we've smoke-tested
 # end to end. 'half' is advertised in ANALYST_OUTPUT_SCHEMA but has
 # never been compiled in this repo; adding it here without a smoke
 # test on real hardware would be a silent contract expansion. The

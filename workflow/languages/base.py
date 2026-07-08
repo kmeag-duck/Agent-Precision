@@ -156,12 +156,20 @@ class LanguageProfile:
                           analyst. Each token names a storage precision
                           for the kernel's parameters / intermediates
                           (`"quad"`, `"double"`, `"float"`, and the
-                          special `"mixed_io"` which keeps outputs at
-                          `baseline_precision` and downcasts
-                          intermediates to float). An empty tuple (the
-                          default for v1) means "no probe for this
-                          profile" — the orchestrator skips the probe
-                          step entirely. Only Kokkos populates this in
+                          special `"original"` which preserves the
+                          user's kernel-parameter types VERBATIM and
+                          serves a dual role: (a) as the splice
+                          scaffold at `baselines/<stem>/driver.cpp`
+                          into which the rewriter's kernel gets
+                          pasted, and (b) as the speedup-baseline
+                          source that `measure_speedup` reads its
+                          baseline `timing` block from — so the
+                          reported speedup reflects the user's real
+                          kernel rather than the promoted quad
+                          oracle). An empty tuple (the default for
+                          v1) means "no probe for this profile" —
+                          the orchestrator skips the probe step
+                          entirely. Only Kokkos populates this in
                           v1; CUDA/HIP/SYCL/OMP-offload remain
                           probe-less until the deferred Commit 6 lands.
 
