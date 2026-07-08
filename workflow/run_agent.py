@@ -17,8 +17,12 @@ type-specific aggregator) to fold ensemble noise into a stable decision.
 """
 
 import json
+import os
 import sys
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import anthropic
 
@@ -31,6 +35,101 @@ from .registry import AGENTS
 # wire (it'd HTTP-400 otherwise), but the operator deserves to know
 # their ensemble's diversity knob isn't actually doing anything.
 _TEMPERATURE_DROP_WARNED: set[str] = set()
+
+
+# ------------------------------------------------------------------ #
+# LLM-call logging
+# ------------------------------------------------------------------ #
+# One JSONL record per client.messages.create() call, capturing enough
+# to fully reproduce the call (model, temperature actually sent, full
+# system prompt including any lens suffix, full task) plus the full
+# response envelope (id, stop_reason, usage, and the parsed
+# submit_result payload). Writes are guarded by a module-level lock so
+# ThreadPoolExecutor fan-outs from `run_agent_ensemble` and
+# `run_verifier_panel` do not interleave partial lines.
+#
+# The path is set once per orchestrator run via `set_llm_call_log_path`
+# (called from `run_orchestrator`). When unset, agent calls do not log
+# — that keeps unit tests that construct `run_agent` in isolation from
+# accidentally spraying artifact files into the repo. `run_orchestrator`
+# always sets it (interactive and --auto both), so real workflow runs
+# always produce the artifact.
+_LLM_CALL_LOG_PATH: Path | None = None
+_LLM_CALL_LOG_LOCK = threading.Lock()
+
+
+def set_llm_call_log_path(path: Path | None) -> None:
+    """Configure where run_agent + orchestrator router calls are logged.
+
+    Pass a Path to enable logging (subsequent calls append one JSONL
+    record per API call). Pass None to disable. Not thread-safe against
+    concurrent set/unset — call once at the top of an orchestrator run
+    before any agent dispatch.
+
+    Truncation is the caller's responsibility; `run_orchestrator`
+    truncates at the start of every run so records reflect the current
+    run only. Kept off by default so `tests/` that call `run_agent`
+    directly don't need to mock out file I/O.
+    """
+    global _LLM_CALL_LOG_PATH
+    _LLM_CALL_LOG_PATH = path
+
+
+def get_llm_call_log_path() -> Path | None:
+    """Return the current log path (for tests / router hook)."""
+    return _LLM_CALL_LOG_PATH
+
+
+def _write_llm_call_record(record: dict) -> None:
+    """Append one JSONL record to the configured log path.
+
+    Silently no-ops when no path is configured. Errors during write
+    (disk full, permission denied) are swallowed with a stderr warning
+    rather than raised — the log is diagnostic-only and must never
+    take down a real workflow run. Thread-safe.
+    """
+    path = _LLM_CALL_LOG_PATH
+    if path is None:
+        return
+    try:
+        line = json.dumps(record, default=str)
+    except (TypeError, ValueError) as exc:
+        print(
+            f"[run_agent] warning: could not serialize llm-call record: "
+            f"{exc}. Skipping this record.",
+            file=sys.stderr,
+        )
+        return
+    with _LLM_CALL_LOG_LOCK:
+        try:
+            with path.open("a") as fh:
+                fh.write(line + "\n")
+        except OSError as exc:
+            print(
+                f"[run_agent] warning: could not write llm-call log to "
+                f"{path}: {exc}. Continuing without logging this call.",
+                file=sys.stderr,
+            )
+
+
+def _summarize_usage(usage: object) -> dict | None:
+    """Extract input/output token counts from the SDK's Usage object.
+
+    Returns None when usage is absent (some proxies drop it). The SDK
+    exposes `input_tokens` / `output_tokens` as attributes; we do a
+    getattr dance so a shim returning a plain dict still works.
+    """
+    if usage is None:
+        return None
+    if isinstance(usage, dict):
+        return {
+            "input_tokens": usage.get("input_tokens"),
+            "output_tokens": usage.get("output_tokens"),
+        }
+    return {
+        "input_tokens": getattr(usage, "input_tokens", None),
+        "output_tokens": getattr(usage, "output_tokens", None),
+    }
 
 
 DEFAULT_SINGLE_SHOT_TEMPERATURE = 0.0
@@ -172,7 +271,76 @@ def run_agent(
         _TEMPERATURE_DROP_WARNED.add(type)
 
     client = anthropic.Anthropic()
-    response = client.messages.create(**create_kwargs)
+    call_started_at = time.time()
+    call_error: str | None = None
+    response = None
+    try:
+        response = client.messages.create(**create_kwargs)
+    except Exception as exc:
+        # Record the failure before re-raising so the log captures
+        # the request that blew up (usually a proxy 400 or a timeout).
+        # NB: this function's parameter `type` shadows the builtin, so
+        # use exc.__class__.__name__ rather than type(exc).__name__.
+        call_error = f"{exc.__class__.__name__}: {exc}"
+        _write_llm_call_record({
+            "timestamp": call_started_at,
+            "duration_sec": time.time() - call_started_at,
+            "caller": "agent",
+            "agent_type": type,
+            "model": spec["model"],
+            "supports_temperature": supports_temperature,
+            "temperature_requested": temperature,
+            "temperature_sent": create_kwargs.get("temperature"),
+            "system_prompt": system_prompt,
+            "system_prompt_suffix": system_prompt_suffix,
+            "task": task,
+            "max_tokens": create_kwargs["max_tokens"],
+            "error": call_error,
+        })
+        raise
+    # Extract response fields once so both the log record and the
+    # existing defensive guards below see the same values.
+    response_id = getattr(response, "id", "<unknown>")
+    stop_reason = getattr(response, "stop_reason", None)
+    usage = getattr(response, "usage", None)
+    # The parsed submit_result payload — pulled here (rather than
+    # after the guards below) so the log record reflects what the
+    # model actually emitted even when a downstream guard raises.
+    submit_result_payload: dict | None = None
+    if response.content is not None:
+        for block in response.content:
+            if block.type == "tool_use" and block.name == "submit_result":
+                try:
+                    submit_result_payload = _coerce_tool_input_to_dict(
+                        block.input, type, response_id
+                    )
+                except RuntimeError:
+                    # Log with raw input so the operator can see the
+                    # malformed payload; the guard below will raise
+                    # the real error in a moment.
+                    submit_result_payload = {
+                        "__coerce_error__": True,
+                        "raw_input": block.input,
+                    }
+                break
+    _write_llm_call_record({
+        "timestamp": call_started_at,
+        "duration_sec": time.time() - call_started_at,
+        "caller": "agent",
+        "agent_type": type,
+        "model": spec["model"],
+        "supports_temperature": supports_temperature,
+        "temperature_requested": temperature,
+        "temperature_sent": create_kwargs.get("temperature"),
+        "system_prompt": system_prompt,
+        "system_prompt_suffix": system_prompt_suffix,
+        "task": task,
+        "max_tokens": create_kwargs["max_tokens"],
+        "response_id": response_id,
+        "stop_reason": stop_reason,
+        "usage": _summarize_usage(usage),
+        "submit_result_payload": submit_result_payload,
+    })
 
     # Defensive guard against backends (notably some Argo proxy
     # configurations) that return HTTP 200 with a body the SDK

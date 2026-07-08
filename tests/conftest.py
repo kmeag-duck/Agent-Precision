@@ -124,6 +124,54 @@ def pytest_runtest_logstart(nodeid, location):
     reporter.write_line("-" * len(filepath))
 
 
+@pytest.fixture(autouse=True)
+def _isolate_llm_call_log(monkeypatch):
+    """Prevent `run_orchestrator` from writing an llm_calls.jsonl to the repo's baselines/ tree during tests.
+
+    `run_orchestrator` unconditionally opens
+    `baselines/<stem>/llm_calls.jsonl` relative to CWD. Most orchestrator
+    tests already `monkeypatch.chdir(tmp_path)`, but a handful of
+    error-path tests do not — those would otherwise pollute the real
+    `baselines/` on every `python -m pytest` run. The production code
+    catches `OSError` from `mkdir` / `write_text` and disables logging
+    for that run; here we make the write fail loudly-but-caught by
+    monkeypatching `Path.mkdir` on the `baselines/` prefix so no test
+    can accidentally touch it. We also clear any stale module-level
+    log path from a previous test.
+    """
+    from pathlib import Path as _P
+
+    from workflow.run_agent import set_llm_call_log_path
+
+    set_llm_call_log_path(None)
+
+    # Snapshot the repo's real baselines/ path at fixture-entry time
+    # (BEFORE the test does its own monkeypatch.chdir(tmp_path)). Any
+    # write with an absolute path underneath that snapshot is a test
+    # accidentally touching the repo tree.
+    repo_baselines_root = (_P(__file__).resolve().parent.parent / "baselines")
+
+    real_mkdir = _P.mkdir
+
+    def guarded_mkdir(self, *args, **kwargs):
+        try:
+            resolved = self.resolve()
+        except (OSError, RuntimeError):
+            return real_mkdir(self, *args, **kwargs)
+        try:
+            resolved.relative_to(repo_baselines_root)
+        except ValueError:
+            return real_mkdir(self, *args, **kwargs)
+        raise OSError(
+            f"tests refuse to create {resolved} under the repo's "
+            f"baselines/ tree; use monkeypatch.chdir(tmp_path)."
+        )
+
+    monkeypatch.setattr(_P, "mkdir", guarded_mkdir)
+    yield
+    set_llm_call_log_path(None)
+
+
 @pytest.fixture
 def fake_anthropic(monkeypatch):
     """Returns a function: install_fake(responses) -> FakeAnthropic.

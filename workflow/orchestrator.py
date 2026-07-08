@@ -22,13 +22,20 @@ job (triage) and the variable_analyst's job (per-variable verdict).
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 import anthropic
 
 from .aggregator import aggregate_analyst_verdicts
 from .languages import LanguageProfile, detect_language
-from .run_agent import run_agent, run_agent_ensemble
+from .run_agent import (
+    _summarize_usage,
+    _write_llm_call_record,
+    run_agent,
+    run_agent_ensemble,
+    set_llm_call_log_path,
+)
 from .tools import (
     bisect_variable_downcast,
     compare_outputs,
@@ -51,6 +58,70 @@ from .verifier_panel import (
 )
 
 ORCHESTRATOR_MODEL = "claude-sonnet-4-6"
+
+
+def _serialize_response_content_for_log(content: object) -> list[dict] | None:
+    """Convert the SDK's `Message.content` list into JSON-friendly dicts.
+
+    Assistant responses come back as SDK content-block objects
+    (`TextBlock`, `ToolUseBlock`, …) which are not JSON-serializable.
+    For the llm_calls log we want the same fields the orchestrator
+    itself acts on: text bodies, and the tool_use `id`/`name`/`input`
+    triples that drive the next turn. Unknown block types are passed
+    through as `{"type": <t>, "repr": <repr>}` so the log is never
+    lossy on a schema change.
+    """
+    if content is None:
+        return None
+    out: list[dict] = []
+    for block in content:
+        btype = getattr(block, "type", None)
+        if btype == "text":
+            out.append({"type": "text", "text": getattr(block, "text", "")})
+        elif btype == "tool_use":
+            out.append({
+                "type": "tool_use",
+                "id": getattr(block, "id", None),
+                "name": getattr(block, "name", None),
+                "input": dict(getattr(block, "input", {}) or {}),
+            })
+        else:
+            out.append({"type": btype, "repr": repr(block)})
+    return out
+
+
+def _serialize_messages_for_log(messages: list[dict]) -> list[dict]:
+    """Convert the running `messages` list into JSON-friendly dicts.
+
+    User messages are already plain dicts (their `content` is either a
+    string or a list of tool_result dicts). Assistant messages have
+    `content` as SDK content-block objects — reuse
+    `_serialize_response_content_for_log` for those. This is the
+    inverse of the transformation the router loop performs when it
+    appends to `messages`.
+    """
+    out: list[dict] = []
+    for msg in messages:
+        role = msg.get("role")
+        content = msg.get("content")
+        if role == "assistant" and not isinstance(content, (str, list)):
+            # Defensive: shouldn't happen, but keep the log lossless.
+            out.append({"role": role, "content": repr(content)})
+            continue
+        if role == "assistant" and isinstance(content, list) and content:
+            # Assistant content is a list of SDK block objects (as
+            # appended in the router loop). Serialize each one.
+            # A user message with a list content (tool_results) is
+            # already dict-shaped, so type-check the first element.
+            first = content[0]
+            if hasattr(first, "type") and not isinstance(first, dict):
+                out.append({
+                    "role": role,
+                    "content": _serialize_response_content_for_log(content),
+                })
+                continue
+        out.append({"role": role, "content": content})
+    return out
 
 # Hard upper bound on orchestrator API turns per run. The HITL pause is the
 # primary safety net (the user can press 'q' at any time); this constant is a
@@ -2670,6 +2741,31 @@ def run_orchestrator(
     client = anthropic.Anthropic()
     gate = _FinishGateState(kernel_path, profile)
 
+    # LLM-call log is always on (both interactive and --auto). Separate
+    # artifact from the --auto-only orchestrator_trace.jsonl: the trace
+    # records executed tools (post-HITL), the llm_calls log records raw
+    # API I/O for every messages.create() call (router + spawned agents)
+    # so a run is fully reproducible from the log alone. Truncate at
+    # the start of every run so the file always reflects the current
+    # run. Wrapped in try/except so that a read-only CWD (tests, sandbox)
+    # disables logging cleanly instead of blowing up the run — the
+    # log is diagnostic-only.
+    kernel_stem_for_log = Path(kernel_path).stem
+    llm_log_dir = Path("baselines") / kernel_stem_for_log
+    try:
+        llm_log_dir.mkdir(parents=True, exist_ok=True)
+        llm_call_log_path = llm_log_dir / "llm_calls.jsonl"
+        llm_call_log_path.write_text("")
+        set_llm_call_log_path(llm_call_log_path)
+    except OSError as exc:
+        print(
+            f"[run_orchestrator] warning: could not open llm-call log "
+            f"at {llm_log_dir}/llm_calls.jsonl: {exc}. Continuing "
+            f"without LLM-call logging for this run.",
+            file=sys.stderr,
+        )
+        set_llm_call_log_path(None)
+
     trace_path: Path | None = None
     if auto:
         stem = Path(kernel_path).stem
@@ -2686,6 +2782,7 @@ def run_orchestrator(
             )
             return None
         turns += 1
+        router_call_started_at = time.time()
         response = client.messages.create(
             model=ORCHESTRATOR_MODEL,
             max_tokens=8192,
@@ -2693,6 +2790,27 @@ def run_orchestrator(
             tools=ORCHESTRATOR_TOOLS,
             messages=messages,
         )
+        _write_llm_call_record({
+            "timestamp": router_call_started_at,
+            "duration_sec": time.time() - router_call_started_at,
+            "caller": "orchestrator_router",
+            "turn": turns,
+            "model": ORCHESTRATOR_MODEL,
+            "max_tokens": 8192,
+            "system": ORCHESTRATOR_SYSTEM_PROMPT,
+            # Tool schemas are huge and static; log only names so the
+            # record stays diagnostically useful without bloating the
+            # log. To reconstruct the exact tool payload, read
+            # ORCHESTRATOR_TOOLS in this module at the pinned commit.
+            "tool_names": [t["name"] for t in ORCHESTRATOR_TOOLS],
+            "messages": _serialize_messages_for_log(messages),
+            "response_id": getattr(response, "id", "<unknown>"),
+            "stop_reason": getattr(response, "stop_reason", None),
+            "usage": _summarize_usage(getattr(response, "usage", None)),
+            "response_content": _serialize_response_content_for_log(
+                response.content
+            ),
+        })
 
         # Defensive guard: some backends (notably some Argo proxy
         # configurations) return HTTP 200 with a body the SDK accepts

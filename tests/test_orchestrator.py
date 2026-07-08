@@ -694,6 +694,128 @@ def test_run_orchestrator_happy_path(monkeypatch, fake_anthropic, tmp_path):
     assert payload["result"]["overall_notes"] == "ok"
 
 
+# ---------- run_orchestrator: llm-call log ----------
+
+
+def test_run_orchestrator_writes_router_record_to_llm_call_log(
+    monkeypatch, fake_anthropic, tmp_path
+):
+    """run_orchestrator opens baselines/<stem>/llm_calls.jsonl and writes a caller='orchestrator_router' record for each messages.create() call. Uses a HITL 'q' quit after the first turn so the run terminates without invoking any spawned agent, isolating the router-side logging behavior."""
+    monkeypatch.chdir(tmp_path)
+    fake_anthropic([
+        FakeResponse(
+            content=[ToolUseBlock(
+                id="tu_1",
+                name="spawn_analyst",
+                input={"kernel_source": "KSRC"},
+            )],
+        ),
+    ])
+    monkeypatch.setattr(
+        orchestrator,
+        "run_agent",
+        lambda *a, **kw: pytest.fail(
+            "run_agent must not be called after quit"
+        ),
+    )
+    _scripted_input(monkeypatch, ["q"])
+
+    assert (
+        run_orchestrator("k.cpp", "src", tolerance=_DEFAULT_TEST_TOLERANCE)
+        is None
+    )
+
+    log_path = tmp_path / "baselines" / "k" / "llm_calls.jsonl"
+    assert log_path.exists(), (
+        "run_orchestrator must create baselines/<stem>/llm_calls.jsonl"
+    )
+    records = [
+        json.loads(line)
+        for line in log_path.read_text().splitlines()
+        if line.strip()
+    ]
+    # Exactly one router turn happened before the 'q' broke the loop.
+    router_records = [
+        r for r in records if r.get("caller") == "orchestrator_router"
+    ]
+    assert len(router_records) == 1, (
+        f"expected 1 router record, got {len(router_records)}: {records}"
+    )
+    rec = router_records[0]
+    # Contract: router record carries turn index, model, the full system
+    # prompt, the list of tool names offered on that turn, the
+    # serialized outbound messages, and a flattened response envelope
+    # (response_id / stop_reason / usage / response_content). Flat
+    # matches the agent-record convention in run_agent.py so both
+    # kinds of records grep cleanly with `jq '.stop_reason'` etc.
+    for key in (
+        "turn", "model", "system", "tool_names", "messages",
+        "response_id", "stop_reason", "response_content",
+    ):
+        assert key in rec, f"router record missing {key!r}: {rec}"
+    assert rec["turn"] == 1
+    assert isinstance(rec["tool_names"], list) and rec["tool_names"]
+    # The production tool set exposes the per-variable pipeline, not
+    # the legacy monolithic spawn_analyst (that entry is a tests-only
+    # backdoor kept out of ORCHESTRATOR_TOOLS — see AGENTS.md).
+    assert "spawn_candidate_finder" in rec["tool_names"]
+    assert "finish" in rec["tool_names"]
+    assert rec["stop_reason"] == "tool_use"
+    # Serialized content should contain the tool_use block the fake
+    # returned, so a reader can see what the router was asked to
+    # dispatch.
+    assert any(
+        b.get("type") == "tool_use" and b.get("name") == "spawn_analyst"
+        for b in rec["response_content"]
+    )
+
+
+def test_run_orchestrator_truncates_llm_call_log_at_start_of_run(
+    monkeypatch, fake_anthropic, tmp_path
+):
+    """A stale llm_calls.jsonl left over from a previous run is truncated at the start of the next run, so the file always reflects the current run's calls only."""
+    monkeypatch.chdir(tmp_path)
+    stale_dir = tmp_path / "baselines" / "k"
+    stale_dir.mkdir(parents=True)
+    stale_log = stale_dir / "llm_calls.jsonl"
+    stale_log.write_text(
+        '{"caller":"orchestrator_router","turn":999,"stale":true}\n'
+    )
+
+    fake_anthropic([
+        FakeResponse(
+            content=[ToolUseBlock(
+                id="tu_1",
+                name="spawn_analyst",
+                input={"kernel_source": "KSRC"},
+            )],
+        ),
+    ])
+    monkeypatch.setattr(
+        orchestrator,
+        "run_agent",
+        lambda *a, **kw: pytest.fail("unreachable"),
+    )
+    _scripted_input(monkeypatch, ["q"])
+
+    run_orchestrator("k.cpp", "src", tolerance=_DEFAULT_TEST_TOLERANCE)
+
+    records = [
+        json.loads(line)
+        for line in stale_log.read_text().splitlines()
+        if line.strip()
+    ]
+    # Stale record must be gone; new run's single router record present.
+    assert not any(r.get("stale") for r in records), (
+        "stale record survived truncation: "
+        f"{records}"
+    )
+    assert any(
+        r.get("caller") == "orchestrator_router" and r.get("turn") == 1
+        for r in records
+    ), records
+
+
 # ---------- run_orchestrator: rejection feeds back sentinel ----------
 
 

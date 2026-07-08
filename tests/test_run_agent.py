@@ -442,3 +442,114 @@ def test_ensemble_k_three_drops_temperature_when_unsupported(
     err = capsys.readouterr().err
     # Exactly one warning was emitted (one-shot per agent type).
     assert err.count("supports_temperature=False") == 1
+
+
+# ---------- llm_calls.jsonl logger ----------
+
+
+import json as _json
+from pathlib import Path as _Path
+
+from workflow.run_agent import (
+    get_llm_call_log_path,
+    set_llm_call_log_path,
+)
+
+
+@pytest.fixture
+def llm_call_log(tmp_path):
+    """Wire set_llm_call_log_path to a tmp file and tear it down after the test."""
+    path = tmp_path / "llm_calls.jsonl"
+    path.write_text("")
+    set_llm_call_log_path(path)
+    yield path
+    set_llm_call_log_path(None)
+
+
+def _read_jsonl(path: _Path) -> list[dict]:
+    """Return one dict per non-empty line in the JSONL file."""
+    return [
+        _json.loads(line)
+        for line in path.read_text().splitlines()
+        if line.strip()
+    ]
+
+
+def test_run_agent_writes_one_llm_call_record_per_call(
+    fake_anthropic, llm_call_log
+):
+    """run_agent appends one JSONL record per messages.create call with agent_type, model, temperature actually sent, full system prompt, task, response_id, stop_reason, usage, and the parsed submit_result payload — enough to fully reproduce the call."""
+    payload = {"rewritten_code": "out", "summary_of_changes": "s"}
+
+    class FakeUsage:
+        input_tokens = 42
+        output_tokens = 7
+
+    resp = FakeResponse(
+        content=[ToolUseBlock(name="submit_result", input=payload)],
+        stop_reason="tool_use",
+    )
+    resp.usage = FakeUsage()
+    resp.id = "msg_test_1"
+    fake_anthropic([resp])
+
+    result = run_agent("rewriter", "task text", temperature=0.5)
+    assert result == payload
+
+    records = _read_jsonl(llm_call_log)
+    assert len(records) == 1
+    rec = records[0]
+    assert rec["caller"] == "agent"
+    assert rec["agent_type"] == "rewriter"
+    assert rec["task"] == "task text"
+    assert rec["temperature_requested"] == 0.5
+    assert rec["temperature_sent"] == 0.5
+    assert rec["response_id"] == "msg_test_1"
+    assert rec["stop_reason"] == "tool_use"
+    assert rec["usage"] == {"input_tokens": 42, "output_tokens": 7}
+    assert rec["submit_result_payload"] == payload
+    # Full system prompt is captured verbatim so a run is reproducible
+    # against a moving registry.
+    assert rec["system_prompt"]  # non-empty
+    assert "model" in rec and rec["model"]
+
+
+def test_run_agent_logs_on_api_error(fake_anthropic, llm_call_log):
+    """When the SDK raises inside messages.create, run_agent records the request + error string before re-raising, so a failed call still lands in the log."""
+
+    class BoomFake:
+        class messages:
+            @staticmethod
+            def create(**kwargs):
+                raise RuntimeError("proxy 400: bad request")
+
+    import anthropic as _a
+    _a.Anthropic = lambda: BoomFake()
+
+    with pytest.raises(RuntimeError, match="proxy 400"):
+        run_agent("rewriter", "task text")
+
+    records = _read_jsonl(llm_call_log)
+    assert len(records) == 1
+    rec = records[0]
+    assert rec["caller"] == "agent"
+    assert rec["agent_type"] == "rewriter"
+    assert "error" in rec and "proxy 400" in rec["error"]
+    assert "response_id" not in rec  # never got a response
+
+
+def test_logging_no_op_when_path_unset(fake_anthropic, tmp_path):
+    """When set_llm_call_log_path is None, run_agent must not write any file — this is the default so tests that instantiate run_agent directly don't spam the repo."""
+    # Explicitly clear (fixture from other tests might have set it).
+    set_llm_call_log_path(None)
+    assert get_llm_call_log_path() is None
+    payload = {"rewritten_code": "x", "summary_of_changes": ""}
+    fake_anthropic([
+        FakeResponse(
+            content=[ToolUseBlock(name="submit_result", input=payload)],
+            stop_reason="tool_use",
+        ),
+    ])
+    run_agent("rewriter", "task")
+    # No file should have been created anywhere under tmp_path.
+    assert list(tmp_path.iterdir()) == []
