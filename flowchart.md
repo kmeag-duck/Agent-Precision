@@ -38,7 +38,7 @@ flowchart TD
   subgraph Orch ["Orchestrator (Claude conversation loop)<br/>routes every step · gates finish · MAX_TURNS=150"]
     direction TB
 
-    S1["<b>1. spawn_baseline_harness_&lt;id&gt;</b><br/><i>id ∈ {kokkos, cuda, hip, sycl, omp_offload};<br/>Kokkos emits 4 drivers, others emit 1</i><br/>→ baselines/&lt;stem&gt;/driver.&lt;ext&gt;<br/>(+ probe/&lt;precision&gt;/driver.cpp ×4 on Kokkos)"]:::agent
+    S1["<b>1. spawn_baseline_harness_&lt;id&gt;</b><br/><i>id ∈ {kokkos, cuda, hip, sycl, omp_offload};<br/>Kokkos emits 4 drivers (quad, double, float, original),<br/>others emit 1</i><br/>→ baselines/&lt;stem&gt;/driver.&lt;ext&gt;<br/>(on Kokkos: copy of drivers.original —<br/>preserves user's kernel parameter types verbatim,<br/>so downcast-alias splices compile at step 10)<br/>(+ probe/&lt;precision&gt;/driver.cpp ×4 on Kokkos)"]:::agent
     S2["<b>2. compile_baseline_driver</b><br/>per-profile compiler + env vars<br/>(KOKKOS_ROOT / CUDA_ARCH / HIP_ARCH /<br/>SYCL_CXX / OMP_CXX / OMP_TARGET)<br/>→ baselines/&lt;stem&gt;/driver"]:::det
     S3["<b>3. run_baseline_driver</b><br/>RUN_TIMEOUT_SEC (default 60)<br/>→ baselines/&lt;stem&gt;/reference.json"]:::det
     S4["<b>4. probe_step ×8</b><br/><i>Kokkos only; 4 precisions × seeds {42, 43};<br/>fused compile+run per cell</i><br/>→ probe/&lt;precision&gt;_seed&lt;N&gt;/reference.json"]:::det
@@ -50,7 +50,7 @@ flowchart TD
     S10["<b>10. compile_rewritten_driver</b><br/>same per-profile compiler as step 2<br/>→ baselines/&lt;stem&gt;/rewritten/driver"]:::det
     S11["<b>11. run_rewritten_driver</b><br/>→ baselines/&lt;stem&gt;/rewritten/reference.json"]:::det
     S12["<b>12. compare_outputs</b><br/><i>baseline vs rewritten under tolerance_json;<br/>writes comparison.json on pass AND fail</i>"]:::det
-    S12b["<b>12b. measure_speedup</b><br/><i>reads `timing` block from baseline +<br/>rewritten reference.json; ratio error prop.;<br/>writes timing.json on ok path only.<br/>NON-GATING: errors / slowdowns do not<br/>block finish</i>"]:::det
+    S12b["<b>12b. measure_speedup</b><br/><i>reads `timing` block from baseline +<br/>rewritten reference.json; ratio error prop.;<br/>writes timing.json on ok path only.<br/>On Kokkos, baseline timing comes from<br/>probe/original_seed42/reference.json<br/>(not baselines/&lt;stem&gt;/reference.json,<br/>which oracle promotion clobbered with quad).<br/>NON-GATING: errors / slowdowns do not<br/>block finish</i>"]:::det
     S13["<b>13. finish</b><br/><i>code-side finish-gate</i>"]:::gate
 
     S1 ==> S2;
@@ -125,7 +125,18 @@ class, not every possible retry path. The full rules:
   blocking the run. The numerical-correctness gate at step 12 is
   the only wall-clock signal that can block termination; step 12b
   exists purely to attach a performance number to an accepted
-  rewrite.
+  rewrite. On profiles with a non-empty `probe_precisions`
+  (currently Kokkos only), the baseline `timing` block is read
+  from `baselines/<stem>/probe/original_seed42/reference.json`,
+  NOT from `baselines/<stem>/reference.json` — oracle promotion
+  at step 5 clobbered the latter with the quad probe reference
+  whose `timing` reflects software quad on the host, not the
+  Kokkos-dispatched user kernel. Profiles without a probe pipeline
+  (CUDA / HIP / SYCL / OMP-offload in v1) fall back to
+  `baselines/<stem>/reference.json` unchanged. A missing
+  `probe/original_seed42/reference.json` on Kokkos surfaces as
+  `status='error'` naming `probe_step` and the
+  `(precision='original', seed=42)` cell explicitly.
 - **Step 1 error**. If the baseline-harness payload is malformed
   (missing both `drivers` and `driver_source`) the orchestrator
   raises a `RuntimeError` and the run ends.
