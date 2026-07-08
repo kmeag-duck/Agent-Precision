@@ -580,7 +580,14 @@ Hard requirements on the driver:
          "kernel": "<kernel_function_name>",
          "seed": <integer seed, value of RNG_SEED>,
          "inputs": { "N": <int>, ... },
-         "outputs": { "<name>": [ <floating-point>, ... ], ... }
+         "outputs": { "<name>": [ <floating-point>, ... ], ... },
+         "timing": {
+           "trials_timed": 10,
+           "mean_sec": <float>,
+           "stddev_sec": <float>,
+           "min_sec": <float>,
+           "max_sec": <float>
+         }
        }
 
    "inputs" carries enough metadata for a human reader to understand
@@ -588,6 +595,36 @@ Hard requirements on the driver:
    strings). "outputs" carries one named flat array per output the
    comparator will check. The names under "outputs" must match
    output_arrays in your submit_result payload.
+
+   "timing" carries wall-clock statistics for the kernel invocation
+   (see item 11 below). It is required in every driver's
+   reference.json so that the downstream `measure_speedup` tool can
+   compute a mean/stddev speedup from the baseline vs rewritten
+   references. The comparator ignores timing values numerically —
+   only `outputs` is checked against the tolerance — but it does
+   require both files to have identically-shaped top-level keys, so
+   the `timing` block must be present in every driver variant.
+
+11. Kernel timing. Repeat the kernel invocation N=11 times: 1
+    untimed warmup call followed by 10 timed trials. Time only the
+    kernel call itself — NOT input allocation, RNG fill, or JSON
+    emission. For the three Kokkos-based drivers (double, float,
+    mixed_io), wrap each timed call in `Kokkos::Timer` (call
+    `.reset()` immediately before the parallel_for and
+    `.seconds()` immediately after; add a `Kokkos::fence()` after
+    the parallel_for and before `.seconds()` so device work
+    completes before the timer stops). For the plain-C++ quad
+    driver, use `std::chrono::steady_clock` around the serial host
+    `for` loop; no fence is needed. Store the 10 per-trial elapsed
+    seconds in a `std::vector<double>` (yes, `double` even in the
+    quad driver — the timing measurement precision is not the
+    numerical measurement precision), then compute the mean,
+    population stddev (dividing by N=10, not N-1), min, and max, and
+    emit them under the top-level `timing` key of reference.json.
+    Use `%.9g` formatting for the four float fields regardless of
+    driver precision (`quadmath_snprintf` is not needed here — these
+    are host wall-clock values). The `trials_timed` field is the
+    literal integer 10.
 
 10. Begin the driver with a top-of-file comment that tells the operator
     to `cd` into the baseline directory (baselines/<file_stem>/) before

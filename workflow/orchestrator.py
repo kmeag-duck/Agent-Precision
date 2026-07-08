@@ -34,6 +34,7 @@ from .tools import (
     compare_outputs,
     compile_baseline_driver,
     compile_rewritten_driver,
+    measure_speedup,
     probe_compare,
     probe_step,
     run_baseline_driver,
@@ -413,6 +414,27 @@ You also have two deterministic (non-LLM) tools:
     languages registered before a baseline harness exists) skip this
     whole chain and finish remains gated only on the verifier verdict.
 
+  - measure_speedup: takes a kernel_stem and reads the top-level
+    `timing` block from baselines/<kernel_stem>/reference.json and
+    baselines/<kernel_stem>/rewritten/reference.json (populated by
+    every driver per the harness contract: 1 warmup + 10 timed
+    trials, mean/stddev/min/max seconds). Computes a wall-clock
+    speedup ratio (baseline mean / rewritten mean) with propagated
+    stddev, writes a summary to
+    baselines/<kernel_stem>/rewritten/timing.json on success, and
+    returns {status, stdout, stderr, artifacts}. Speedup > 1.0 means
+    the rewrite is faster; slowdowns are reported as-is with no
+    policy decision. Call exactly once per accepted verifier verdict,
+    after a successful compare_outputs, and BEFORE calling finish.
+    Non-gating: unlike compare_outputs, this call is NOT a
+    precondition for finish — the finish-gate tracks compare_status
+    only, so a missing timing block, a slowdown, or any error here
+    does not block termination. On error (missing reference.json,
+    missing/malformed timing block, non-positive baseline mean,
+    mismatched trials_timed across sides, OSError on write), returns
+    status='error' with no timing.json artifact; surface the error
+    in your final notes and proceed to finish anyway.
+
 You also have a finish tool to emit the final answer.
 
 Tolerance handling:
@@ -552,15 +574,24 @@ Your job after the tolerance is fixed:
    restructuring, no field substitutions. The tolerance_json
    argument must be the agreed tolerance serialized as a JSON
    string.
-5. If the verifier returns verdict='accept', call finish with the
-   rewritten code. If verdict='reject', either call spawn_rewriter again
-   with a task_prompt that incorporates the verifier's per-variable
-   mismatches and concerns, or — if the verifier's `concerns` implicate
-   a specific variable's verdict — call spawn_variable_analyst again
-   for that variable (and re-assemble the verdict for the rewriter as
-   in step 2, then re-run spawn_analyst_finalizer per step 2b) with
-   the same tolerance. After any re-run, you must call spawn_verifier
-   again on the new rewrite before calling finish.
+5. If the verifier returns verdict='accept', run the rewritten chain
+   (splice_rewritten_kernel -> compile_rewritten_driver ->
+   run_rewritten_driver -> compare_outputs). If compare_outputs
+   returns status='ok', call measure_speedup ONCE with the same
+   kernel_stem to get a wall-clock speedup summary, then call finish
+   with the rewritten code (fold the speedup number and any timing
+   error into your final notes). measure_speedup is non-gating: a
+   missing timing block or a slowdown does NOT block finish, and an
+   error there means "surface it in your notes and proceed to
+   finish anyway". If verdict='reject', either call spawn_rewriter
+   again with a task_prompt that incorporates the verifier's
+   per-variable mismatches and concerns, or — if the verifier's
+   `concerns` implicate a specific variable's verdict — call
+   spawn_variable_analyst again for that variable (and re-assemble
+   the verdict for the rewriter as in step 2, then re-run
+   spawn_analyst_finalizer per step 2b) with the same tolerance.
+   After any re-run, you must call spawn_verifier again on the new
+   rewrite before calling finish.
 
 Hard rules:
 - You may not call finish unless the most recent spawn_verifier call
@@ -570,7 +601,11 @@ Hard rules:
   recent verifier-accept and received status='ok' from it; the
   orchestrator loop enforces this in code, not just in the prompt,
   and a premature finish call will be turned into a synthetic tool
-  error telling you what is missing.
+  error telling you what is missing. measure_speedup is NOT part of
+  the finish-gate — it is expected but not enforced; run it after
+  compare_outputs='ok' and before finish so the operator gets a
+  wall-clock speedup number alongside the numerical-correctness
+  signal.
 
 Be deliberate. Each spawn_* call costs another model call and the user
 will inspect every prompt before it runs. Prefer one well-crafted prompt
@@ -1382,6 +1417,50 @@ ORCHESTRATOR_TOOLS = [
         },
     },
     {
+        "name": "measure_speedup",
+        "description": (
+            "Deterministic (non-LLM) tool. Reads the `timing` block "
+            "from baselines/<kernel_stem>/reference.json (baseline) "
+            "and baselines/<kernel_stem>/rewritten/reference.json "
+            "(rewritten) and computes a wall-clock speedup ratio "
+            "with propagated stddev. The `timing` block is populated "
+            "by every driver per the harness contract (item 11 in "
+            "the baseline_harness system prompt): 1 untimed warmup "
+            "call + 10 timed trials, with mean/stddev/min/max "
+            "seconds emitted alongside `outputs`. On success writes "
+            "a summary to baselines/<kernel_stem>/rewritten/"
+            "timing.json and returns speedup + speedup_stddev in "
+            "stdout; speedup > 1.0 means the rewrite is faster, "
+            "< 1.0 means it regressed wall-clock time. Slowdowns "
+            "are reported as-is (no policy decision here). "
+            "Non-gating: this call is NOT a precondition for finish "
+            "— the finish-gate tracks compare_outputs only. Call "
+            "exactly once per accepted verifier verdict, after a "
+            "successful compare_outputs, and BEFORE calling finish. "
+            "On any error (missing reference.json, missing/malformed "
+            "timing block, non-positive baseline mean, mismatched "
+            "trials_timed across sides, OSError on write), returns "
+            "status='error' and writes NO timing.json — surface the "
+            "error to the operator in your final notes and proceed "
+            "to finish anyway; the numerical correctness signal "
+            "(compare_outputs='ok') is what actually gates the run."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "kernel_stem": {
+                    "type": "string",
+                    "description": (
+                        "Filesystem-safe short name for this kernel; "
+                        "MUST match the kernel_stem passed to the "
+                        "preceding compare_outputs call."
+                    ),
+                },
+            },
+            "required": ["kernel_stem"],
+        },
+    },
+    {
         "name": "finish",
         "description": "Terminate the workflow with the final rewritten kernel.",
         "input_schema": {
@@ -2000,6 +2079,22 @@ def _execute_tool(
             tool_input["tolerance_json"],
             profile.id,
         )
+    if tool_name == "measure_speedup":
+        # Deterministic tool (no LLM call): pure file I/O + arithmetic.
+        # Reads the `timing` block from both reference.json files and
+        # computes a wall-clock speedup ratio with propagated stddev,
+        # writing baselines/<stem>/rewritten/timing.json on the ok
+        # path. Non-gating: _FinishGateState tracks compare_status
+        # only, so a missing timing block or a slowdown does NOT
+        # block finish. `profile.id` is injected here so the LLM
+        # never has to pass it (same call-shape as compare_outputs
+        # and the probe tools); the speedup extractor is fully
+        # language-agnostic because it walks two reference.json
+        # files whose top-level shape is fixed by the harness
+        # contract regardless of profile.
+        return measure_speedup(
+            tool_input["kernel_stem"], profile.id
+        )
     if tool_name == "probe_step":
         # Deterministic tool (no LLM call): seed-rewrites a per-precision
         # driver template that the v1 baseline_harness wrote under
@@ -2410,12 +2505,17 @@ class _FinishGateState:
             return
         # Other tools (spawn_candidate_finder, spawn_variable_analyst,
         # spawn_analyst, spawn_baseline_harness, compile_baseline_driver,
-        # run_baseline_driver, probe_step, probe_compare) do not affect
-        # the gate. The probe tools in particular are INFORMATIONAL --
-        # they exist to give the finder and analysts evidence, not to
-        # gate finish; a failed or skipped probe does not block finish,
-        # and a successful probe does not earn finish without the
-        # regular verifier+comparator chain.
+        # run_baseline_driver, probe_step, probe_compare,
+        # measure_speedup) do not affect the gate. The probe tools in
+        # particular are INFORMATIONAL -- they exist to give the finder
+        # and analysts evidence, not to gate finish; a failed or skipped
+        # probe does not block finish, and a successful probe does not
+        # earn finish without the regular verifier+comparator chain.
+        # measure_speedup is likewise non-gating by design: it produces
+        # a wall-clock speedup number after compare_outputs='ok', but a
+        # missing timing block, a slowdown, or any error there must not
+        # block termination -- the numerical-correctness signal
+        # (compare_outputs='ok') is what actually gates the run.
         return
 
     def check_finish(self) -> str | None:

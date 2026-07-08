@@ -2433,6 +2433,102 @@ def test_execute_tool_compare_outputs_error_passes_through(monkeypatch):
     ]
 
 
+# ---------- measure_speedup: orchestrator dispatch and prompt wiring ----------
+
+
+def test_orchestrator_tools_include_measure_speedup():
+    """ORCHESTRATOR_TOOLS exposes measure_speedup with kernel_stem as the ONLY required input — no tolerance_json, no trials override — matching the deliberately-minimal signature."""
+    by_name = {t["name"]: t for t in ORCHESTRATOR_TOOLS}
+    assert "measure_speedup" in by_name
+    tool = by_name["measure_speedup"]
+    props = tool["input_schema"]["properties"]
+    assert "kernel_stem" in props
+    assert props["kernel_stem"]["type"] == "string"
+    # No tolerance / trials args — the speedup is not gated on
+    # tolerance and the trials count is hardcoded per harness prompt.
+    assert set(tool["input_schema"]["required"]) == {"kernel_stem"}
+    assert "tolerance_json" not in props
+    assert "trials" not in props
+
+
+def test_orchestrator_tools_measure_speedup_description_names_non_gating():
+    """The measure_speedup tool description must state (a) it is NON-gating for finish, (b) it comes AFTER compare_outputs, and (c) it reads the `timing` block populated by the harness — so the LLM does not accidentally treat it as a finish precondition or call it before the comparator."""
+    by_name = {t["name"]: t for t in ORCHESTRATOR_TOOLS}
+    text = by_name["measure_speedup"]["description"].lower()
+    assert "non-gating" in text or "not a precondition" in text
+    assert "compare_outputs" in text
+    assert "timing" in text
+    assert "finish" in text
+
+
+def test_orchestrator_prompt_mentions_measure_speedup_placement():
+    """The orchestrator system prompt places measure_speedup after compare_outputs and before finish, and explicitly marks it non-gating so the LLM does not skip it out of caution nor treat a slowdown / error as a finish blocker."""
+    text = ORCHESTRATOR_SYSTEM_PROMPT
+    assert "measure_speedup" in text
+    # Must appear AFTER the compare_outputs step in the pipeline
+    # narrative.
+    assert text.index("compare_outputs") < text.index("measure_speedup")
+    # Must explicitly state non-gating (or equivalent).
+    lowered = text.lower()
+    assert "non-gating" in lowered or "not a precondition" in lowered
+
+
+def test_execute_tool_dispatches_measure_speedup(monkeypatch):
+    """_execute_tool routes measure_speedup to workflow.tools.measure_speedup, forwards kernel_stem and injects profile.id as language_id (LLM never passes it), and returns the tool's {status, stdout, stderr, artifacts} dict verbatim."""
+    captured = {}
+
+    def stub_measure(kernel_stem, language_id):
+        captured["kernel_stem"] = kernel_stem
+        captured["language_id"] = language_id
+        return {
+            "status": "ok",
+            "stdout": "speedup = 2.0 +/- 0.1",
+            "stderr": "",
+            "artifacts": ["baselines/nbody_force/rewritten/timing.json"],
+        }
+
+    monkeypatch.setattr(orchestrator, "measure_speedup", stub_measure)
+
+    result = _execute_tool(
+        "measure_speedup",
+        {"kernel_stem": "nbody_force"},
+        KOKKOS_PROFILE,
+    )
+
+    assert captured == {
+        "kernel_stem": "nbody_force",
+        "language_id": "kokkos",
+    }
+    assert result == {
+        "status": "ok",
+        "stdout": "speedup = 2.0 +/- 0.1",
+        "stderr": "",
+        "artifacts": ["baselines/nbody_force/rewritten/timing.json"],
+    }
+
+
+def test_execute_tool_measure_speedup_error_passes_through(monkeypatch):
+    """When measure_speedup returns status='error' (missing reference.json, malformed timing block, non-positive baseline mean, etc.), _execute_tool passes the error dict through unchanged so the orchestrator sees it as a normal (non-gating) tool result — the finish-gate must NOT block on it."""
+    monkeypatch.setattr(
+        orchestrator,
+        "measure_speedup",
+        lambda stem, language_id: {
+            "status": "error",
+            "stdout": "",
+            "stderr": (
+                "baseline reference.json has no top-level `timing` key."
+            ),
+            "artifacts": [],
+        },
+    )
+    result = _execute_tool(
+        "measure_speedup", {"kernel_stem": "x"}, KOKKOS_PROFILE
+    )
+    assert result["status"] == "error"
+    assert "timing" in result["stderr"].lower()
+    assert result["artifacts"] == []
+
+
 # ---------- finish-gate: code-side enforcement ----------
 
 
@@ -3112,6 +3208,54 @@ def test_finish_gate_state_treats_probe_tools_as_explicit_no_ops():
     assert state.check_finish() is None
 
 
+def test_finish_gate_state_treats_measure_speedup_as_explicit_no_op():
+    """_FinishGateState.observe must NOT mutate last_verifier_verdict or last_compare_status when fed a measure_speedup result -- even an error result. measure_speedup runs AFTER compare_outputs='ok' and is non-gating by design: a missing timing block, a slowdown, or any subprocess error there must not retroactively block finish. Without this guarantee a failed timing run would spuriously invalidate a completed verifier+comparator chain."""
+    from workflow.orchestrator import _FinishGateState
+
+    state = _FinishGateState("kernels/nbody_force.cpp", KOKKOS_PROFILE)
+    # Prime the gate to the "ready to finish" condition.
+    state.observe(
+        "spawn_verifier",
+        {"status": "ok", "result": {"verdict": "accept"}},
+    )
+    state.observe(
+        "compare_outputs",
+        {"status": "ok", "stdout": "", "stderr": "", "artifacts": []},
+    )
+    assert state.last_verifier_verdict == "accept"
+    assert state.last_compare_status == "ok"
+    assert state.check_finish() is None
+
+    # A measure_speedup error must not invalidate either status.
+    state.observe(
+        "measure_speedup",
+        {
+            "status": "error",
+            "stdout": "",
+            "stderr": "baseline reference.json has no `timing` key.",
+            "artifacts": [],
+        },
+    )
+    assert state.last_verifier_verdict == "accept"
+    assert state.last_compare_status == "ok"
+    assert state.check_finish() is None
+
+    # A successful measure_speedup must also be a no-op (it does not
+    # earn finish on its own; it just adds a wall-clock signal).
+    state.observe(
+        "measure_speedup",
+        {
+            "status": "ok",
+            "stdout": "speedup = 1.8 +/- 0.05",
+            "stderr": "",
+            "artifacts": ["baselines/nbody_force/rewritten/timing.json"],
+        },
+    )
+    assert state.last_verifier_verdict == "accept"
+    assert state.last_compare_status == "ok"
+    assert state.check_finish() is None
+
+
 def test_layer2_score_known_tools_includes_probe_step_and_probe_compare():
     """evals.layer2.score._KNOWN_TOOLS must enumerate probe_step and probe_compare so a trace containing them does not produce 'unknown tool' warnings in the Layer-2 grader. Adding a new spawn/probe tool without updating this frozenset is a known failure mode the closed-set design exists to catch. Also cross-checks the per-variable pipeline tools (spawn_candidate_finder, spawn_variable_analyst, test_variable_downcast) — each of these was added in a separate step and every one is a candidate for slipping past the closed-set grader if the frozenset isn't kept in sync."""
     from evals.layer2.score import _KNOWN_TOOLS
@@ -3135,6 +3279,10 @@ def test_layer2_score_known_tools_includes_probe_step_and_probe_compare():
     # synthesis step the orchestrator calls once per rewrite cycle
     # AFTER the assembled per-variable list and BEFORE spawn_rewriter.
     assert "spawn_analyst_finalizer" in _KNOWN_TOOLS
+    # Speedup measurement tool: runs after compare_outputs='ok' and is
+    # non-gating for finish, but the trace grader must still recognize
+    # it -- same closed-set-drift risk as every tool above.
+    assert "measure_speedup" in _KNOWN_TOOLS
 
 
 def test_run_cli_no_probe_flag_threads_run_probe_false(monkeypatch, tmp_path):

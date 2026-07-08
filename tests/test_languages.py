@@ -448,3 +448,31 @@ def test_detect_language_cpp_with_sycl_and_omp_offload_markers_returns_sycl():
         "}\n"
     )
     assert detect_language("k.cpp", mixed) is SYCL_PROFILE
+
+
+# ---------- baseline_harness prompt: timing block contract ----------
+
+
+@pytest.mark.parametrize(
+    "profile",
+    [KOKKOS_PROFILE, CUDA_PROFILE, HIP_PROFILE, SYCL_PROFILE, OMP_OFFLOAD_PROFILE],
+    ids=["kokkos", "cuda", "hip", "sycl", "omp_offload"],
+)
+def test_baseline_harness_prompt_documents_timing_block(profile):
+    """Every dynamic-verification profile's baseline_harness_system_prompt must document the reference.json `timing` block: the top-level key, the four float fields (mean_sec, stddev_sec, min_sec, max_sec) + trials_timed integer, the N=11-trial protocol (1 untimed warmup + 10 timed), and %.9g formatting. measure_speedup reads this block on both baseline and rewritten reference.json files; without a stable prompt contract across all 5 profiles, the tool degrades to a status='error' return the very first time it is called on a non-Kokkos kernel."""
+    prompt = profile.baseline_harness_system_prompt
+    # Top-level key + fields (schema shape).
+    assert '"timing"' in prompt
+    assert "trials_timed" in prompt
+    assert "mean_sec" in prompt
+    assert "stddev_sec" in prompt
+    assert "min_sec" in prompt
+    assert "max_sec" in prompt
+    # Protocol: N=11 total, 1 untimed warmup, 10 timed.
+    assert "N=11" in prompt
+    # Formatting contract for the four float fields.
+    assert "%.9g" in prompt
+    # The literal integer 10 must appear in the trials_timed context
+    # (guards against the harness emitting trials_timed=11 by counting
+    # the warmup, which would mismatch measure_speedup's cross-check).
+    assert "trials_timed" in prompt and "10" in prompt

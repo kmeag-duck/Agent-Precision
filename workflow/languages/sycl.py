@@ -444,7 +444,14 @@ Hard requirements on the driver:
          "kernel": "<kernel_function_name>",
          "seed": <integer seed>,
          "inputs": { "N": <int>, ... },
-         "outputs": { "<name>": [ <double>, ... ], ... }
+         "outputs": { "<name>": [ <double>, ... ], ... },
+         "timing": {
+           "trials_timed": 10,
+           "mean_sec": <float>,
+           "stddev_sec": <float>,
+           "min_sec": <float>,
+           "max_sec": <float>
+         }
        }
 
    "inputs" carries enough metadata for a human reader to understand
@@ -453,12 +460,37 @@ Hard requirements on the driver:
    comparator will check. The names under "outputs" must match
    output_arrays in your submit_result payload.
 
+   "timing" carries wall-clock statistics for the kernel submission
+   (see item 11 below). It is required in every reference.json so
+   that the downstream `measure_speedup` tool can compute a
+   mean/stddev speedup from the baseline vs rewritten references.
+   The comparator ignores timing values numerically — only `outputs`
+   is checked against the tolerance — but it does require both files
+   to have identically-shaped top-level keys, so the `timing` block
+   must always be present.
+
 10. Begin the driver with a top-of-file comment that tells the
     operator to `cd` into the baseline directory (baselines/<file_stem>/)
     before running, so ./reference.json lands next to the driver
     source. Also mention the compile command in a comment (a typical
     `icpx -fsycl -std=c++17 -O2 driver.cpp -o driver` build line is
     fine; the operator will adapt it).
+
+11. Kernel timing. Repeat the kernel submission N=11 times: 1
+    untimed warmup submission followed by 10 timed trials. Time only
+    the kernel submission itself — NOT buffer construction, host
+    initialization, or JSON emission. Per trial, capture
+    `auto t0 = std::chrono::steady_clock::now();`, submit the kernel
+    to the in-order queue, immediately call `queue.wait();` to
+    force the device to complete before stopping the timer, then
+    `auto t1 = std::chrono::steady_clock::now();` and compute
+    `std::chrono::duration<double>(t1 - t0).count()`. Push the
+    seconds value into a `std::vector<double>`. After all 10 timed
+    trials, compute the mean, population stddev (dividing by N=10,
+    not N-1), min, and max, and emit them under the top-level
+    `timing` key of reference.json. Use `%.9g` formatting for the
+    four float fields. The `trials_timed` field is the literal
+    integer 10.
 
 Set kernel_function_name and output_arrays in your submit_result
 payload so they exactly match what the driver actually does. If your

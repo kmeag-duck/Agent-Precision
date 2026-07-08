@@ -50,6 +50,7 @@ flowchart TD
     S10["<b>10. compile_rewritten_driver</b><br/>same per-profile compiler as step 2<br/>→ baselines/&lt;stem&gt;/rewritten/driver"]:::det
     S11["<b>11. run_rewritten_driver</b><br/>→ baselines/&lt;stem&gt;/rewritten/reference.json"]:::det
     S12["<b>12. compare_outputs</b><br/><i>baseline vs rewritten under tolerance_json;<br/>writes comparison.json on pass AND fail</i>"]:::det
+    S12b["<b>12b. measure_speedup</b><br/><i>reads `timing` block from baseline +<br/>rewritten reference.json; ratio error prop.;<br/>writes timing.json on ok path only.<br/>NON-GATING: errors / slowdowns do not<br/>block finish</i>"]:::det
     S13["<b>13. finish</b><br/><i>code-side finish-gate</i>"]:::gate
 
     S1 ==> S2;
@@ -64,7 +65,9 @@ flowchart TD
     S9 ==> S10;
     S10 ==> S11;
     S11 ==> S12;
-    S12 == "status=ok" ==> S13;
+    S12 == "status=ok" ==> S12b;
+    S12b ==> S13;
+    S12b -. "error / slowdown (non-gating)" .-> S12b;
 
     %% deviations from the happy path, as compact side-loops
     S8 -. "reject" .-> S7;
@@ -112,6 +115,17 @@ class, not every possible retry path. The full rules:
   scratch), not just another rewrite of the same verdict. The
   synthetic `{status:'error', is_error:true}` tool result that
   blocks a premature `finish` call uses the same routing.
+- **Step 12b non-gating**. `measure_speedup` runs after
+  `compare_outputs='ok'` and before `finish` on every profile with
+  `dynamic_verification=True`, but its result does not participate
+  in `_FinishGateState`. A missing `timing` block on either
+  reference.json, a subprocess timeout during the 11-trial harness
+  run, or a rewrite that shows a slowdown all surface as tool
+  output (stderr / status='error' where applicable) without
+  blocking the run. The numerical-correctness gate at step 12 is
+  the only wall-clock signal that can block termination; step 12b
+  exists purely to attach a performance number to an accepted
+  rewrite.
 - **Step 1 error**. If the baseline-harness payload is malformed
   (missing both `drivers` and `driver_source`) the orchestrator
   raises a `RuntimeError` and the run ends.

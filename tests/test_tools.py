@@ -34,10 +34,13 @@ tmp_path.
 """
 
 import json
+import math
 import os
 import stat
 import subprocess
 from pathlib import Path
+
+import pytest
 
 from workflow import tools
 from workflow.languages import cuda as cuda_profile
@@ -76,6 +79,7 @@ from workflow.tools import (
     compare_outputs,
     compile_baseline_driver,
     compile_rewritten_driver,
+    measure_speedup,
     probe_compare,
     probe_step,
     run_baseline_driver,
@@ -5776,3 +5780,241 @@ void run(aType a) {{
     # The LOCAL was mutated, and the alias (a real parameter) was NOT touched.
     assert "float inv_r = 1.0 / a(0);" in singleton_src
     assert "using aType = Kokkos::View<double*>;" in singleton_src
+
+
+# ---------- measure_speedup ----------
+
+
+def _timing(mean, stddev=0.0, mn=None, mx=None, trials=10):
+    """Build a minimally-valid `timing` block matching the harness contract."""
+    if mn is None:
+        mn = mean
+    if mx is None:
+        mx = mean
+    return {
+        "trials_timed": trials,
+        "mean_sec": mean,
+        "stddev_sec": stddev,
+        "min_sec": mn,
+        "max_sec": mx,
+    }
+
+
+def _ref_with_timing(outputs, timing):
+    """Build a reference.json dict carrying both `outputs` and `timing`."""
+    ref = _well_shaped(outputs)
+    ref["timing"] = timing
+    return ref
+
+
+def _stage_measure_speedup(tmp_path, stem, baseline_ref, rewritten_ref):
+    """Write baseline + rewritten reference.json files under baselines/<stem>/."""
+    baseline_dir = tmp_path / "baselines" / stem
+    rewritten_dir = baseline_dir / "rewritten"
+    baseline_dir.mkdir(parents=True, exist_ok=True)
+    rewritten_dir.mkdir(parents=True, exist_ok=True)
+    (baseline_dir / "reference.json").write_text(json.dumps(baseline_ref))
+    (rewritten_dir / "reference.json").write_text(json.dumps(rewritten_ref))
+    return baseline_dir, rewritten_dir
+
+
+def test_measure_speedup_happy_path_writes_timing_json(monkeypatch, tmp_path):
+    """On the ok path measure_speedup writes baselines/<stem>/rewritten/timing.json with baseline/rewritten/speedup/speedup_stddev/trials_timed and returns status='ok' whose stdout carries the speedup and stddev."""
+    monkeypatch.chdir(tmp_path)
+    baseline_ref = _ref_with_timing(
+        {"y": [1.0]}, _timing(mean=2.0, stddev=0.1, mn=1.8, mx=2.2)
+    )
+    rewritten_ref = _ref_with_timing(
+        {"y": [1.0]}, _timing(mean=1.0, stddev=0.05, mn=0.9, mx=1.1)
+    )
+    _, rewritten_dir = _stage_measure_speedup(
+        tmp_path, "kern", baseline_ref, rewritten_ref
+    )
+
+    result = measure_speedup("kern", "kokkos")
+
+    assert result["status"] == "ok", result["stderr"]
+    timing_path = rewritten_dir / "timing.json"
+    assert result["artifacts"] == ["baselines/kern/rewritten/timing.json"]
+    payload = json.loads(timing_path.read_text())
+    assert set(payload.keys()) == {
+        "baseline", "rewritten", "speedup", "speedup_stddev", "trials_timed"
+    }
+    assert payload["speedup"] == 2.0
+    # Ratio error propagation: 2.0 * sqrt((0.1/2.0)^2 + (0.05/1.0)^2)
+    expected_sd = 2.0 * math.sqrt((0.1 / 2.0) ** 2 + (0.05 / 1.0) ** 2)
+    assert payload["speedup_stddev"] == pytest.approx(expected_sd)
+    assert payload["trials_timed"] == 10
+    assert payload["baseline"]["mean_sec"] == 2.0
+    assert payload["rewritten"]["mean_sec"] == 1.0
+    assert "speedup" in result["stdout"]
+
+
+def test_measure_speedup_reports_slowdown_without_policy(monkeypatch, tmp_path):
+    """A rewrite slower than baseline produces speedup < 1.0 and still returns status='ok' — measure_speedup makes no policy decision on regressions."""
+    monkeypatch.chdir(tmp_path)
+    baseline_ref = _ref_with_timing({"y": [1.0]}, _timing(mean=1.0))
+    rewritten_ref = _ref_with_timing({"y": [1.0]}, _timing(mean=2.0))
+    _stage_measure_speedup(tmp_path, "k", baseline_ref, rewritten_ref)
+
+    result = measure_speedup("k", "kokkos")
+
+    assert result["status"] == "ok", result["stderr"]
+    payload = json.loads(
+        (tmp_path / "baselines" / "k" / "rewritten" / "timing.json").read_text()
+    )
+    assert payload["speedup"] == 0.5
+
+
+def test_measure_speedup_errors_when_baseline_missing(monkeypatch, tmp_path):
+    """If baselines/<stem>/reference.json does not exist, measure_speedup returns status='error' naming run_baseline_driver and writes NO timing.json."""
+    monkeypatch.chdir(tmp_path)
+    rewritten_dir = tmp_path / "baselines" / "k" / "rewritten"
+    rewritten_dir.mkdir(parents=True)
+    (rewritten_dir / "reference.json").write_text(
+        json.dumps(_ref_with_timing({"y": [1.0]}, _timing(mean=1.0)))
+    )
+
+    result = measure_speedup("k", "kokkos")
+
+    assert result["status"] == "error"
+    assert "run_baseline_driver" in result["stderr"]
+    assert result["artifacts"] == []
+    assert not (rewritten_dir / "timing.json").exists()
+
+
+def test_measure_speedup_errors_when_rewritten_missing(monkeypatch, tmp_path):
+    """If baselines/<stem>/rewritten/reference.json does not exist, measure_speedup returns status='error' naming run_rewritten_driver and writes NO timing.json."""
+    monkeypatch.chdir(tmp_path)
+    baseline_dir = tmp_path / "baselines" / "k"
+    baseline_dir.mkdir(parents=True)
+    (baseline_dir / "reference.json").write_text(
+        json.dumps(_ref_with_timing({"y": [1.0]}, _timing(mean=1.0)))
+    )
+
+    result = measure_speedup("k", "kokkos")
+
+    assert result["status"] == "error"
+    assert "run_rewritten_driver" in result["stderr"]
+    assert result["artifacts"] == []
+
+
+def test_measure_speedup_errors_on_missing_timing_key(monkeypatch, tmp_path):
+    """If either reference.json omits the top-level `timing` key, measure_speedup returns status='error' naming the offending side and referencing the harness contract."""
+    monkeypatch.chdir(tmp_path)
+    baseline_ref = _well_shaped({"y": [1.0]})  # no timing block
+    rewritten_ref = _ref_with_timing({"y": [1.0]}, _timing(mean=1.0))
+    _stage_measure_speedup(tmp_path, "k", baseline_ref, rewritten_ref)
+
+    result = measure_speedup("k", "kokkos")
+
+    assert result["status"] == "error"
+    assert "timing" in result["stderr"].lower()
+    assert "baseline" in result["stderr"].lower()
+    assert result["artifacts"] == []
+
+
+def test_measure_speedup_errors_on_timing_missing_subkey(monkeypatch, tmp_path):
+    """If a `timing` block is missing a required subkey (e.g. stddev_sec), measure_speedup returns status='error' listing the missing key."""
+    monkeypatch.chdir(tmp_path)
+    incomplete = {
+        "trials_timed": 10,
+        "mean_sec": 1.0,
+        # stddev_sec missing
+        "min_sec": 0.9,
+        "max_sec": 1.1,
+    }
+    baseline_ref = _ref_with_timing({"y": [1.0]}, incomplete)
+    rewritten_ref = _ref_with_timing({"y": [1.0]}, _timing(mean=1.0))
+    _stage_measure_speedup(tmp_path, "k", baseline_ref, rewritten_ref)
+
+    result = measure_speedup("k", "kokkos")
+
+    assert result["status"] == "error"
+    assert "stddev_sec" in result["stderr"]
+
+
+def test_measure_speedup_errors_on_non_positive_baseline_mean(
+    monkeypatch, tmp_path
+):
+    """A baseline mean_sec of 0.0 (or negative) is a division-by-zero hazard; measure_speedup rejects it up front."""
+    monkeypatch.chdir(tmp_path)
+    baseline_ref = _ref_with_timing({"y": [1.0]}, _timing(mean=0.0))
+    rewritten_ref = _ref_with_timing({"y": [1.0]}, _timing(mean=1.0))
+    _stage_measure_speedup(tmp_path, "k", baseline_ref, rewritten_ref)
+
+    result = measure_speedup("k", "kokkos")
+
+    assert result["status"] == "error"
+    assert "mean_sec" in result["stderr"]
+
+
+def test_measure_speedup_errors_on_non_finite_stddev(monkeypatch, tmp_path):
+    """NaN / inf in any timing scalar is rejected — a propagated speedup_stddev must be a real number."""
+    monkeypatch.chdir(tmp_path)
+    baseline_ref = _ref_with_timing(
+        {"y": [1.0]}, _timing(mean=1.0, stddev=float("nan"))
+    )
+    rewritten_ref = _ref_with_timing({"y": [1.0]}, _timing(mean=1.0))
+    _stage_measure_speedup(tmp_path, "k", baseline_ref, rewritten_ref)
+
+    result = measure_speedup("k", "kokkos")
+
+    assert result["status"] == "error"
+    assert "finite" in result["stderr"].lower()
+
+
+def test_measure_speedup_errors_on_mismatched_trials(monkeypatch, tmp_path):
+    """The harness prompt pins trials_timed=10 across all profiles; a mismatch between the two sides indicates a stale harness prompt or a hand-edited driver and is rejected."""
+    monkeypatch.chdir(tmp_path)
+    baseline_ref = _ref_with_timing(
+        {"y": [1.0]}, _timing(mean=1.0, trials=10)
+    )
+    rewritten_ref = _ref_with_timing(
+        {"y": [1.0]}, _timing(mean=1.0, trials=5)
+    )
+    _stage_measure_speedup(tmp_path, "k", baseline_ref, rewritten_ref)
+
+    result = measure_speedup("k", "kokkos")
+
+    assert result["status"] == "error"
+    assert "trials_timed" in result["stderr"]
+
+
+def test_measure_speedup_errors_on_invalid_json(monkeypatch, tmp_path):
+    """If a reference.json is not valid JSON, measure_speedup returns a status='error' naming the file rather than raising."""
+    monkeypatch.chdir(tmp_path)
+    baseline_dir = tmp_path / "baselines" / "k"
+    rewritten_dir = baseline_dir / "rewritten"
+    baseline_dir.mkdir(parents=True)
+    rewritten_dir.mkdir(parents=True)
+    (baseline_dir / "reference.json").write_text("{not json")
+    (rewritten_dir / "reference.json").write_text(
+        json.dumps(_ref_with_timing({"y": [1.0]}, _timing(mean=1.0)))
+    )
+
+    result = measure_speedup("k", "kokkos")
+
+    assert result["status"] == "error"
+    assert "valid JSON" in result["stderr"]
+
+
+def test_measure_speedup_rejects_unknown_language(monkeypatch, tmp_path):
+    """language_id is validated via _resolve_profile; an unknown id raises before any file I/O."""
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises((KeyError, ValueError)):
+        measure_speedup("k", "cobol")
+
+
+def test_measure_speedup_result_keys_are_stable(monkeypatch, tmp_path):
+    """Both ok and error paths return exactly {status, stdout, stderr, artifacts} — the same contract as compare_outputs and the compile/run tools."""
+    monkeypatch.chdir(tmp_path)
+    # error path (no files staged)
+    err = measure_speedup("k", "kokkos")
+    assert set(err.keys()) == {"status", "stdout", "stderr", "artifacts"}
+    # ok path
+    baseline_ref = _ref_with_timing({"y": [1.0]}, _timing(mean=2.0))
+    rewritten_ref = _ref_with_timing({"y": [1.0]}, _timing(mean=1.0))
+    _stage_measure_speedup(tmp_path, "k", baseline_ref, rewritten_ref)
+    ok = measure_speedup("k", "kokkos")
+    assert set(ok.keys()) == {"status", "stdout", "stderr", "artifacts"}

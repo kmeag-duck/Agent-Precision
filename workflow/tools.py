@@ -58,6 +58,22 @@ Currently exposes:
     subprocess shape, and result schema of run_baseline_driver; only
     the directory differs. The baseline tree is never touched.
 
+  - measure_speedup(kernel_stem, language_id): compute a mean/stddev
+    wall-clock speedup from the baseline vs rewritten reference.json
+    `timing` blocks (contract: item 11 of every baseline_harness
+    system prompt — 1 warmup + 10 timed trials, mean/stddev/min/max
+    per side). Writes a summary to
+    baselines/<kernel_stem>/rewritten/timing.json with keys
+    {baseline, rewritten, speedup, speedup_stddev, trials_timed}
+    and returns the same summary in stdout. speedup > 1.0 means the
+    rewrite is faster; slowdowns are reported as-is. Non-gating:
+    orchestrator's _FinishGateState tracks compare_status only, so
+    a missing timing block or a slowdown does not block finish. On
+    any error (missing reference.json, malformed timing block,
+    non-positive baseline mean, mismatched trials_timed across
+    sides, OSError on write), returns status='error' and writes NO
+    timing.json artifact.
+
   - compare_outputs(kernel_stem, tolerance_json, language_id): numerically compare
     baselines/<kernel_stem>/reference.json (baseline) and
     baselines/<kernel_stem>/rewritten/reference.json (rewritten) under
@@ -1125,6 +1141,222 @@ def compare_outputs(
         "stdout": "",
         "stderr": "\n".join(stderr_lines),
         "artifacts": [str(comparison_path)],
+    }
+
+
+# ---------- measure_speedup: baseline-vs-rewritten timing summary ----------
+
+# Fields the timing block MUST carry; matched verbatim against the
+# harness prompt (item 11 in every language profile's
+# BASELINE_HARNESS_SYSTEM_PROMPT). If the prompt contract grows a
+# field, add it here so the extractor validates it too.
+_TIMING_REQUIRED_KEYS = (
+    "trials_timed",
+    "mean_sec",
+    "stddev_sec",
+    "min_sec",
+    "max_sec",
+)
+
+
+def _extract_timing(ref: object, side: str) -> tuple[dict | None, str | None]:
+    """Extract and validate the top-level `timing` block from a reference.json.
+
+    Returns `(timing_dict, None)` on success or `(None, error_msg)` on
+    any contract violation (missing key, wrong type, missing required
+    subkey, non-positive mean, non-finite value). `side` is a short
+    label ('baseline' / 'rewritten') folded into the error message so
+    the operator knows which reference.json is malformed.
+
+    Kept private and separate from _load_reference so the failure mode
+    (which side, which field) reaches the caller's error message
+    untouched — a symmetric split with the shape-check helpers used
+    by compare_outputs.
+    """
+    if not isinstance(ref, dict):
+        return (None, f"{side} reference.json top-level is not an object.")
+    if "timing" not in ref:
+        return (None, (
+            f"{side} reference.json has no top-level `timing` key. "
+            f"The harness contract (item 11 in the baseline_harness "
+            f"prompt) requires every driver to emit a `timing` block "
+            f"alongside `outputs`. Regenerate the driver from an "
+            f"updated harness prompt if this reference.json predates "
+            f"the timing contract."
+        ))
+    timing = ref["timing"]
+    if not isinstance(timing, dict):
+        return (None, (
+            f"{side} reference.json `timing` is not an object "
+            f"(got {type(timing).__name__})."
+        ))
+    missing = [k for k in _TIMING_REQUIRED_KEYS if k not in timing]
+    if missing:
+        return (None, (
+            f"{side} reference.json `timing` block is missing "
+            f"required key(s): {sorted(missing)}. Required keys: "
+            f"{list(_TIMING_REQUIRED_KEYS)}."
+        ))
+    for k in ("mean_sec", "stddev_sec", "min_sec", "max_sec"):
+        v = timing[k]
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            return (None, (
+                f"{side} reference.json `timing.{k}` is not a number "
+                f"(got {type(v).__name__}: {v!r})."
+            ))
+        if not math.isfinite(float(v)):
+            return (None, (
+                f"{side} reference.json `timing.{k}` is not finite "
+                f"({v!r}); cannot compute a speedup from non-finite "
+                f"timings."
+            ))
+    if timing["mean_sec"] <= 0.0:
+        return (None, (
+            f"{side} reference.json `timing.mean_sec` is not positive "
+            f"({timing['mean_sec']!r}); cannot compute speedup ratio."
+        ))
+    trials = timing["trials_timed"]
+    if isinstance(trials, bool) or not isinstance(trials, int) or trials < 1:
+        return (None, (
+            f"{side} reference.json `timing.trials_timed` is not a "
+            f"positive integer (got {trials!r})."
+        ))
+    return (timing, None)
+
+
+def measure_speedup(kernel_stem: str, language_id: str) -> dict:
+    """Compute a mean/stddev speedup from baseline vs rewritten timing blocks.
+
+    Reads baselines/<kernel_stem>/reference.json and
+    baselines/<kernel_stem>/rewritten/reference.json, extracts the
+    top-level `timing` block from each (contract: item 11 of every
+    baseline_harness system prompt), and writes a summary document to
+    baselines/<kernel_stem>/rewritten/timing.json.
+
+    The summary carries:
+
+      - `baseline` / `rewritten`: the two `timing` blocks verbatim
+        (mean_sec, stddev_sec, min_sec, max_sec, trials_timed).
+      - `speedup`: baseline.mean_sec / rewritten.mean_sec. A speedup
+        > 1.0 means the rewritten kernel is faster; < 1.0 means the
+        rewrite regressed wall-clock time. Slowdowns are reported
+        as-is (no policy decision here; the orchestrator surfaces the
+        number to the LLM and the operator).
+      - `speedup_stddev`: propagated uncertainty on the ratio, using
+        the standard error-propagation formula for a quotient of two
+        independent measurements:
+            σ_S = S * sqrt((σ_b/μ_b)² + (σ_r/μ_r)²)
+        where μ_b, σ_b are baseline mean/stddev and μ_r, σ_r are
+        the rewritten mean/stddev. This assumes the two driver runs
+        are statistically independent (they are — they are separate
+        subprocess invocations at different times, on the same host).
+      - `trials_timed`: echoed from the baseline block (the two sides
+        must match — the harness prompt hardcodes trials_timed=10
+        across all profiles, so a mismatch here is a contract bug).
+
+    `language_id` is accepted for call-shape symmetry with the rest
+    of the dynamic-verification chain, matching compare_outputs;
+    speedup extraction is fully language-agnostic because it walks
+    two reference.json files whose top-level shape is fixed by the
+    harness contract regardless of profile.
+
+    Non-gating: a failure here does NOT block finish (see the
+    orchestrator's _FinishGateState — it tracks compare_status only).
+    On any error path (missing reference.json, malformed timing
+    block, non-positive mean, mismatched trial counts, OSError on
+    write), the function returns status='error' with a clear
+    stderr message and writes NO timing.json artifact. Only the
+    happy path writes to disk.
+    """
+    _resolve_profile(language_id)
+
+    baseline_dir = Path("baselines") / kernel_stem
+    baseline_path = baseline_dir / "reference.json"
+    rewritten_dir = baseline_dir / "rewritten"
+    rewritten_path = rewritten_dir / "reference.json"
+    timing_path = rewritten_dir / "timing.json"
+
+    if not baseline_path.is_file():
+        return _error(
+            f"Baseline reference.json not found at {baseline_path}. "
+            f"Did run_baseline_driver run and succeed for this "
+            f"kernel_stem?"
+        )
+    if not rewritten_path.is_file():
+        return _error(
+            f"Rewritten reference.json not found at {rewritten_path}. "
+            f"Did run_rewritten_driver run and succeed for this "
+            f"kernel_stem?"
+        )
+
+    try:
+        baseline = _load_reference(baseline_path)
+    except json.JSONDecodeError as exc:
+        return _error(
+            f"Baseline reference.json at {baseline_path} is not "
+            f"valid JSON: {exc}."
+        )
+    try:
+        rewritten = _load_reference(rewritten_path)
+    except json.JSONDecodeError as exc:
+        return _error(
+            f"Rewritten reference.json at {rewritten_path} is not "
+            f"valid JSON: {exc}."
+        )
+
+    baseline_timing, err = _extract_timing(baseline, "baseline")
+    if err is not None:
+        return _error(err)
+    rewritten_timing, err = _extract_timing(rewritten, "rewritten")
+    if err is not None:
+        return _error(err)
+
+    if baseline_timing["trials_timed"] != rewritten_timing["trials_timed"]:
+        return _error(
+            f"baseline and rewritten timing.trials_timed disagree "
+            f"({baseline_timing['trials_timed']} vs "
+            f"{rewritten_timing['trials_timed']}). The harness prompt "
+            f"pins trials_timed=10 across all profiles; a mismatch "
+            f"indicates one side was produced by a stale harness "
+            f"prompt or a driver that hand-edited the constant."
+        )
+
+    mu_b = float(baseline_timing["mean_sec"])
+    mu_r = float(rewritten_timing["mean_sec"])
+    sigma_b = float(baseline_timing["stddev_sec"])
+    sigma_r = float(rewritten_timing["stddev_sec"])
+    speedup = mu_b / mu_r
+    # Ratio error propagation. Both means are already validated > 0,
+    # so the divisions are safe.
+    rel_var_b = (sigma_b / mu_b) ** 2
+    rel_var_r = (sigma_r / mu_r) ** 2
+    speedup_stddev = speedup * math.sqrt(rel_var_b + rel_var_r)
+
+    timing_doc = {
+        "baseline": baseline_timing,
+        "rewritten": rewritten_timing,
+        "speedup": speedup,
+        "speedup_stddev": speedup_stddev,
+        "trials_timed": baseline_timing["trials_timed"],
+    }
+    try:
+        rewritten_dir.mkdir(parents=True, exist_ok=True)
+        timing_path.write_text(json.dumps(timing_doc, indent=2))
+    except OSError as exc:
+        return _error(
+            f"Failed to write timing summary at {timing_path}: {exc}."
+        )
+
+    return {
+        "status": "ok",
+        "stdout": (
+            f"speedup = {speedup:.4g} +/- {speedup_stddev:.4g} "
+            f"(baseline mean {mu_b:.4g}s +/- {sigma_b:.4g}s, "
+            f"rewritten mean {mu_r:.4g}s +/- {sigma_r:.4g}s, "
+            f"{baseline_timing['trials_timed']} timed trials per side)."
+        ),
+        "stderr": "",
+        "artifacts": [str(timing_path)],
     }
 
 

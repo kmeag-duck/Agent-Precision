@@ -41,6 +41,7 @@ _KNOWN_TOOLS = frozenset({
     "compile_rewritten_driver",
     "run_rewritten_driver",
     "compare_outputs",
+    "measure_speedup",
     "probe_step",
     "probe_compare",
     "test_variable_downcast",
