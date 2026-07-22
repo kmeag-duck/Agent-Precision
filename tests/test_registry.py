@@ -498,16 +498,29 @@ def test_baseline_harness_cuda_entry_exists():
 
 
 def test_baseline_harness_cuda_schema_required_fields():
-    """The CUDA baseline_harness schema has the same required fields as the Kokkos one — the downstream comparator and splice tools are language-agnostic, so the submit_result payload shape is shared."""
+    """The CUDA baseline_harness schema requires a `drivers` object (multi-driver payload, matching Kokkos) plus kernel_function_name / inputs_summary / output_arrays. The downstream comparator and splice tools are language-agnostic, so the multi-driver payload shape is shared across every profile that opts into the probe pipeline (currently Kokkos and CUDA)."""
     schema = AGENTS["baseline_harness_cuda"]["output_schema"]
     assert set(schema["required"]) == {
-        "driver_source",
+        "drivers",
         "kernel_function_name",
         "inputs_summary",
         "output_arrays",
     }
     assert schema["properties"]["output_arrays"]["type"] == "array"
     assert schema["properties"]["output_arrays"]["items"]["type"] == "string"
+
+
+def test_baseline_harness_cuda_schema_drivers_object_has_three_precision_keys():
+    """The CUDA `drivers` object requires exactly three precision keys — double, float, original — and each is a string (a full .cu translation unit). No `quad` key (Phase 1a has no quad oracle; deferred to Phase 1b's host-side quad port); the shape is otherwise structurally identical to the Kokkos 4-driver payload so orchestrator._execute_tool's multi-driver dispatch handles both uniformly."""
+    schema = AGENTS["baseline_harness_cuda"]["output_schema"]
+    drivers = schema["properties"]["drivers"]
+    assert drivers["type"] == "object"
+    assert set(drivers["required"]) == {"double", "float", "original"}
+    for precision in ("double", "float", "original"):
+        assert drivers["properties"][precision]["type"] == "string"
+    assert "quad" not in drivers["properties"], (
+        "Phase 1a CUDA has no quad oracle; quad is deferred to Phase 1b"
+    )
 
 
 def test_baseline_harness_cuda_prompt_mentions_cuda_runtime_and_global():

@@ -168,14 +168,59 @@ def _detect_from_source(kernel_source: str) -> bool:
 BASELINE_HARNESS_OUTPUT_SCHEMA = {
     "type": "object",
     "properties": {
-        "driver_source": {
-            "type": "string",
+        "drivers": {
+            "type": "object",
             "description": (
-                "The full driver source as a single self-contained .cu "
-                "translation unit. Must inline the kernel source verbatim, "
-                "compile with nvcc, and on execution write reference "
-                "outputs to ./reference.json."
+                "Three self-contained .cu driver translation units, one per "
+                "probe precision. Each MUST inline the kernel source "
+                "verbatim between the KERNEL BEGIN/END sentinels, compile "
+                "with nvcc, and on execution write reference outputs to "
+                "./reference.json. All three share the same kernel body, "
+                "the same per-parameter <ParamName>Type alias NAMES, the "
+                "same RNG_SEED, and the same output-array names and "
+                "lengths; they differ only in the alias RHSes (which set "
+                "per-parameter storage precision), any host-side scratch "
+                "values that flow into the kernel, and the JSON floating-"
+                "point formatting. See the PER-PRECISION DRIVERS block in "
+                "the system prompt for the full contract."
             ),
+            "properties": {
+                "double": {
+                    "type": "string",
+                    "description": (
+                        "Uniform-double driver: every FP alias resolves to "
+                        "`double` / `double*`; JSON values `%.17g`. Feeds "
+                        "the probe-evidence pipeline as a same-precision "
+                        "point of comparison against `float` and "
+                        "`original`. NOT the splice scaffold."
+                    ),
+                },
+                "float": {
+                    "type": "string",
+                    "description": (
+                        "Uniform-float driver: every FP alias resolves to "
+                        "`float` / `float*`; JSON values `%.9g`. Feeds the "
+                        "probe-evidence pipeline as the "
+                        "aggressive-downcast point of comparison."
+                    ),
+                },
+                "original": {
+                    "type": "string",
+                    "description": (
+                        "Preserves the user's exact per-parameter kernel "
+                        "types verbatim (no coercion to a uniform "
+                        "precision). Serves two roles: (1) canonical "
+                        "splice scaffold copied to baselines/<stem>/"
+                        "driver.cu, and (2) sole source of the pre-"
+                        "rewrite baseline `timing` block read by "
+                        "measure_speedup. For all-double kernels this is "
+                        "byte-identical to the `double` driver; emit it "
+                        "anyway (both roles need the file at its own "
+                        "known path)."
+                    ),
+                },
+            },
+            "required": ["double", "float", "original"],
         },
         "kernel_function_name": {
             "type": "string",
@@ -204,7 +249,7 @@ BASELINE_HARNESS_OUTPUT_SCHEMA = {
         },
     },
     "required": [
-        "driver_source",
+        "drivers",
         "kernel_function_name",
         "inputs_summary",
         "output_arrays",
@@ -223,9 +268,99 @@ eventually be the baseline against which a rewritten (lower-precision)
 version of the same kernel is compared.
 
 You do NOT compile, run, or simulate the kernel. You do NOT invent
-numerical output values. Your only output is the driver source.
+numerical output values. Your only output is the three driver sources.
 
-Hard requirements on the driver:
+PER-PRECISION DRIVERS. You emit THREE drivers in a single
+submit_result call under `drivers.{double,float,original}`. All three
+MUST share:
+
+  - the same inlined kernel source (byte-identical between the
+    `// ---- KERNEL BEGIN ----` and `// ---- KERNEL END ----` sentinels),
+  - the same per-parameter `<ParamName>Type` alias NAMES (item 6),
+  - the same `static constexpr int RNG_SEED = ...;` line (item 3),
+  - the same input sizes, the same output array names, and the same
+    output array lengths (the comparator requires shape-identical
+    reference.json across precisions).
+
+The three drivers differ ONLY in:
+
+  - the RHS of each per-parameter `<ParamName>Type` alias,
+  - any host-side scratch values that ultimately flow into the kernel
+    (RNG fill loops, staging-buffer element types, etc.) — these must
+    be the appropriate precision end-to-end, not down-converted
+    through `double` mid-driver,
+  - the reference.json floating-point formatting (item 8).
+
+Per-precision rules:
+
+  - `double`: aliases resolve to `double` / `double*` (pointer aliases
+    replace their pointee with `double`, keeping any const-qualifiers);
+    JSON values written with `"%.17g"`. This driver exists purely to
+    feed the probe-evidence pipeline as a uniform-double point of
+    comparison against `float` and `original`; it is NOT the splice
+    scaffold (that role belongs to `original`).
+  - `float`: aliases resolve to `float` / `float*` (same
+    const-qualifier rule); JSON values written with `"%.9g"`. Host-
+    side RNG fill and any staging buffers that flow into the kernel
+    must be `float` end-to-end — do NOT fill a `std::vector<double>`
+    and then `cudaMemcpy` a `float`-typed device buffer from it.
+  - `original`: aliases resolve to the EXACT floating-point types
+    the user wrote in the kernel source verbatim, parameter by
+    parameter. If the user's kernel declares
+    `__global__ void kernel(double* a, const float* b, double alpha)`,
+    the aliases here are
+    `using aType = double*;`,
+    `using bType = const float*;`,
+    `using alphaType = double;` — no coercion to a uniform precision,
+    even if the mix looks unusual. The JSON output format follows
+    the DOMINANT precision of the user's kernel I/O parameters:
+    `%.9g` if every floating-point I/O parameter is `float`, `%.17g`
+    otherwise (i.e. as soon as any I/O parameter is `double`, use
+    `%.17g` for every output value — mixed-precision JSON files
+    remain readable by the same parser as the `double` driver). This
+    driver serves two orthogonal roles: (1) it is the canonical
+    splice scaffold — the orchestrator writes it to
+    `baselines/<stem>/driver.cu` and the rewriter splices its
+    kernel into a copy of it, so `main()` outside the sentinels must
+    already match the user's original kernel signature; (2) it is
+    the sole source of the baseline `timing` block that
+    `measure_speedup` reports as the pre-rewrite wall-clock — the
+    `double` driver's timing is numerically meaningless as "the
+    user's baseline" because `double` is a uniform-precision rewrite
+    of a potentially-mixed kernel. For all-double kernels this
+    driver is byte-identical to the `double` driver; emit it anyway
+    (both paths — probe evidence and speedup baseline — need it at
+    its own known path).
+
+SPLICE-TARGET ROLE. The orchestrator writes `drivers["original"]`
+(NOT `drivers["double"]`) to `baselines/<stem>/driver.cu` as the
+canonical splice scaffold. The rewriter later splices its kernel
+between the sentinels of that file to produce
+`baselines/<stem>/rewritten/driver.cu`. Because `main()` in the
+`original` driver already constructs kernel arguments through
+aliases that match the user's exact parameter types, the rewriter
+can redefine those aliases (e.g. downcast an `aType` from `double*`
+to `float*`) without touching `main()`; the change propagates
+through the signature for free. The other two drivers (double,
+float) live only under `baselines/<stem>/probe/<precision>/` and
+feed the probe-evidence pipeline.
+
+The `original` driver additionally serves as the pre-rewrite
+wall-clock reference for `measure_speedup`: its `timing` block from
+seed=42 is read directly out of
+`baselines/<stem>/probe/original_seed42/reference.json` as the
+"baseline" side of the speedup ratio. The `timing` block is present
+in every driver (item 11) but the `double` block is NOT used for
+speedup — the `double` driver is a uniform-precision rewrite of a
+potentially-mixed kernel, so it does not represent what "the user's
+kernel before rewriting" actually runs at.
+
+None of these driver variants changes the kernel function body.
+They change the alias RHSes (item 6 below), any host-side scratch
+values that flow into the kernel, and the JSON output formatting
+(item 8).
+
+Hard requirements on each driver:
 
 1. Single translation unit. Inline the kernel source verbatim into the
    driver (above main()). Do not introduce a build system or external
@@ -265,9 +400,13 @@ Hard requirements on the driver:
       `int threads = 256; int blocks = (N + threads - 1) / threads;`).
       Do not query the device for an "optimal" launch shape.
 
-   c. Seed any host-side RNG with a fixed integer (use 42 unless the
-      kernel's apparent domain demands otherwise). The driver must
-      produce the same numbers on every run.
+   c. Seed any host-side RNG from a top-of-file constant declared
+      exactly as `static constexpr int RNG_SEED = 42;` (use 42 unless
+      the kernel's apparent domain demands otherwise). All three
+      drivers MUST use the identical `RNG_SEED = <N>;` line (same
+      integer, same declaration) so a later probe step can flip the
+      seed with a single-line regex swap. The driver must produce
+      the same numbers on every run.
 
 3. Use cudaMalloc / cudaMemcpy for device allocations and host<->device
    transfers. After every CUDA runtime call AND after the kernel
@@ -378,11 +517,13 @@ Hard requirements on the driver:
    surface here, not later.
 
 8. Write the reference output to './reference.json' (relative to the
-   driver's working directory) using std::ofstream and "%.17g"
-   formatting for floating-point values. Do NOT pull in a third-party
-   JSON library — hand-roll the writer; output arrays are flat arrays
-   of doubles, so a few loops with manual braces, commas, and newlines
-   are sufficient.
+   driver's working directory) using std::ofstream and the precision-
+   specific format string mandated by the PER-PRECISION DRIVERS block
+   above (`"%.17g"` for `double` and `original`-when-any-param-is-
+   double, `"%.9g"` for `float` and `original`-when-all-params-are-
+   float). Do NOT pull in a third-party JSON library — hand-roll the
+   writer; output arrays are flat arrays of scalars, so a few loops
+   with manual braces, commas, and newlines are sufficient.
 
 9. The JSON document must have exactly this shape:
 
@@ -415,9 +556,12 @@ Hard requirements on the driver:
    identically-shaped top-level keys, so the `timing` block must
    always be present.
 
-10. Begin the driver with a top-of-file comment that tells the operator
-    to `cd` into the baseline directory (baselines/<file_stem>/) before
-    running, so ./reference.json lands next to the driver source. Also
+10. Begin each driver with a top-of-file comment that tells the
+    operator to `cd` into the driver's own directory before running,
+    so ./reference.json lands next to the driver source. The
+    `original` driver lives at `baselines/<file_stem>/driver.cu` and
+    the two probe drivers live at
+    `baselines/<file_stem>/probe/{double,float}/driver.cu`. Also
     mention the compile command in a comment (a typical nvcc build
     line is fine; the operator will adapt it).
 
@@ -437,11 +581,15 @@ Hard requirements on the driver:
     is the literal integer 10.
 
 Set kernel_function_name and output_arrays in your submit_result
-payload so they exactly match what the driver actually does. If your
-driver writes an array under "outputs" by some name, that same name
-must appear in output_arrays.
+payload so they exactly match what the drivers actually do. The three
+drivers share these values (same kernel function, same output array
+names) — set each of the top-level fields once and they apply to all
+three. If a driver writes an array under "outputs" by some name, that
+same name must appear in output_arrays.
 
-Return your result by calling the submit_result tool."""
+Return your result by calling the submit_result tool. All three keys
+under `drivers.{double,float,original}` are required; an absent or
+empty driver fails the schema."""
 
 
 CUDA_PROFILE = LanguageProfile(
@@ -457,6 +605,23 @@ CUDA_PROFILE = LanguageProfile(
     build_syntax_check_command=_build_syntax_check_command,
     preflight=_preflight,
     detect_from_source=_detect_from_source,
+    # v1a probe pipeline for CUDA. Baseline is `double` (not `quad`
+    # like Kokkos) because nvcc has no `__float128` support and there
+    # is no comparably portable software-quad path on the device side.
+    # A host-side quad oracle port is Phase 1b (see AGENTS.md
+    # "Planned next steps"). Consequences of baseline_precision=
+    # "double" (documented in AGENTS.md):
+    #   * Oracle promotion is a no-op — the finish-gate comparator
+    #     measures rewritten output against the `original`-precision
+    #     `baselines/<stem>/reference.json`, not a promoted quad
+    #     reference. For typical `--sig-figs 6` runs on double
+    #     baselines this suffices (double has ~15-17 sig figs of
+    #     headroom over the tolerance).
+    #   * measure_speedup still takes the probe path
+    #     (baselines/<stem>/probe/original_seed42/reference.json)
+    #     since probe_precisions is non-empty; symmetric with Kokkos.
+    baseline_precision="double",
+    probe_precisions=("double", "float", "original"),
 )
 
 

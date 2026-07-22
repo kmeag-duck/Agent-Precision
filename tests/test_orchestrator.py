@@ -3327,15 +3327,27 @@ def test_format_baseline_block_kokkos_with_run_probe_false_omits_matrix():
     assert "spawn_baseline_harness" in block
 
 
-def test_format_baseline_block_cuda_never_mentions_probe_matrix():
-    """CUDA's probe_precisions is empty in v1, so _format_baseline_block must NEVER emit a PROBE STEP block under the CUDA profile — regardless of the run_probe flag. The --no-probe CLI is a no-op for non-probing profiles; the prompt must reflect that by silently omitting the section rather than including an 'N/A' line that wastes context."""
-    for run_probe in (True, False):
-        block = _format_baseline_block(
-            "kernels/vector_add.cu", None, CUDA_PROFILE, run_probe=run_probe
-        )
-        assert "PROBE STEP:" not in block, (
-            f"PROBE STEP must be absent under CUDA (run_probe={run_probe})"
-        )
+def test_format_baseline_block_cuda_emits_probe_matrix_when_enabled():
+    """Phase 1a lit up CUDA's probe pipeline (probe_precisions=('double', 'float', 'original'), baseline_precision='double'), so _format_baseline_block MUST emit a PROBE STEP block when run_probe=True on a CUDA kernel. Symmetric with the Kokkos behavior — the block is what tells the orchestrator LLM to invoke probe_step for each precision × seed cell before the analyst pipeline."""
+    block = _format_baseline_block(
+        "kernels/vector_add.cu", None, CUDA_PROFILE, run_probe=True
+    )
+    assert "PROBE STEP:" in block, (
+        "PROBE STEP must be present under CUDA when run_probe=True"
+    )
+
+
+def test_format_baseline_block_cuda_omits_probe_matrix_when_disabled():
+    """Even now that CUDA has a probe pipeline, --no-probe (run_probe=False) must still suppress the PROBE STEP block — the two probe tools remain in ORCHESTRATOR_TOOLS, the LLM just isn't told to invoke them. Symmetric with the Kokkos --no-probe behavior."""
+    block = _format_baseline_block(
+        "kernels/vector_add.cu", None, CUDA_PROFILE, run_probe=False
+    )
+    assert "PROBE STEP:" not in block, (
+        "PROBE STEP must be absent under CUDA when run_probe=False"
+    )
+    # The baseline harness instructions for CUDA must still be there —
+    # disabling the probe doesn't disable dynamic verification.
+    assert "spawn_baseline_harness" in block
 
 
 def test_finish_gate_state_treats_probe_tools_as_explicit_no_ops():

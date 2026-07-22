@@ -128,16 +128,22 @@ def test_kokkos_profile_probe_precisions_v1_set():
     )
 
 
-def test_non_kokkos_profiles_have_default_probe_fields():
-    """CUDA / HIP / SYCL / OMP-offload all keep the v0-compatible defaults: empty `probe_precisions` (orchestrator skips the probe entirely) and `baseline_precision='double'` (matches the historical baseline). Deferred Commit 6 will lift these to populated probe sets, but v1 ships Kokkos-only probe support."""
-    for profile in (CUDA_PROFILE, HIP_PROFILE, SYCL_PROFILE, OMP_OFFLOAD_PROFILE):
+def test_cuda_profile_probe_precisions_v1a_set():
+    """CUDA_PROFILE.probe_precisions == ('double', 'float', 'original') with baseline_precision='double'. Phase 1a extends the probe pipeline to CUDA without a quad oracle (nvcc has no __float128 device-side support; host-side quad oracle is deferred to Phase 1b). The 3-cell matrix measures float-vs-double drift and float-vs-original drift; the `original` cell doubles as the splice scaffold and the measure_speedup timing source, same as under Kokkos. Consequences of baseline_precision='double' (no quad oracle): oracle promotion is a no-op, and the finish-gate comparator measures rewritten output against the `original`-precision reference rather than a promoted higher-precision one."""
+    assert CUDA_PROFILE.probe_precisions == ("double", "float", "original")
+    assert CUDA_PROFILE.baseline_precision == "double"
+
+
+def test_hip_sycl_omp_profiles_have_default_probe_fields():
+    """HIP / SYCL / OMP-offload keep the v0-compatible defaults: empty `probe_precisions` (orchestrator skips the probe entirely) and `baseline_precision='double'` (matches the historical baseline). Deferred smoke-validation on those profiles' toolchains will lift them to populated probe sets, but v1a ships Kokkos + CUDA probe support only."""
+    for profile in (HIP_PROFILE, SYCL_PROFILE, OMP_OFFLOAD_PROFILE):
         assert profile.probe_precisions == (), (
             f"{profile.id} has non-empty probe_precisions={profile.probe_precisions!r}; "
-            f"v1 only populates Kokkos"
+            f"v1a only populates Kokkos and CUDA"
         )
         assert profile.baseline_precision == "double", (
             f"{profile.id} has baseline_precision={profile.baseline_precision!r}; "
-            f"v1 only changes Kokkos's baseline"
+            f"v1a only changes Kokkos's baseline"
         )
 
 
