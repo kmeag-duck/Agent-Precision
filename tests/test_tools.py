@@ -3688,7 +3688,7 @@ def _make_ref_payload(kernel, seed, outputs):
 
 
 def test_probe_compare_errors_when_quad_seed42_missing(monkeypatch, tmp_path):
-    """probe_compare hard-errors when the canonical quad cell (quad_seed42) is missing -- without ground truth there is nothing to compare against. The error message names quad_seed42 and probe_step so the operator knows which upstream call must be re-run."""
+    """probe_compare hard-errors on Kokkos when the canonical baseline_precision cell (quad_seed42) is missing -- without ground truth there is nothing to compare against. The error message names the missing cell and probe_step so the operator knows which upstream call must be re-run."""
     monkeypatch.chdir(tmp_path)
     _stage_probe_template_dir(tmp_path, "k", "quad")
     _stage_probe_template_dir(tmp_path, "k", "float")
@@ -3698,6 +3698,24 @@ def test_probe_compare_errors_when_quad_seed42_missing(monkeypatch, tmp_path):
 
     assert result["status"] == "error"
     assert "quad_seed42" in result["stderr"]
+    assert "probe_step" in result["stderr"]
+    assert result["artifacts"] == []
+
+
+def test_probe_compare_errors_when_cuda_double_seed42_missing(
+    monkeypatch, tmp_path
+):
+    """probe_compare on CUDA hard-errors when the canonical baseline_precision cell (double_seed42) is missing -- the CUDA profile has baseline_precision='double' (no host-side quad oracle in v1a), so the ground-truth cell name and the error message must reflect that. Kokkos and CUDA share the same code path via LanguageProfile.baseline_precision; only the cell name changes."""
+    monkeypatch.chdir(tmp_path)
+    _stage_probe_template_dir(tmp_path, "k", "double")
+    _stage_probe_template_dir(tmp_path, "k", "float")
+    # Note: NO double_seed42 cell written.
+
+    result = probe_compare("k", "cuda")
+
+    assert result["status"] == "error"
+    assert "double_seed42" in result["stderr"]
+    assert "quad" not in result["stderr"].lower()  # not a Kokkos error message
     assert "probe_step" in result["stderr"]
     assert result["artifacts"] == []
 
@@ -3846,10 +3864,10 @@ def test_probe_compare_records_shape_error_on_mismatched_outputs(
     assert "stats" in double_cell
 
 
-def test_probe_compare_records_no_quad_partner_when_quad_seed43_missing(
+def test_probe_compare_records_no_baseline_partner_when_quad_seed43_missing(
     monkeypatch, tmp_path
 ):
-    """When seed=42 has full coverage but seed=43 has a non-quad cell with no quad partner at the same seed, probe_compare records cell.status='no_quad_partner' for that cell rather than the misleading 'ok'. The seed=42 stats are unaffected."""
+    """When seed=42 has full coverage but seed=43 has a non-baseline cell with no baseline partner at the same seed, probe_compare records cell.status='no_baseline_partner' for that cell rather than the misleading 'ok'. The seed=42 stats are unaffected. The status enum is baseline-agnostic (was 'no_quad_partner' when Kokkos was the only probe profile) so CUDA / future profiles reuse the same code path."""
     monkeypatch.chdir(tmp_path)
     _stage_probe_template_dir(tmp_path, "k", "quad")
     _stage_probe_template_dir(tmp_path, "k", "float")
@@ -3875,7 +3893,9 @@ def test_probe_compare_records_no_quad_partner_when_quad_seed43_missing(
         (tmp_path / "baselines" / "k" / "probe" / "evidence.json").read_text()
     )
     assert evidence["cells"]["float_seed42"]["status"] == "ok"
-    assert evidence["cells"]["float_seed43"]["status"] == "no_quad_partner"
+    assert (
+        evidence["cells"]["float_seed43"]["status"] == "no_baseline_partner"
+    )
     assert "quad_seed43" in evidence["cells"]["float_seed43"]["error"]
 
 
@@ -3974,8 +3994,67 @@ def test_probe_compare_summary_reports_worst_cell_and_output(
     assert "max_absrel" in result["stdout"]
 
 
+def test_probe_compare_cuda_writes_evidence_with_double_baseline(
+    monkeypatch, tmp_path
+):
+    """probe_compare on CUDA uses double as the ground-truth baseline (no host-side quad oracle in v1a). The float_seed42 cell's stats are computed vs double_seed42, evidence.json['baseline_precision'] records the choice, and the summary line says 'vs double' not 'vs quad'. This is the counterpart to the Kokkos happy-path test above."""
+    monkeypatch.chdir(tmp_path)
+    _stage_probe_template_dir(tmp_path, "k", "double")
+    _stage_probe_template_dir(tmp_path, "k", "float")
+    _stage_probe_template_dir(tmp_path, "k", "original")
+
+    # double ground truth, seed=42.
+    _stage_probe_cell_reference(
+        tmp_path, "k", "double", 42,
+        _make_ref_payload("k", 42, {"y": [1.0, 2.0, 3.0]}),
+    )
+    # float cell, seed=42 with a ~1e-7 relative error on y[0].
+    _stage_probe_cell_reference(
+        tmp_path, "k", "float", 42,
+        _make_ref_payload("k", 42, {"y": [1.0 + 1e-7, 2.0, 3.0]}),
+    )
+    # original cell, seed=42 exactly matches (preserves user's types
+    # which happen to be double in this fixture).
+    _stage_probe_cell_reference(
+        tmp_path, "k", "original", 42,
+        _make_ref_payload("k", 42, {"y": [1.0, 2.0, 3.0]}),
+    )
+
+    result = probe_compare("k", "cuda")
+    assert result["status"] == "ok"
+    # Summary says vs double, not vs quad.
+    assert "vs double" in result["stdout"]
+    assert "vs quad" not in result["stdout"]
+
+    evidence = json.loads(
+        (tmp_path / "baselines" / "k" / "probe" / "evidence.json").read_text()
+    )
+    # Baseline precision is recorded verbatim.
+    assert evidence["baseline_precision"] == "double"
+    # No quad cells exist on CUDA.
+    assert set(evidence["precisions"]) == {"double", "float", "original"}
+
+    # double_seed42 is the ground truth (no stats computed for itself).
+    cells = evidence["cells"]
+    assert cells["double_seed42"]["status"] == "ok"
+    assert "stats" not in cells["double_seed42"]
+
+    # float_seed42 stats are vs the double baseline, not vs original.
+    float_cell = cells["float_seed42"]
+    assert float_cell["status"] == "ok"
+    y_stats = float_cell["stats"]["y"]
+    assert y_stats["n"] == 3
+    assert y_stats["n_finite"] == 3
+    assert 5e-8 < y_stats["max_absrel"] < 2e-7
+
+    # original_seed42 also gets stats vs double_seed42 (exact match).
+    original_cell = cells["original_seed42"]
+    assert original_cell["status"] == "ok"
+    assert original_cell["stats"]["y"]["max_absrel"] == 0.0
+
+
 def test_probe_compare_result_keys_are_stable(monkeypatch, tmp_path):
-    """probe_compare returns the uniform {status, stdout, stderr, artifacts} schema on both the success and the hard-error (no quad ground truth) paths, matching every other tool in workflow.tools."""
+    """probe_compare returns the uniform {status, stdout, stderr, artifacts} schema on both the success and the hard-error (no baseline ground truth) paths, matching every other tool in workflow.tools."""
     monkeypatch.chdir(tmp_path)
     _stage_probe_template_dir(tmp_path, "k", "quad")
     _stage_probe_cell_reference(

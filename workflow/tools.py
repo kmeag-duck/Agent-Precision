@@ -116,16 +116,17 @@ Currently exposes:
     For each (precision, seed) cell it records a status (ok /
     missing / load_error / shape_error) so the analyst sees which
     signals are real, and for every cell that has an `ok` partner
-    quad-same-seed cell it computes per-output stats vs the quad
-    ground truth (max-absrel error, mean-absrel error, max-absolute
-    error, count of finite mismatches). It also computes per-output
-    cross-seed deltas (how much the per-precision max-absrel error
-    changes between seed 42 and seed 43) so the analyst can tell
-    seed-correlated precision pain from seed-independent precision
-    pain. The tool itself hard-errors only when the quad ground
-    truth for the canonical seed (42) is missing -- otherwise it
-    reports whatever cells are present. Pure file + arithmetic
-    I/O; no subprocess.
+    at the same seed AND at the profile's baseline_precision (quad
+    on Kokkos, double on CUDA) it computes per-output stats vs the
+    baseline ground truth (max-absrel error, mean-absrel error,
+    max-absolute error, count of finite mismatches). It also
+    computes per-output cross-seed deltas (how much the per-precision
+    max-absrel error changes between seed 42 and seed 43) so the
+    analyst can tell seed-correlated precision pain from
+    seed-independent precision pain. The tool itself hard-errors
+    only when the baseline ground truth for the canonical seed (42)
+    is missing -- otherwise it reports whatever cells are present.
+    Pure file + arithmetic I/O; no subprocess.
 """
 
 from __future__ import annotations
@@ -1688,10 +1689,10 @@ def _load_probe_cell(
     return (payload, "ok", None)
 
 
-def _per_output_stats_vs_quad(
-    quad_payload: dict, other_payload: dict
+def _per_output_stats_vs_baseline(
+    baseline_payload: dict, other_payload: dict
 ) -> tuple[dict | None, str | None]:
-    """Compute per-output error stats of `other_payload` vs `quad_payload`.
+    """Compute per-output error stats of `other_payload` vs `baseline_payload`.
 
     Returns `(stats, None)` on success or `(None, error_msg)` on a
     shape mismatch (reuses `_shape_error` so the contract stays in
@@ -1700,51 +1701,57 @@ def _per_output_stats_vs_quad(
       {n: int,              total elements compared
        n_finite: int,       elements where both sides are finite
        n_nonfinite: int,    elements where either side is NaN or inf
-       max_absrel: float,   max |a-q| / max(|a|, |q|, eps) over finite pairs
+       max_absrel: float,   max |a-b| / max(|a|, |b|, eps) over finite pairs
        mean_absrel: float,  mean of the same over finite pairs
-       max_abserror: float} max |a-q| over finite pairs
+       max_abserror: float} max |a-b| over finite pairs
+
+    The `baseline` here is whatever cell the caller has resolved as
+    the ground-truth oracle for the profile: `quad` on Kokkos (higher
+    precision than any downcast candidate) or `double` on CUDA (the
+    original storage precision; without a host-side quad oracle in
+    v1a there is no higher-precision cell to compare against).
 
     The relative-error denominator uses a tiny epsilon floor (1e-300)
-    so quad-zero / other-zero pairs do not blow the stat up to inf;
-    in that exact-zero case both numerator and denominator are zero,
-    yielding 0.0 -- which is the analyst-friendly answer (the cell
-    agreed perfectly). NaN and inf pairs are excluded from the
+    so baseline-zero / other-zero pairs do not blow the stat up to
+    inf; in that exact-zero case both numerator and denominator are
+    zero, yielding 0.0 -- which is the analyst-friendly answer (the
+    cell agreed perfectly). NaN and inf pairs are excluded from the
     finite-arithmetic stats but counted in `n_nonfinite` so the
     analyst sees that something special happened.
     """
-    shape_err = _shape_error(quad_payload, other_payload)
+    shape_err = _shape_error(baseline_payload, other_payload)
     if shape_err is not None:
         return (None, shape_err)
 
     stats: dict[str, dict] = {}
     eps = 1e-300
-    outputs_q = quad_payload["outputs"]
+    outputs_b = baseline_payload["outputs"]
     outputs_o = other_payload["outputs"]
-    for name in sorted(outputs_q.keys()):
-        arr_q = outputs_q[name]
+    for name in sorted(outputs_b.keys()):
+        arr_b = outputs_b[name]
         arr_o = outputs_o[name]
-        n = len(arr_q)
+        n = len(arr_b)
         n_finite = 0
         n_nonfinite = 0
         max_absrel = 0.0
         sum_absrel = 0.0
         max_abserror = 0.0
-        for vq, vo in zip(arr_q, arr_o):
+        for vb, vo in zip(arr_b, arr_o):
             try:
-                fq = float(vq)
+                fb = float(vb)
                 fo = float(vo)
             except (TypeError, ValueError):
                 n_nonfinite += 1
                 continue
             if (
-                math.isnan(fq) or math.isnan(fo)
-                or math.isinf(fq) or math.isinf(fo)
+                math.isnan(fb) or math.isnan(fo)
+                or math.isinf(fb) or math.isinf(fo)
             ):
                 n_nonfinite += 1
                 continue
             n_finite += 1
-            abs_err = abs(fo - fq)
-            denom = max(abs(fq), abs(fo), eps)
+            abs_err = abs(fo - fb)
+            denom = max(abs(fb), abs(fo), eps)
             rel = abs_err / denom
             if rel > max_absrel:
                 max_absrel = rel
@@ -1767,62 +1774,80 @@ def probe_compare(kernel_stem: str, language_id: str) -> dict:
     """Aggregate the per-cell probe runs into evidence.json for the analyst.
 
     Walks the probe matrix (every (precision, seed) cell the v1 probe
-    pipeline emits, currently 4 precisions x 2 seeds = 8 cells for
-    Kokkos), classifies each cell's reference.json (ok / missing /
-    load_error / shape_error), and for every non-quad cell that has
-    an `ok` partner `quad_seed<N>` cell computes per-output stats
-    against the quad reference at the same seed. Adds per-output
+    pipeline emits: 4 precisions x 2 seeds = 8 cells for Kokkos, 3
+    precisions x 2 seeds = 6 cells for CUDA), classifies each cell's
+    reference.json (ok / missing / load_error / shape_error), and for
+    every non-baseline cell that has an `ok` partner
+    `<baseline_precision>_seed<N>` cell computes per-output stats
+    against the baseline reference at the same seed. Adds per-output
     cross-seed deltas so the analyst can distinguish seed-correlated
     precision pain from seed-independent precision pain.
 
+    The ground-truth "baseline" cell is chosen by the resolved
+    `LanguageProfile.baseline_precision`: `quad` on Kokkos (higher
+    precision than any downcast candidate) or `double` on CUDA (the
+    original storage precision; without a host-side quad oracle in
+    v1a there is no higher-precision cell to compare against). A
+    profile with no probe pipeline (`probe_precisions=()`) is never
+    dispatched here by the orchestrator.
+
     Writes the aggregated document to
     `baselines/<kernel_stem>/probe/evidence.json`. That path is also
-    what the orchestrator's spawn_analyst branch will read to attach
-    the PROBE EVIDENCE block to the analyst task prompt (Commit 4).
+    what the orchestrator reads to attach the PROBE EVIDENCE block
+    to the per-variable analyst pipeline task prompts.
 
-    Hard-errors only when the quad ground truth for the canonical
+    Hard-errors only when the baseline ground truth for the canonical
     seed (42) is missing -- without that cell there is no reference
     to compare against and the per-cell stats would all be empty.
     Any other missing or failed cell is recorded in `cells[<name>]`
     with a non-ok status and skipped during the stats walk; the
     analyst sees exactly which signals are real.
 
-    The probe quad reference values are written as `%.34Qg` tokens by
-    the harness's quadmath_snprintf call but parsed back through
-    Python's `json.load`, which truncates them to IEEE 754 double
-    (~15-17 decimal digits). For the purpose of comparing a
-    float-precision or original-precision driver against the quad ground
-    truth, that double truncation is harmless -- the float driver's
-    error floor (~2^-23 ~= 1e-7) is many orders of magnitude above
-    the double round-off (~2^-52 ~= 2e-16) introduced by the parse.
-    A future commit that wants to compare double-precision drivers
-    against quad with quad-level resolution would need to either
-    parse the JSON as decimal strings or have the harness write a
-    parallel quad-as-string output array; v1 punts on this because
-    no current analyst question requires the extra resolution.
+    The probe quad reference values (Kokkos only) are written as
+    `%.34Qg` tokens by the harness's quadmath_snprintf call but
+    parsed back through Python's `json.load`, which truncates them
+    to IEEE 754 double (~15-17 decimal digits). For the purpose of
+    comparing a float-precision or original-precision driver against
+    the quad ground truth, that double truncation is harmless --
+    the float driver's error floor (~2^-23 ~= 1e-7) is many orders
+    of magnitude above the double round-off (~2^-52 ~= 2e-16)
+    introduced by the parse. A future commit that wants to compare
+    double-precision drivers against quad with quad-level resolution
+    would need to either parse the JSON as decimal strings or have
+    the harness write a parallel quad-as-string output array; v1
+    punts on this because no current analyst question requires the
+    extra resolution.
 
-    `language_id` is accepted for symmetry and validated; this tool
-    itself is language-agnostic (it reads JSON files that obey the
-    harness contract regardless of source language).
+    `language_id` selects the profile whose `baseline_precision`
+    identifies the ground-truth cell. Cell layout on disk is the
+    same regardless of profile (the harness writes precision-named
+    template dirs), so the disk walk itself is language-agnostic;
+    only the choice of which cell is "the oracle" varies.
     """
-    _resolve_profile(language_id)
+    profile = _resolve_profile(language_id)
+    canonical_precision = profile.baseline_precision
     probe_dir = Path("baselines") / kernel_stem / "probe"
     evidence_path = probe_dir / "evidence.json"
 
-    # Probe the canonical-seed quad cell first so we can fail fast
+    # Probe the canonical-seed baseline cell first so we can fail fast
     # if the ground truth is missing.
     canonical_seed = _PROBE_SEEDS[0]
-    quad_canonical_payload, quad_canonical_status, quad_canonical_err = (
-        _load_probe_cell(kernel_stem, "quad", canonical_seed)
-    )
-    if quad_canonical_status != "ok":
+    (
+        baseline_canonical_payload,
+        baseline_canonical_status,
+        baseline_canonical_err,
+    ) = _load_probe_cell(kernel_stem, canonical_precision, canonical_seed)
+    if baseline_canonical_status != "ok":
         return _error(
-            f"Probe ground truth missing: the canonical quad cell at "
-            f"seed={canonical_seed} could not be loaded "
-            f"({quad_canonical_status}: {quad_canonical_err}). "
-            f"probe_compare cannot run without quad_seed{canonical_seed} "
-            f"as a comparison baseline; check that probe_step("
-            f"precision='quad', seed={canonical_seed}) ran and succeeded."
+            f"Probe ground truth missing: the canonical "
+            f"{canonical_precision} cell at seed={canonical_seed} "
+            f"could not be loaded "
+            f"({baseline_canonical_status}: {baseline_canonical_err}). "
+            f"probe_compare cannot run without "
+            f"{canonical_precision}_seed{canonical_seed} as a "
+            f"comparison baseline; check that probe_step("
+            f"precision={canonical_precision!r}, "
+            f"seed={canonical_seed}) ran and succeeded."
         )
 
     # Discover which precisions to walk by reading the harness-written
@@ -1843,16 +1868,17 @@ def probe_compare(kernel_stem: str, language_id: str) -> dict:
     if not precisions:
         return _error(
             f"No probe driver templates found under {template_root}. "
-            f"Did spawn_baseline_harness run with the v1 4-driver "
+            f"Did spawn_baseline_harness run with the v1 multi-driver "
             f"schema for this kernel_stem?"
         )
 
     # cells[<precision>_seed<seed>] -> {status, error?, stats?, shape_error?}
     cells: dict[str, dict] = {}
-    # per_seed_quad_payload[seed] caches the quad reference for that
-    # seed so the stats loop doesn't reload it once per non-quad cell.
-    per_seed_quad_payload: dict[int, dict] = {
-        canonical_seed: quad_canonical_payload
+    # per_seed_baseline_payload[seed] caches the baseline reference
+    # for that seed so the stats loop doesn't reload it once per
+    # non-baseline cell.
+    per_seed_baseline_payload: dict[int, dict] = {
+        canonical_seed: baseline_canonical_payload
     }
 
     for seed in _PROBE_SEEDS:
@@ -1865,36 +1891,37 @@ def probe_compare(kernel_stem: str, language_id: str) -> dict:
             if err is not None:
                 cell["error"] = err
             cells[cell_name] = cell
-            if precision == "quad" and status == "ok":
-                per_seed_quad_payload[seed] = payload
+            if precision == canonical_precision and status == "ok":
+                per_seed_baseline_payload[seed] = payload
 
-    # Stats walk: for each non-quad ok cell with an ok quad partner
-    # at the same seed, compute per-output stats vs quad.
+    # Stats walk: for each non-baseline ok cell with an ok baseline
+    # partner at the same seed, compute per-output stats vs baseline.
     for seed in _PROBE_SEEDS:
-        quad_partner = per_seed_quad_payload.get(seed)
+        baseline_partner = per_seed_baseline_payload.get(seed)
         for precision in precisions:
-            if precision == "quad":
+            if precision == canonical_precision:
                 continue
             cell_name = f"{precision}_seed{seed}"
             cell = cells[cell_name]
             if cell["status"] != "ok":
                 continue
-            if quad_partner is None:
-                # No quad partner at this seed -> record but don't
+            if baseline_partner is None:
+                # No baseline partner at this seed -> record but don't
                 # promote to a hard error. The analyst sees a
-                # "no_quad_partner" status and treats this cell as
+                # "no_baseline_partner" status and treats this cell as
                 # missing comparison data.
-                cell["status"] = "no_quad_partner"
+                cell["status"] = "no_baseline_partner"
                 cell["error"] = (
-                    f"quad_seed{seed} did not load; cannot compute "
-                    f"stats for {cell_name} without a ground truth."
+                    f"{canonical_precision}_seed{seed} did not load; "
+                    f"cannot compute stats for {cell_name} without a "
+                    f"ground truth."
                 )
                 continue
             payload, _, _ = _load_probe_cell(
                 kernel_stem, precision, seed
             )
-            stats, shape_err = _per_output_stats_vs_quad(
-                quad_partner, payload
+            stats, shape_err = _per_output_stats_vs_baseline(
+                baseline_partner, payload
             )
             if shape_err is not None:
                 cell["status"] = "shape_error"
@@ -1902,7 +1929,7 @@ def probe_compare(kernel_stem: str, language_id: str) -> dict:
                 continue
             cell["stats"] = stats
 
-    # Cross-seed deltas: for each non-quad precision, if both
+    # Cross-seed deltas: for each non-baseline precision, if both
     # precision_seed42 and precision_seed43 have stats, compute the
     # per-output delta of max_absrel. Stored at the top level under
     # `cross_seed_deltas[<precision>][<output_name>]`.
@@ -1910,7 +1937,7 @@ def probe_compare(kernel_stem: str, language_id: str) -> dict:
     if len(_PROBE_SEEDS) >= 2:
         s_a, s_b = _PROBE_SEEDS[0], _PROBE_SEEDS[1]
         for precision in precisions:
-            if precision == "quad":
+            if precision == canonical_precision:
                 continue
             cell_a = cells.get(f"{precision}_seed{s_a}", {})
             cell_b = cells.get(f"{precision}_seed{s_b}", {})
@@ -1929,6 +1956,7 @@ def probe_compare(kernel_stem: str, language_id: str) -> dict:
 
     evidence = {
         "kernel_stem": kernel_stem,
+        "baseline_precision": canonical_precision,
         "precisions": precisions,
         "seeds": list(_PROBE_SEEDS),
         "cells": cells,
@@ -1966,8 +1994,8 @@ def probe_compare(kernel_stem: str, language_id: str) -> dict:
     )
     if worst_cell:
         summary += (
-            f" Worst max_absrel vs quad: {worst_absrel:.3e} at "
-            f"{worst_cell}/{worst_output}."
+            f" Worst max_absrel vs {canonical_precision}: "
+            f"{worst_absrel:.3e} at {worst_cell}/{worst_output}."
         )
     return {
         "status": "ok",
