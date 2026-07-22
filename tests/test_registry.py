@@ -595,6 +595,85 @@ def test_baseline_harness_cuda_prompt_requires_alias_derived_staging_buffer():
     assert "const" in normalized
 
 
+def test_baseline_harness_cuda_prompt_documents_quad_driver_contract():
+    """Phase 1b: the CUDA baseline_harness prompt must document the `quad` driver as a plain-C++ host oracle — no <cuda_runtime.h>, no __global__, no <<<...>>> launch. The rewrite path swaps CUDA math intrinsics for their q-suffixed quadmath equivalents (sqrtq, sinq, expq, fmaq for a*b+c), and reductions use Kahan or pairwise summation to keep the oracle honest at N=1e6. The compile step auto-detects the quad driver by scanning for __float128 and switches from nvcc to g++ -lquadmath."""
+    prompt = AGENTS["baseline_harness_cuda"]["system_prompt"]
+    # Structural tokens: quad IS a first-class driver in the payload.
+    assert "drivers.{quad,double,float,original}" in prompt
+    # Host-only mandate: the prompt must be explicit that the quad
+    # driver does NOT use the CUDA runtime.
+    assert "does NOT `#include <cuda_runtime.h>`" in prompt
+    # The __global__ ban is documented but the exact leading-word
+    # varies across the prompt's clause; check for the token in a
+    # forbidding context by scanning near the __global__ mention.
+    assert "NOT use `__global__`" in prompt
+    # Quadmath transcendentals + fmaq mandate.
+    assert "sqrtq" in prompt
+    assert "sinq" in prompt
+    assert "cosq" in prompt
+    assert "expq" in prompt
+    assert "logq" in prompt
+    assert "fmaq" in prompt
+    # Kahan / pairwise summation mandate for reductions.
+    lower = prompt.lower()
+    assert "kahan" in lower or "pairwise" in lower
+    # The __float128 sniff mechanism must be documented so a model
+    # doesn't invent an alternate compile flag.
+    assert "__float128" in prompt
+    assert "-lquadmath" in prompt
+
+
+def test_baseline_harness_cuda_prompt_documents_rounding_mode_intrinsic_refusal():
+    """Phase 1b: the CUDA baseline_harness prompt must instruct the model to REFUSE to emit a quad oracle when the kernel uses CUDA rounding-mode intrinsics (__fadd_rd, __fmul_ru, etc.) that have no quadmath analogue. Silently stripping the intrinsic would produce an oracle that disagrees with the kernel by exactly the amount the intrinsic was controlling, contaminating every downstream verdict. The refusal is implemented by populating drivers.quad with a program that std::exit(2)s with an explanatory error, so the probe pipeline hard-errors at the quad_seed42 cell and stops before the analyst stage (the correct behavior — there is no ground-truth oracle available)."""
+    prompt = AGENTS["baseline_harness_cuda"]["system_prompt"]
+    # The refusal clause must be labeled clearly so the model can find it.
+    assert "REFUSAL CLAUSE" in prompt
+    # At least one canonical rounding-mode intrinsic must be named as
+    # an example — __fadd_rd is the most common trigger.
+    assert "__fadd_rd" in prompt
+    # The refusal MUST be conditional (kernel uses the intrinsic) and
+    # NOT a blanket "always refuse quad on CUDA" instruction.
+    # Normalize whitespace so line-wraps don't defeat the substring match.
+    normalized = " ".join(prompt.split())
+    assert "If the kernel under test uses CUDA rounding-mode intrinsics" in normalized
+    # The refusal mechanism (std::exit(2) so the probe cell hard-errors)
+    # must be documented so the model doesn't invent an alternate
+    # signal like silently emitting a double driver.
+    assert "std::exit(2)" in prompt
+    # The three CUDA drivers must still be emitted even on refusal —
+    # partial fanout is the whole reason the schema requires all four
+    # keys.
+    assert "The other three drivers (double, float, original)" in normalized
+
+
+def test_baseline_harness_cuda_prompt_forbids_gnu_quad_literal_suffix():
+    """Phase 1b: the CUDA quad driver prompt must forbid the GNU `q` / `Q` numeric-literal suffix (e.g. `0.0q`, `1.5Q`) because g++ rejects it under -std=c++17 without -fext-numeric-literals, which the compile step does NOT pass. This is the same trap the Kokkos quad prompt already documents — a model that has seen quadmath examples online will reach for the shorter suffix form and break the build. The mandated form is `__float128(0.0)` / `(__float128)1.5` / `static_cast<__float128>(0.0)`."""
+    prompt = AGENTS["baseline_harness_cuda"]["system_prompt"]
+    # The prohibition must be explicit — a "DO NOT use the ... suffix"
+    # sentence.
+    assert "DOES NOT use the GNU `q` / `Q` numeric-literal suffix" in prompt
+    # The mandated alternative form(s).
+    assert "__float128(0.0)" in prompt
+    assert "static_cast<__float128>" in prompt
+
+
+def test_baseline_harness_cuda_prompt_documents_quad_driver_uses_std_chrono_not_cudaevent():
+    """Phase 1b: the CUDA quad driver must NOT use cudaEvent for timing (there is no CUDA runtime linked into the quad driver — cudaEventCreate is a link error there). The prompt mandates std::chrono around the serial host loop as the quad driver's timing mechanism. The `timing` block shape stays identical to the other three drivers so the aggregator and measure_speedup don't need per-precision special-casing."""
+    prompt = AGENTS["baseline_harness_cuda"]["system_prompt"]
+    # The quad driver's timing path must be documented — std::chrono
+    # is the only sensible host-only option and the prompt must name it.
+    assert "std::chrono" in prompt
+    # The prompt must be explicit that the timing precision is not the
+    # driver precision (so a model doesn't reach for quadmath_snprintf
+    # on timing values). Normalize whitespace since the prompt line-
+    # wraps the sentence across "driver\n    precision".
+    normalized = " ".join(prompt.split())
+    assert (
+        "timing measurement precision is not the driver precision"
+        in normalized
+    )
+
+
 def test_baseline_harness_cuda_prompt_does_not_mention_kokkos():
     """The CUDA baseline_harness prompt must not mention Kokkos-specific tokens — those would mislead the model into emitting a hybrid driver. Cross-prompt isolation is the whole point of having one profile per language."""
     prompt = AGENTS["baseline_harness_cuda"]["system_prompt"]
