@@ -291,8 +291,9 @@ You also have two deterministic (non-LLM) tools:
     per-cell probe_step results landed under baselines/<kernel_stem>/
     probe/ into a single baselines/<kernel_stem>/probe/evidence.json
     document. Returns {status, stdout, stderr, artifacts}. Hard-errors
-    only when the canonical quad/seed=42 cell is missing (no ground
-    truth -> no comparison); any other missing or failed cell is
+    only when the canonical baseline_precision/seed=42 cell is
+    missing (quad_seed42 on Kokkos, double_seed42 on CUDA — no
+    ground truth -> no comparison); any other missing or failed cell is
     recorded with a non-ok status and skipped during the stats walk.
     The aggregated evidence is INFORMATIONAL: the orchestrator loop
     automatically attaches it to the next spawn_candidate_finder
@@ -1123,11 +1124,13 @@ ORCHESTRATOR_TOOLS = [
             "analyst reason from numerical evidence, not just from "
             "source); it is NOT a finish-gate precondition. Available "
             "only on language profiles whose probe_precisions is "
-            "non-empty (currently Kokkos: quad / double / float / "
-            "original). Call once per (precision, seed) cell after a "
-            "successful run_baseline_driver and before "
-            "spawn_candidate_finder; skip cleanly on profiles where "
-            "the BASELINE STEP block does not mention probe_step."
+            "non-empty (Kokkos: quad / double / float / original; "
+            "CUDA: double / float / original -- no quad on CUDA in "
+            "v1a because nvcc lacks device-side __float128). Call "
+            "once per (precision, seed) cell after a successful "
+            "run_baseline_driver and before spawn_candidate_finder; "
+            "skip cleanly on profiles where the BASELINE STEP block "
+            "does not mention probe_step."
         ),
         "input_schema": {
             "type": "object",
@@ -1145,7 +1148,9 @@ ORCHESTRATOR_TOOLS = [
                     "description": (
                         "Which probe driver template to use. Must be a "
                         "key the harness emitted under drivers.* "
-                        "(Kokkos: 'quad', 'double', 'float', 'original')."
+                        "(Kokkos: 'quad', 'double', 'float', "
+                        "'original'; CUDA: 'double', 'float', "
+                        "'original')."
                     ),
                 },
                 "seed": {
@@ -1166,20 +1171,23 @@ ORCHESTRATOR_TOOLS = [
             "Deterministic (non-LLM) tool. Aggregates the per-cell "
             "probe runs under baselines/<kernel_stem>/probe/ into a "
             "single evidence.json document for the analyst: per-output "
-            "stats for every non-quad cell against its same-seed quad "
-            "ground truth, plus cross-seed deltas so the analyst can "
-            "tell seed-correlated precision pain from seed-independent "
-            "pain. Cells whose probe_step failed (or was never run) "
-            "are recorded with a non-ok status and skipped in the "
-            "stats walk; the analyst sees exactly which signals are "
-            "real. Returns {status, stdout, stderr, artifacts}. "
-            "Hard-errors only when the canonical quad_seed42 cell is "
-            "missing — without it there is no ground truth. Call once "
-            "after all probe_step cells have been attempted, and "
-            "before spawn_candidate_finder. The evidence is "
-            "INFORMATIONAL: the finder and each variable_analyst see "
-            "it but are told to treat it as one input among several, "
-            "not as a verdict."
+            "stats for every non-baseline cell against its same-seed "
+            "baseline ground truth (quad on Kokkos, double on CUDA; "
+            "the profile's baseline_precision decides), plus cross-seed "
+            "deltas so the analyst can tell seed-correlated precision "
+            "pain from seed-independent pain. Cells whose probe_step "
+            "failed (or was never run) are recorded with a non-ok "
+            "status and skipped in the stats walk; the analyst sees "
+            "exactly which signals are real. Returns {status, stdout, "
+            "stderr, artifacts}. Hard-errors only when the canonical "
+            "baseline_precision cell at seed=42 is missing "
+            "(quad_seed42 on Kokkos, double_seed42 on CUDA) — without "
+            "it there is no ground truth. Call once after all "
+            "probe_step cells have been attempted, and before "
+            "spawn_candidate_finder. The evidence is INFORMATIONAL: "
+            "the finder and each variable_analyst see it but are "
+            "told to treat it as one input among several, not as a "
+            "verdict."
         ),
         "input_schema": {
             "type": "object",
@@ -1706,8 +1714,11 @@ def _execute_tool(
                         "precision probe on this kernel before invoking "
                         "you. The aggregated evidence below shows, for "
                         "each (precision, seed) cell that succeeded, "
-                        "per-output stats against the quad/seed=42 "
-                        "ground truth, plus cross-seed deltas. Use it "
+                        "per-output stats against the seed=42 "
+                        "ground-truth cell (the profile's "
+                        "baseline_precision — quad on Kokkos, double on "
+                        "CUDA; see the 'baseline_precision' key in the "
+                        "JSON below), plus cross-seed deltas. Use it "
                         "to inform your triage: cells that clear the "
                         "tolerance are evidence for downcast_candidate="
                         "TRUE on the variables that feed those outputs; "
@@ -1747,13 +1758,16 @@ def _execute_tool(
                         "precision probe on this kernel before invoking "
                         "you. The aggregated evidence below shows, for "
                         "each (precision, seed) cell that succeeded, "
-                        "per-output stats against the quad/seed=42 "
-                        "ground truth, plus cross-seed deltas. Treat it "
+                        "per-output stats against the seed=42 "
+                        "ground-truth cell (the profile's "
+                        "baseline_precision — quad on Kokkos, double on "
+                        "CUDA; see the 'baseline_precision' key in the "
+                        "JSON below), plus cross-seed deltas. Treat it "
                         "as ONE input among several: corroborate it "
                         "against the source you can see, do not let it "
                         "override your own analysis, and remember that "
-                        "a 'no_quad_partner' or 'missing' cell means no "
-                        "signal -- not 'precision is safe'.\n"
+                        "a 'no_baseline_partner' or 'missing' cell "
+                        "means no signal -- not 'precision is safe'.\n"
                         f"{evidence_text}"
                     )
         # Optional self-consistency ensemble: when AGENT_PRECISION_ANALYST_K
@@ -1824,14 +1838,17 @@ def _execute_tool(
                         "precision probe on this kernel before invoking "
                         "you. The aggregated evidence below shows, for "
                         "each (precision, seed) cell that succeeded, "
-                        "per-output stats against the quad/seed=42 "
-                        "ground truth, plus cross-seed deltas. Focus on "
+                        "per-output stats against the seed=42 "
+                        "ground-truth cell (the profile's "
+                        "baseline_precision — quad on Kokkos, double on "
+                        "CUDA; see the 'baseline_precision' key in the "
+                        "JSON below), plus cross-seed deltas. Focus on "
                         "the outputs your TARGET VARIABLE feeds; other "
                         "outputs are context. Treat this as ONE input "
                         "among several: corroborate it against the "
                         "source you can see, and remember that a "
-                        "'no_quad_partner' or 'missing' cell means no "
-                        "signal -- not 'precision is safe'.\n"
+                        "'no_baseline_partner' or 'missing' cell means "
+                        "no signal -- not 'precision is safe'.\n"
                         f"{evidence_text}"
                     )
         result = run_agent("variable_analyst", variable_task)
@@ -1885,8 +1902,11 @@ def _execute_tool(
                         "precision probe on this kernel before invoking "
                         "you. The aggregated evidence below shows, for "
                         "each (precision, seed) cell that succeeded, "
-                        "per-output stats against the quad/seed=42 "
-                        "ground truth, plus cross-seed deltas. Use it "
+                        "per-output stats against the seed=42 "
+                        "ground-truth cell (the profile's "
+                        "baseline_precision — quad on Kokkos, double on "
+                        "CUDA; see the 'baseline_precision' key in the "
+                        "JSON below), plus cross-seed deltas. Use it "
                         "to ground your headroom_argument in observed "
                         "numbers when it corroborates the per-variable "
                         "list. Missing / errored cells are no signal.\n"
@@ -2418,12 +2438,12 @@ def _format_baseline_block(
     else:
         test_config_block = ""
     # Probe matrix is silently omitted on profiles whose
-    # probe_precisions tuple is empty (every profile other than
-    # Kokkos in v1). The two probe tools still exist in
-    # ORCHESTRATOR_TOOLS, but without explicit instructions naming
-    # the matrix the orchestrator should not invoke them on a
-    # non-probing profile; if it does, probe_step's preflight
-    # ("template not found") cleanly errors.
+    # probe_precisions tuple is empty (HIP / SYCL / OMP-offload in
+    # v1a; Kokkos and CUDA both have non-empty probe_precisions). The
+    # two probe tools still exist in ORCHESTRATOR_TOOLS, but without
+    # explicit instructions naming the matrix the orchestrator should
+    # not invoke them on a non-probing profile; if it does,
+    # probe_step's preflight ("template not found") cleanly errors.
     if profile.probe_precisions and run_probe:
         from .tools import _PROBE_SEEDS  # local import: private helper
         precisions_list = ", ".join(repr(p) for p in profile.probe_precisions)
@@ -2433,6 +2453,7 @@ def _format_baseline_block(
             for seed in _PROBE_SEEDS
             for precision in profile.probe_precisions
         ]
+        ground_truth_cell = f"{profile.baseline_precision}_seed42"
         probe_block = (
             "PROBE STEP: this kernel's language profile carries a "
             f"non-empty probe_precisions tuple ({precisions_list}). "
@@ -2451,7 +2472,10 @@ def _format_baseline_block(
             "non-fatal: continue to the next cell. After every cell has "
             "been attempted, call probe_compare exactly once with the "
             "same KERNEL STEM. probe_compare hard-errors only if the "
-            "canonical quad/seed=42 cell is missing. The aggregated "
+            f"canonical {ground_truth_cell} cell is missing (this "
+            f"profile's baseline_precision is "
+            f"{profile.baseline_precision!r}, so that is the ground-"
+            "truth cell for the per-output stats). The aggregated "
             "evidence is attached to spawn_candidate_finder AND to "
             "each spawn_variable_analyst call automatically; you do "
             "not pass it through yourself. If run_baseline_driver "
