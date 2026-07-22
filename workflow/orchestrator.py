@@ -2785,10 +2785,11 @@ def run_orchestrator(
         router_call_started_at = time.time()
         response = client.messages.create(
             model=ORCHESTRATOR_MODEL,
-            max_tokens=8192,
+            max_tokens=32768,
             system=ORCHESTRATOR_SYSTEM_PROMPT,
             tools=ORCHESTRATOR_TOOLS,
             messages=messages,
+            timeout=600.0,
         )
         _write_llm_call_record({
             "timestamp": router_call_started_at,
@@ -2796,7 +2797,7 @@ def run_orchestrator(
             "caller": "orchestrator_router",
             "turn": turns,
             "model": ORCHESTRATOR_MODEL,
-            "max_tokens": 8192,
+            "max_tokens": 32768,
             "system": ORCHESTRATOR_SYSTEM_PROMPT,
             # Tool schemas are huge and static; log only names so the
             # record stays diagnostically useful without bloating the
