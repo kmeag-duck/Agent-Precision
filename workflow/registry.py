@@ -1122,6 +1122,273 @@ Return your result by calling the submit_result tool with verdict,
 per_variable, and concerns."""
 
 # ---------------------------------------------------------------------------
+# Kernel extractor (codebase discovery)
+# ---------------------------------------------------------------------------
+#
+# The kernel-extractor agent is the LLM-confirm half of the hybrid
+# kernel-discovery pipeline (the deterministic pre-filter lives in
+# workflow.discovery). Given ONE source file that the pre-filter already
+# flagged as kernel-shaped, it identifies the numerical compute kernel
+# function(s) worth precision analysis, names each, and reports its line
+# range plus two triage flags (floating_point, self_contained). It never
+# rewrites, slices, or invents code — discovery is read-only. Its output
+# feeds the `workflow/discover.py` CLI's selection table and (optionally)
+# a JSON manifest a future extraction/rewrite step can consume.
+
+KERNEL_EXTRACTOR_OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "kernels": {
+            "type": "array",
+            "description": (
+                "One entry per numerical compute kernel function found in "
+                "this file that is worth precision analysis. Empty array "
+                "if the file contains no such kernel (a false positive "
+                "from the deterministic marker scan). Do not invent "
+                "functions; only report functions actually present in the "
+                "source."
+            ),
+            "items": {
+                "type": "object",
+                "properties": {
+                    "function_name": {
+                        "type": "string",
+                        "description": (
+                            "The kernel function's name as it appears in "
+                            "the source. For a Kokkos parallel dispatch, "
+                            "prefer the enclosing C++ function that owns "
+                            "the parallel_for/reduce (the thing a caller "
+                            "invokes), not the lambda. If the dispatch has "
+                            "a string label, you may note it in rationale, "
+                            "but function_name must be a real identifier."
+                        ),
+                    },
+                    "language": {
+                        "type": "string",
+                        "description": (
+                            "The kernel's language id, one of: kokkos, "
+                            "cuda, hip, sycl, omp_offload. Use the "
+                            "structural evidence in the file (includes, "
+                            "namespaces, launch syntax), not the file "
+                            "extension alone."
+                        ),
+                    },
+                    "start_line": {
+                        "type": "integer",
+                        "description": (
+                            "1-based line number of the first line of the "
+                            "kernel function (its signature/return type), "
+                            "as counted in the file exactly as given."
+                        ),
+                    },
+                    "end_line": {
+                        "type": "integer",
+                        "description": (
+                            "1-based line number of the last line of the "
+                            "kernel function (its closing brace). Must be "
+                            ">= start_line."
+                        ),
+                    },
+                    "floating_point": {
+                        "type": "boolean",
+                        "description": (
+                            "True iff the kernel operates on floating-point "
+                            "data (float/double/long double or Views/arrays "
+                            "thereof). Integer-only or pointer-shuffling "
+                            "kernels are false — they are not precision-"
+                            "analysis targets."
+                        ),
+                    },
+                    "self_contained": {
+                        "type": "boolean",
+                        "description": (
+                            "True iff the kernel could plausibly be sliced "
+                            "into a standalone compilable driver with fixed "
+                            "inputs WITHOUT resolving heavy dependencies. "
+                            "Set FALSE for kernels that rely on "
+                            "project-specific types not defined in this "
+                            "file, or need external state to make sense. "
+                            "IMPORTANT: being a function/class template is "
+                            "NOT by itself a reason to set this false — "
+                            "report the template parameters in "
+                            "template_params instead. A kernel that is "
+                            "templated but whose types are otherwise all "
+                            "defined in-file (or are standard scalars / "
+                            "Kokkos Views) should be self_contained=true "
+                            "with a populated template_params; only a "
+                            "kernel buried in project-specific types is "
+                            "self_contained=false. This flag is the "
+                            "primary triage signal for which kernels a "
+                            "later extraction step can actually handle."
+                        ),
+                    },
+                    "template_params": {
+                        "type": "array",
+                        "description": (
+                            "The template parameters of the kernel "
+                            "function (or its enclosing class template, if "
+                            "the kernel is a member). EMPTY ARRAY if the "
+                            "kernel is not templated — always include the "
+                            "field, never omit it. This is INFORMATIONAL: "
+                            "it tells a human operator what instantiation "
+                            "would be needed to compile the kernel; the "
+                            "workflow does not act on it automatically. "
+                            "Each `suggested` value is your best-guess "
+                            "concrete instantiation, a hint the operator "
+                            "owns — not a decision and not code you "
+                            "generate."
+                        ),
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": {
+                                    "type": "string",
+                                    "description": (
+                                        "The template parameter identifier "
+                                        "as written (e.g. 'T', 'Scalar', "
+                                        "'ExecSpace', 'N')."
+                                    ),
+                                },
+                                "kind": {
+                                    "type": "string",
+                                    "enum": [
+                                        "type",
+                                        "exec_space",
+                                        "non_type",
+                                        "unknown",
+                                    ],
+                                    "description": (
+                                        "Classification of the parameter: "
+                                        "'type' for a generic value/element "
+                                        "type, 'exec_space' for a Kokkos "
+                                        "execution/memory space or similar "
+                                        "backend tag, 'non_type' for a "
+                                        "non-type template parameter (e.g. "
+                                        "an int size/rank), 'unknown' when "
+                                        "you cannot tell."
+                                    ),
+                                },
+                                "suggested": {
+                                    "type": "string",
+                                    "description": (
+                                        "Best-guess concrete instantiation "
+                                        "that would make the kernel "
+                                        "compilable (e.g. 'double', "
+                                        "'Kokkos::Serial', '128'), or empty "
+                                        "string if you cannot suggest one. "
+                                        "A hint for the operator, not a "
+                                        "commitment."
+                                    ),
+                                },
+                            },
+                            "required": ["name", "kind", "suggested"],
+                        },
+                    },
+                    "rationale": {
+                        "type": "string",
+                        "description": (
+                            "One or two sentences: what the kernel "
+                            "computes and why you flagged it (or, for a "
+                            "false positive, why the marker matched but "
+                            "this is not a real kernel). Ground it in the "
+                            "source."
+                        ),
+                    },
+                },
+                "required": [
+                    "function_name",
+                    "language",
+                    "start_line",
+                    "end_line",
+                    "floating_point",
+                    "self_contained",
+                    "template_params",
+                    "rationale",
+                ],
+            },
+        },
+    },
+    "required": ["kernels"],
+}
+
+KERNEL_EXTRACTOR_SYSTEM_PROMPT = """You are the kernel-extractor agent \
+for a mixed-precision analysis pipeline. A cheap deterministic scan has \
+already flagged this source file as containing kernel-shaped code; your \
+job is to CONFIRM and NAME the real numerical compute kernel(s) in it, \
+or report that there are none (the scan produced a false positive).
+
+You will be given one source file's full text, with 1-based line \
+numbers to help you report accurate ranges. You will also be told the \
+scan's coarse language guess and which markers matched.
+
+Your job is IDENTIFICATION ONLY. You do not rewrite, slice, refactor, \
+compile, or invent code. You do not analyze precision. You report facts \
+about what kernels exist.
+
+For every numerical compute kernel function in the file, emit one entry:
+
+  { function_name, language, start_line, end_line,
+    floating_point, self_contained, rationale }
+
+Rules:
+
+- A "kernel" is a function that performs numerical computation over \
+  array/View data, typically via a parallel dispatch (Kokkos \
+  parallel_for/reduce/scan, a CUDA/HIP __global__ function, a SYCL \
+  parallel_for, an OpenMP target region) or a tight compute loop that \
+  such a dispatch calls. Report the enclosing named function a caller \
+  would invoke, not the anonymous lambda body.
+
+- COVERAGE: a single file may contain several kernels. Report all of \
+  them. But do NOT report utility functions, I/O helpers, constructors, \
+  getters, or setup code as kernels.
+
+- FALSE POSITIVES: the deterministic scan matches substrings, so a \
+  marker may appear in a comment, a string literal, or a non-kernel \
+  helper. If the file has no real numerical kernel, return an empty \
+  `kernels` array. Do not force a match.
+
+- floating_point: true only if the kernel actually operates on \
+  floating-point data. Integer-only kernels are out of scope for \
+  precision analysis; mark them false (and you may still list them so \
+  the operator sees them, with rationale noting they are integer-only).
+
+- self_contained: your best judgment of whether this kernel could be \
+  sliced into a standalone compilable driver without resolving heavy \
+  dependencies. Kernels depending on project-specific types not defined \
+  in this file, and kernels needing external state, are NOT \
+  self-contained. Being a template is NOT by itself disqualifying: a \
+  kernel templated over a scalar type and/or a Kokkos execution space, \
+  whose other types are standard or defined in-file, IS self-contained \
+  — report its template parameters in template_params. Reserve \
+  self_contained=false for kernels buried in project-specific types. \
+  This is the single most useful triage flag for the operator, so \
+  reason about it carefully in rationale, and say WHICH reason applies \
+  (templated-but-simple vs. buried-in-project-types).
+
+- template_params: report the template parameters of the kernel \
+  function (or its enclosing class template, if the kernel is a member \
+  of one). Return an EMPTY ARRAY for a non-templated kernel; never omit \
+  the field. For each parameter give { name, kind, suggested } where \
+  kind is one of type / exec_space / non_type / unknown, and suggested \
+  is your best-guess concrete instantiation (e.g. 'double', \
+  'Kokkos::Serial', '128') or empty string. This is INFORMATIONAL only: \
+  it tells the operator what instantiation a kernel would need. You do \
+  NOT generate the instantiation, do NOT rewrite the kernel, and the \
+  workflow does not act on `suggested` automatically — a human decides. \
+  Be aware that instantiating a template specializes the kernel, so \
+  any downstream precision result is conditional on that choice; your \
+  job is only to surface the parameters, not to pick them.
+
+- LINE RANGES must be accurate 1-based line numbers into the file as \
+  given, start_line <= end_line, spanning the whole function including \
+  its signature and closing brace.
+
+Return your result by calling the submit_result tool with the `kernels` \
+array (possibly empty)."""
+
+
+# ---------------------------------------------------------------------------
 # Baseline harness
 # ---------------------------------------------------------------------------
 #
@@ -1201,6 +1468,12 @@ AGENTS = {
     "verifier": {
         "system_prompt": VERIFIER_SYSTEM_PROMPT,
         "output_schema": VERIFIER_OUTPUT_SCHEMA,
+        "model": "claude-sonnet-4-6",
+        "supports_temperature": True,
+    },
+    "kernel_extractor": {
+        "system_prompt": KERNEL_EXTRACTOR_SYSTEM_PROMPT,
+        "output_schema": KERNEL_EXTRACTOR_OUTPUT_SCHEMA,
         "model": "claude-sonnet-4-6",
         "supports_temperature": True,
     },

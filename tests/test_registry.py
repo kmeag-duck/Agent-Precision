@@ -20,6 +20,7 @@ def test_known_agent_types():
         "analyst_finalizer",
         "rewriter",
         "verifier",
+        "kernel_extractor",
         "baseline_harness",
     }
     assert core_types.issubset(set(AGENTS))
