@@ -141,6 +141,35 @@ _LOWERABLE_KEEP_CARVEOUTS: frozenset[str] = frozenset({
     # in launch syntax. ~5865/1048576 mismatches empirically observed.
     # See baselines/saxpy/orchestrator_trace.jsonl.
     "test-kernels/cuda/lowerable/saxpy.cu",
+    # Phase 1b (2026-07-22): honest quad oracle exposed that
+    # sigmoid(x) with x ~ U(-10, 10) has float_seed42.max_absrel=0.9975
+    # vs quad — every input pushes exp(-x) through a region where fp32
+    # loses order-of-magnitude precision. The earlier Phase-1a smoke
+    # run's "safely lowerable" verdict compared float against a double
+    # baseline that gave 0 relative error, hiding the failure.
+    # See baselines/sigmoid/probe/evidence.json.
+    "test-kernels/cuda/lowerable/sigmoid.cu",
+})
+
+
+# Needs-precision-category kernels where a subset of variables is
+# nevertheless expected to downcast. Same carve-out philosophy as
+# _LOWERABLE_KEEP_CARVEOUTS: the directory category ("needs_precision"
+# = long-trajectory or accumulation-dominated) is correct for the
+# kernel's state carriers, but per-variable analysis shows that some
+# thread-local intermediates can safely downcast. Adding an entry here
+# is a deliberate empirical decision documented at the EXPECTED entry;
+# it does NOT change the kernel's directory category.
+_NEEDS_PRECISION_DOWNCAST_CARVEOUTS: frozenset[str] = frozenset({
+    # Phase 1b (2026-07-22): the two thread-local force-computation
+    # intermediates r2 = x^2 + y^2 and inv_r3 = 1/(r2*sqrt(r2)) are
+    # computed and consumed within a single kernel step; they are
+    # never accumulated across steps. Singleton + union downcast tests
+    # both passed; comparator passed at sig_figs=3 on 262144 outputs.
+    # State arrays (x/y/vx/vy) still expected "keep". See
+    # baselines/orbit_integrator/probe/evidence.json and the entry
+    # header comment.
+    "test-kernels/cuda/needs_precision/orbit_integrator.cu",
 })
 
 
@@ -181,7 +210,16 @@ def test_lowerable_entries_only_specify_downcast():
 
 
 def test_needs_precision_entries_only_specify_keep():
-    """Needs-precision category sanity check: no 'downcast' or 'emulate' expected."""
+    """Needs-precision category sanity check: no 'downcast' or 'emulate'
+    expected UNLESS the kernel is on the documented carve-out list.
+
+    Carve-outs exist for needs_precision kernels where some
+    thread-local intermediates can safely downcast even though the
+    kernel's state carriers require double. The carve-out list is
+    small and explicit on purpose (same philosophy as
+    _LOWERABLE_KEEP_CARVEOUTS): it forces a deliberate code change to
+    add one, rather than letting a typo silently weaken the invariant.
+    """
     for path, entry in EXPECTED.items():
         if entry.category != "needs_precision":
             continue
@@ -190,7 +228,19 @@ def test_needs_precision_entries_only_specify_keep():
             for name, action in entry.per_variable.items()
             if action != "keep"
         }
+        if path in _NEEDS_PRECISION_DOWNCAST_CARVEOUTS:
+            # Carved out: must have at least one non-keep verdict
+            # (otherwise the carve-out is stale and should be removed).
+            assert non_keep, (
+                f"{path}: listed in _NEEDS_PRECISION_DOWNCAST_CARVEOUTS "
+                f"but every per_variable verdict is 'keep'. Remove the "
+                f"carve-out."
+            )
+            continue
         assert not non_keep, (
             f"{path}: needs_precision kernels should expect 'keep' for "
-            f"every scored variable; found {non_keep}."
+            f"every scored variable; found {non_keep}. If this is a new "
+            f"empirical finding, add the kernel to "
+            f"_NEEDS_PRECISION_DOWNCAST_CARVEOUTS and document the "
+            f"evidence at the EXPECTED entry."
         )
