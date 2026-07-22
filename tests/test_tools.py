@@ -2131,6 +2131,107 @@ def test_compare_outputs_inf_rules(monkeypatch, tmp_path):
     assert failed_indices == [2, 3]
 
 
+def test_normalize_nonfinite_tokens_rewrites_lowercase_c_spellings():
+    """Lowercase `nan`/`inf`/`-inf`/`infinity` (as emitted by C `%.17g`) in JSON value position are rewritten to the `NaN`/`Infinity`/`-Infinity` spellings Python's json.loads accepts, with sign preserved."""
+    import math
+
+    raw = (
+        '{"outputs":{"a":[1.0, nan, inf, -inf, -nan, INFINITY, 2.5]}}'
+    )
+    parsed = json.loads(tools._normalize_nonfinite_tokens(raw))
+    vals = parsed["outputs"]["a"]
+    assert vals[0] == 1.0
+    assert math.isnan(vals[1])
+    assert math.isinf(vals[2]) and vals[2] > 0
+    assert math.isinf(vals[3]) and vals[3] < 0
+    assert math.isnan(vals[4])
+    assert math.isinf(vals[5]) and vals[5] > 0
+    assert vals[6] == 2.5
+
+
+def test_normalize_nonfinite_tokens_leaves_string_literals_untouched():
+    """The normalizer only touches tokens in JSON value position (after `:`, `,`, `[`), so string contents that merely contain the substrings `inf`/`nan` (e.g. `"inference"`, `"nanometers"`) are never corrupted."""
+    raw = (
+        '{"info":"the inference of nanometers","kernel":"infnan",'
+        '"outputs":{"a":[nan]}}'
+    )
+    parsed = json.loads(tools._normalize_nonfinite_tokens(raw))
+    assert parsed["info"] == "the inference of nanometers"
+    assert parsed["kernel"] == "infnan"
+    import math
+
+    assert math.isnan(parsed["outputs"]["a"][0])
+
+
+def test_loads_reference_text_parses_valid_json_without_normalizing(monkeypatch):
+    """A well-formed reference body parses on the first json.loads try WITHOUT invoking the O(len) _normalize_nonfinite_tokens regex — the fast path that keeps large all-finite reference.json loads cheap in the empirical per-variable pipeline. Crucially this holds even when metadata prose merely contains the substrings 'nan'/'inf' (e.g. 'dominant', 'inputs'), which are valid inside JSON strings."""
+    raw = (
+        '{"inputs":{"C_shape":"diagonal-dominant SPD"},'
+        '"outputs":{"a":[1.0, 2.5, -3.0, 4.25e10, 0.0]}}'
+    )
+    called = {"normalize": False}
+    orig = tools._normalize_nonfinite_tokens
+
+    def _spy(text):
+        called["normalize"] = True
+        return orig(text)
+
+    monkeypatch.setattr(tools, "_normalize_nonfinite_tokens", _spy)
+
+    parsed = tools._loads_reference_text(raw)
+    assert called["normalize"] is False  # first parse succeeded, no regex
+    assert parsed["outputs"]["a"][0] == 1.0
+    assert parsed["inputs"]["C_shape"] == "diagonal-dominant SPD"
+
+
+def test_loads_reference_text_normalizes_only_on_parse_failure(monkeypatch):
+    """When the body contains bare lowercase `nan`/`inf` (invalid JSON from an overflowing downcast), the first json.loads raises and _loads_reference_text falls back to _normalize_nonfinite_tokens then reparses into real float nan/inf."""
+    import math
+
+    raw = '{"outputs":{"a":[1.0, nan, inf, -inf]}}'
+    called = {"normalize": False}
+    orig = tools._normalize_nonfinite_tokens
+
+    def _spy(text):
+        called["normalize"] = True
+        return orig(text)
+
+    monkeypatch.setattr(tools, "_normalize_nonfinite_tokens", _spy)
+
+    parsed = tools._loads_reference_text(raw)
+    assert called["normalize"] is True  # fallback engaged
+    vals = parsed["outputs"]["a"]
+    assert vals[0] == 1.0
+    assert math.isnan(vals[1])
+    assert math.isinf(vals[2]) and vals[2] > 0
+    assert math.isinf(vals[3]) and vals[3] < 0
+
+
+def test_compare_outputs_lowercase_nan_reported_as_mismatch_not_infra_error(
+    monkeypatch, tmp_path
+):
+    """A driver whose downcast overflows writes bare lowercase `nan` (invalid JSON) — the tolerant loader now parses it as a real float nan so the comparator classifies it as a numerical mismatch (regression) instead of crashing with a JSON parse infrastructure error, which previously mis-demoted bad downcasts to 'keep' for the wrong reason."""
+    monkeypatch.chdir(tmp_path)
+    # Lowercase `nan` as %.17g actually emits — invalid JSON before the fix.
+    raw_base = '{"kernel":"k","seed":1,"inputs":{},"outputs":{"a":[1.0,2.0,3.0]}}'
+    raw_rewr = '{"kernel":"k","seed":1,"inputs":{},"outputs":{"a":[1.0,nan,3.0]}}'
+    baseline_dir = tmp_path / "baselines" / "lower"
+    (baseline_dir / "rewritten").mkdir(parents=True)
+    (baseline_dir / "reference.json").write_text(raw_base)
+    (baseline_dir / "rewritten" / "reference.json").write_text(raw_rewr)
+
+    result = compare_outputs("lower", _tolerance("sig_figs", 6), "kokkos")
+    # status='error' here means "numerical mismatch found" (a fail verdict),
+    # NOT an infrastructure/parse error — the comparison.json is written.
+    assert result["status"] == "error"
+    doc = json.loads(
+        (baseline_dir / "rewritten" / "comparison.json").read_text()
+    )
+    assert doc["total_compared"] == 3
+    # Only the nan pair (index 1) mismatches; the two finite pairs agree.
+    assert [m["index"] for m in doc["mismatches"]] == [1]
+
+
 def test_compare_outputs_truncates_mismatch_list_with_footer(
     monkeypatch, tmp_path
 ):

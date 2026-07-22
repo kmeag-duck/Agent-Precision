@@ -499,7 +499,7 @@ def _run_driver(driver_dir: Path, missing_binary_hint: str) -> dict:
 
     try:
         with reference_path.open() as fh:
-            json.load(fh)
+            _loads_reference_text(fh.read())
     except (OSError, json.JSONDecodeError) as exc:
         return {
             "status": "error",
@@ -767,6 +767,74 @@ def _resolve_profile(language_id: str) -> LanguageProfile:
 _MAX_REPORTED_MISMATCHES = 10
 
 
+# Non-finite tokens as emitted by C/C++ `%.17g` / `%.9g` (lowercase
+# `nan`, `inf`, `-inf`) are NOT valid JSON and are NOT the spellings
+# Python's json module accepts as its non-standard extension (`NaN`,
+# `Infinity`, `-Infinity`). A driver whose downcast induces overflow
+# therefore writes a reference.json that crashes json.load — surfacing
+# as an infrastructure error and causing the singleton/union precision
+# tests to conservatively demote the variable to 'keep' for the WRONG
+# reason (parse crash) rather than the right one (numerical regression).
+# The comparator already treats NaN as an always-mismatch and inf-vs-
+# finite as a fail (see _value_within_tolerance), so the correct
+# behavior is to LET these values through the loader as real float
+# nan/inf and let the comparator classify them. This regex rewrites the
+# lowercase C spellings to the capitalized spellings json.load accepts,
+# but ONLY in JSON value position (immediately after `:`, `,`, or `[`
+# with optional whitespace) so it can never corrupt a string literal.
+_NONFINITE_JSON_RE = re.compile(
+    r"(?P<lead>[:,\[]\s*)(?P<sign>-?)(?P<tok>nan|inf|infinity)\b",
+    re.IGNORECASE,
+)
+
+
+def _normalize_nonfinite_tokens(text: str) -> str:
+    """Rewrite lowercase C `nan`/`inf`/`-inf` tokens to JSON-loadable ones.
+
+    Only touches tokens in JSON value position so string contents are
+    never altered. `nan`/`-nan` -> `NaN`; `inf`/`infinity` -> `Infinity`
+    (sign preserved). Python's json.load then parses these into
+    float('nan') / float('inf'), which the comparator handles.
+    """
+
+    def _repl(m: "re.Match[str]") -> str:
+        tok = m.group("tok").lower()
+        if tok == "nan":
+            return f"{m.group('lead')}NaN"
+        # inf / infinity, sign preserved
+        return f"{m.group('lead')}{m.group('sign')}Infinity"
+
+    return _NONFINITE_JSON_RE.sub(_repl, text)
+
+
+def _loads_reference_text(text: str) -> object:
+    """json.loads a reference-file body, tolerating lowercase non-finites.
+
+    Strategy is parse-first, normalize-on-failure. Python's json.loads
+    already accepts the capitalized non-finite spellings `NaN` / `Infinity`
+    / `-Infinity` as an extension, so a well-formed reference — the
+    overwhelmingly common case, including one whose metadata prose merely
+    *contains* the substrings "nan"/"inf" (e.g. the word "dominant" or
+    "inputs") — parses on the first try with zero extra work.
+
+    Only when that first parse raises json.JSONDecodeError do we invoke
+    _normalize_nonfinite_tokens (an O(len) regex rebuild) and retry, which
+    handles the genuine failure mode: a driver whose downcast overflowed
+    and emitted bare lowercase `nan`/`inf` from `%.17g`/`%.9g` (invalid
+    JSON). This avoids the ~16s regex pass on every load of a large
+    all-finite reference.json (30M-element outputs at N=1M), which the
+    empirical per-variable pipeline performs dozens of times per run.
+
+    If normalization still doesn't yield valid JSON, the second parse's
+    JSONDecodeError propagates unchanged so the real syntax error reaches
+    the caller's uniform error handling.
+    """
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return json.loads(_normalize_nonfinite_tokens(text))
+
+
 def _load_reference(path: Path) -> object:
     """Read and JSON-parse a reference.json at `path`.
 
@@ -775,9 +843,15 @@ def _load_reference(path: Path) -> object:
     expected to translate both into the uniform _error result; the
     helper deliberately does not catch them so the failure mode (which
     side was missing / unparseable) reaches the error message untouched.
+
+    Lowercase non-finite tokens (`nan`, `inf`, `-inf`) emitted by a
+    driver's `%.17g`/`%.9g` formatting are normalized to the capitalized
+    spellings Python's json accepts (see _normalize_nonfinite_tokens),
+    so an overflow-producing downcast reaches the comparator as a real
+    numerical regression instead of a JSON parse crash.
     """
     with path.open("r") as fp:
-        return json.load(fp)
+        return _loads_reference_text(fp.read())
 
 
 def _value_within_tolerance(
@@ -1606,7 +1680,7 @@ def _load_probe_cell(
         return (None, "missing", f"reference.json not found at {ref_path}.")
     try:
         with ref_path.open("r") as fp:
-            payload = json.load(fp)
+            payload = _loads_reference_text(fp.read())
     except json.JSONDecodeError as exc:
         return (None, "load_error", f"{ref_path} is not valid JSON: {exc}.")
     except OSError as exc:
