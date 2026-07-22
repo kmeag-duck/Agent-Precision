@@ -121,10 +121,25 @@ def _build_compile_command(driver_src: Path, driver_bin: Path) -> list[str]:
     a real use case demands it.
     """
     if QUAD_PROBE_TOKEN in driver_src.read_text():
+        # `-x c++` is required because the driver filename is `driver.cu`
+        # (a profile-wide constant used by the splice/compare/measure
+        # chain), and g++ refuses to compile a `.cu` suffix as C++ — it
+        # treats the source as a linker script and fails at link time
+        # (verified empirically: `g++ -O2 driver.cu -lquadmath -o driver`
+        # reports "file format not recognized; treating as linker
+        # script"). `-x c++` explicitly overrides the suffix-based
+        # language detection and must appear before the source file for
+        # g++'s left-to-right argument scan. Renaming to `driver.cpp`
+        # for the quad cell was rejected as an alternative because it
+        # would leak precision-awareness into `LanguageProfile
+        # .driver_filename` (currently one filename per language), and
+        # `-x c++` is a strict local fix.
         return [
             QUAD_HOST_CXX,
             CXX_STD,
             *OPT_FLAGS,
+            "-x",
+            "c++",
             str(driver_src),
             QUAD_LIB,
             "-o",
@@ -181,10 +196,15 @@ def _build_syntax_check_command(driver_src: Path) -> list[str] | None:
     if QUAD_PROBE_TOKEN in driver_src.read_text():
         if shutil.which(QUAD_HOST_CXX) is None:
             return None
+        # `-x c++` is required for the same reason as in the compile
+        # command: g++ would otherwise refuse the `.cu` suffix. See
+        # `_build_compile_command` for the full explanation.
         return [
             QUAD_HOST_CXX,
             CXX_STD,
             "-fsyntax-only",
+            "-x",
+            "c++",
             str(driver_src),
         ]
     if shutil.which(NVCC) is None:

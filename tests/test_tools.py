@@ -2566,11 +2566,20 @@ def test_compile_baseline_driver_cuda_quad_branch_switches_to_gpp_and_lquadmath(
     assert "-std=c++17" in cmd
     assert "-O2" in cmd
     assert cuda_profile.QUAD_LIB in cmd
+    # `-x c++` is required because g++ refuses the `.cu` suffix
+    # (verified empirically — see the comment in
+    # cuda._build_compile_command for the full failure mode). The two
+    # flags must appear as adjacent argv entries and must come BEFORE
+    # the source file so g++'s left-to-right argument scan picks up
+    # the language override before it encounters driver.cu.
+    x_idx = cmd.index("-x")
+    assert cmd[x_idx + 1] == "c++"
+    src_idx = cmd.index("baselines/quad_saxpy/driver.cu")
+    assert x_idx < src_idx, "-x c++ must precede the source file"
     # No nvcc-specific flags anywhere.
     assert not any(a.startswith("-arch") for a in cmd)
     # Link order: source must appear before -lquadmath so left-to-right
     # symbol resolution sees the __float128-referencing symbols first.
-    src_idx = cmd.index("baselines/quad_saxpy/driver.cu")
     lquad_idx = cmd.index(cuda_profile.QUAD_LIB)
     assert src_idx < lquad_idx
 
@@ -2663,6 +2672,13 @@ def test_cuda_build_syntax_check_command_quad_branch_uses_gpp_fsyntax_only(
     assert "-std=c++17" in cmd
     assert "-fsyntax-only" in cmd
     assert str(src) in cmd
+    # `-x c++` is required for the same reason as in the compile
+    # command: g++ refuses the `.cu` suffix (see
+    # cuda._build_compile_command for the full explanation). Must
+    # appear as adjacent argv entries BEFORE the source file.
+    x_idx = cmd.index("-x")
+    assert cmd[x_idx + 1] == "c++"
+    assert x_idx < cmd.index(str(src)), "-x c++ must precede the source file"
     # No nvcc, no -arch, no -lquadmath, no -O2.
     assert NVCC not in cmd
     assert not any(a.startswith("-arch") for a in cmd)
