@@ -79,6 +79,44 @@ def _build_compile_command(driver_src: Path, driver_bin: Path) -> list[str]:
     ]
 
 
+def _build_syntax_check_command(driver_src: Path) -> list[str] | None:
+    """Assemble the nvcc argv list for a pre-write CUDA driver check.
+
+    Returns None when nvcc is not on PATH — the harness-validation gate
+    then skips silently rather than failing every run on a host without
+    a CUDA toolchain (validation is a quality improvement, not a hard
+    requirement, exactly as for the Kokkos gate).
+
+    nvcc has no true parse-only mode: it rejects `-fsyntax-only`
+    (verified empirically — `nvcc fatal: Unknown option '-fsyntax-only'`).
+    The closest it offers is `-c -o /dev/null`, which compiles both the
+    host and device sides to an object but never links (no CUDA runtime
+    libraries, no GPU required beyond nvcc itself) and never writes an
+    artifact. That is a strict subset of the real compile flags
+    (`_build_compile_command`): same `-std`, `-O2`, and `-arch`, but the
+    final `-o <bin>` is replaced with `-c -o /dev/null`. It catches the
+    malformed-driver class the gate exists for (e.g. the inconsistent
+    alias-naming that motivated the Kokkos gate) at a fraction of a full
+    compile+link, before any file is written to disk.
+
+    The `-arch` value is read at call time (same contract as
+    `_build_compile_command`) so a monkeypatched env is honored.
+    """
+    if shutil.which(NVCC) is None:
+        return None
+    arch = os.environ.get(ARCH_ENV, DEFAULT_ARCH)
+    return [
+        NVCC,
+        CXX_STD,
+        *OPT_FLAGS,
+        f"-arch={arch}",
+        "-c",
+        str(driver_src),
+        "-o",
+        os.devnull,
+    ]
+
+
 def _preflight() -> dict | None:
     """Verify nvcc is reachable before invoking the compiler.
 
@@ -416,6 +454,7 @@ CUDA_PROFILE = LanguageProfile(
     baseline_harness_system_prompt=BASELINE_HARNESS_SYSTEM_PROMPT,
     baseline_harness_output_schema=BASELINE_HARNESS_OUTPUT_SCHEMA,
     build_compile_command=_build_compile_command,
+    build_syntax_check_command=_build_syntax_check_command,
     preflight=_preflight,
     detect_from_source=_detect_from_source,
 )

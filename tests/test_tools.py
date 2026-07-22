@@ -2424,6 +2424,52 @@ def test_compile_baseline_driver_cuda_result_keys_are_stable(
     assert set(compile_baseline_driver("x", "cuda").keys()) == expected_keys
 
 
+def test_cuda_build_syntax_check_command_shape(monkeypatch, tmp_path):
+    """The CUDA syntax-check command is a strict subset of the compile command: nvcc -std=c++17 -O2 -arch=<arch> -c <src> -o /dev/null (compile-to-object, no link, no artifact). nvcc has no -fsyntax-only, so -c -o os.devnull is the parse+typecheck-without-link surrogate."""
+    monkeypatch.delenv(CUDA_ARCH_ENV, raising=False)
+    monkeypatch.setattr(cuda_profile.shutil, "which", lambda name: f"/usr/bin/{name}")
+    src = tmp_path / "driver.cu"
+    cmd = cuda_profile._build_syntax_check_command(src)
+    assert cmd is not None
+    assert cmd[0] == NVCC
+    assert "-std=c++17" in cmd
+    assert "-O2" in cmd
+    assert f"-arch={CUDA_DEFAULT_ARCH}" in cmd
+    assert "-c" in cmd
+    assert str(src) in cmd
+    # No link: the object goes to the null device, and no final -o <bin>.
+    assert os.devnull in cmd
+    # Strict subset: no Kokkos flags, no -l<lib>, no -L.
+    assert not any(a.startswith("-l") for a in cmd)
+    assert not any(a.startswith("-L") for a in cmd)
+
+
+def test_cuda_build_syntax_check_command_honors_arch_env(monkeypatch, tmp_path):
+    """AGENT_PRECISION_CUDA_ARCH is read at call time by the syntax-check builder, same contract as the compile builder."""
+    monkeypatch.setenv(CUDA_ARCH_ENV, "sm_75")
+    monkeypatch.setattr(cuda_profile.shutil, "which", lambda name: f"/usr/bin/{name}")
+    cmd = cuda_profile._build_syntax_check_command(tmp_path / "driver.cu")
+    assert cmd is not None
+    assert "-arch=sm_75" in cmd
+    assert f"-arch={CUDA_DEFAULT_ARCH}" not in cmd
+
+
+def test_cuda_build_syntax_check_command_none_when_nvcc_missing(
+    monkeypatch, tmp_path
+):
+    """When nvcc is not on PATH, the syntax-check builder returns None so the gate skips silently — validation is a quality improvement, not a hard prerequisite (same idiom as the Kokkos gate skipping on unset AGENT_PRECISION_KOKKOS_ROOT)."""
+    monkeypatch.setattr(cuda_profile.shutil, "which", lambda name: None)
+    assert cuda_profile._build_syntax_check_command(tmp_path / "driver.cu") is None
+
+
+def test_cuda_profile_wires_syntax_check_builder():
+    """CUDA_PROFILE.build_syntax_check_command is the module's _build_syntax_check_command (not the base-class default that returns None), so the pre-write harness gate is active for CUDA."""
+    assert (
+        cuda_profile.CUDA_PROFILE.build_syntax_check_command
+        is cuda_profile._build_syntax_check_command
+    )
+
+
 def test_splice_rewritten_kernel_cuda_reads_and_writes_dot_cu(
     monkeypatch, tmp_path
 ):
