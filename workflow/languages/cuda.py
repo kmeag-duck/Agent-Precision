@@ -58,15 +58,78 @@ NVCC = "nvcc"
 CXX_STD = "-std=c++17"
 OPT_FLAGS = ("-O2",)
 
+# Phase 1b: detection token for the CUDA quad-precision probe path.
+# nvcc has no `__float128` support on either the host or device side
+# (verified empirically), so a quad oracle for CUDA cannot be a real
+# GPU driver. The baseline_harness therefore emits the quad driver as
+# plain C++ (no `<cuda_runtime.h>`, no `__global__`, no `<<<...>>>`
+# launch syntax) that reproduces the kernel on the host in
+# `__float128` via <quadmath.h>. We detect that shape by scanning the
+# driver source for `__float128` — a GCC-specific extension keyword
+# that is exceedingly unlikely to appear in a real CUDA driver
+# (`nvcc` would reject it), so a false positive is essentially
+# impossible in practice. When the token is found,
+# `_build_compile_command` switches from `nvcc` to plain `g++` (host-
+# only) and appends `-lquadmath` — the same libquadmath link the
+# Kokkos profile uses for its own quad driver. The two profiles
+# deliberately share the token / lib names so the mechanism reads
+# uniformly across the codebase.
+QUAD_PROBE_TOKEN = "__float128"
+QUAD_LIB = "-lquadmath"
+
+# g++ command used for the CUDA quad driver (host-only compile).
+# Deliberately mirrors the Kokkos g++ line (same std, same -O2) so
+# both profiles' quad drivers behave the same numerically — the
+# quadmath transcendentals are what actually drive the accuracy, not
+# any -O flag difference. `-fopenmp` is deliberately omitted here
+# (the CUDA quad driver is a serial host loop; nothing needs OpenMP)
+# where the Kokkos quad line includes it because the surrounding
+# Kokkos-shaped driver expects it.
+QUAD_HOST_CXX = "g++"
+
 
 def _build_compile_command(driver_src: Path, driver_bin: Path) -> list[str]:
-    """Assemble the nvcc argv list for a CUDA driver compile.
+    """Assemble the compile argv list for a CUDA driver compile.
 
-    Reads AGENT_PRECISION_CUDA_ARCH at call time (not import time) so a
-    test that monkeypatches the env affects every subsequent compile in
-    the same process. Assumes preflight has already verified nvcc is on
-    PATH.
+    Two paths, selected by sniffing the driver source:
+
+      * If the source contains `__float128` (`QUAD_PROBE_TOKEN`), this
+        is the Phase 1b host-side quad oracle: compile with plain g++
+        and append `-lquadmath`. No nvcc, no `-arch`, no GPU required
+        at build or run time. Symmetric with the Kokkos quad path,
+        which also switches to a quadmath link when it sees the token.
+
+      * Otherwise, this is a real CUDA driver: compile with nvcc,
+        honoring AGENT_PRECISION_CUDA_ARCH (defaulting to sm_89).
+        The arch env var is read at call time (not import time) so a
+        test that monkeypatches the env affects every subsequent
+        compile in the same process.
+
+    The sniff is a substring match on the source file's text (same
+    idiom as `workflow.languages.kokkos._build_compile_command`).
+    `driver_src` is guaranteed to exist by this point (`_compile_driver`
+    checks it above us); a read failure here would surface as a
+    FileNotFoundError, same as it would from the subprocess attempt
+    that follows.
+
+    Assumes preflight has already verified nvcc is on PATH. The quad
+    path does NOT require nvcc — a host without nvcc can still compile
+    the quad driver — but the preflight fails uniformly for all
+    precisions, so a nvcc-less host cannot reach this compile at all
+    today. If we later want to permit "quad-only on a nvcc-less host",
+    the preflight would need to become precision-aware; deferred until
+    a real use case demands it.
     """
+    if QUAD_PROBE_TOKEN in driver_src.read_text():
+        return [
+            QUAD_HOST_CXX,
+            CXX_STD,
+            *OPT_FLAGS,
+            str(driver_src),
+            QUAD_LIB,
+            "-o",
+            str(driver_bin),
+        ]
     arch = os.environ.get(ARCH_ENV, DEFAULT_ARCH)
     return [
         NVCC,
@@ -80,28 +143,50 @@ def _build_compile_command(driver_src: Path, driver_bin: Path) -> list[str]:
 
 
 def _build_syntax_check_command(driver_src: Path) -> list[str] | None:
-    """Assemble the nvcc argv list for a pre-write CUDA driver check.
+    """Assemble the argv list for a pre-write CUDA driver check.
 
-    Returns None when nvcc is not on PATH — the harness-validation gate
-    then skips silently rather than failing every run on a host without
-    a CUDA toolchain (validation is a quality improvement, not a hard
-    requirement, exactly as for the Kokkos gate).
+    Two paths, selected by the same `__float128` sniff as
+    `_build_compile_command`:
 
-    nvcc has no true parse-only mode: it rejects `-fsyntax-only`
-    (verified empirically — `nvcc fatal: Unknown option '-fsyntax-only'`).
-    The closest it offers is `-c -o /dev/null`, which compiles both the
-    host and device sides to an object but never links (no CUDA runtime
-    libraries, no GPU required beyond nvcc itself) and never writes an
-    artifact. That is a strict subset of the real compile flags
-    (`_build_compile_command`): same `-std`, `-O2`, and `-arch`, but the
-    final `-o <bin>` is replaced with `-c -o /dev/null`. It catches the
-    malformed-driver class the gate exists for (e.g. the inconsistent
-    alias-naming that motivated the Kokkos gate) at a fraction of a full
-    compile+link, before any file is written to disk.
+      * If the source contains `__float128` (Phase 1b host-side quad
+        oracle), return a `g++ -fsyntax-only` line. g++ has a true
+        parse-only mode, so this is a clean strict subset of the real
+        quad compile: same `-std=c++17`, no `-lquadmath` (link is not
+        exercised in a syntax check; the `__float128` type is a GCC
+        built-in with no header dependency, same rationale as the
+        Kokkos quad path). Returns None if g++ is not on PATH.
+
+      * Otherwise, return the nvcc surrogate. Returns None when nvcc
+        is not on PATH — the harness-validation gate then skips
+        silently rather than failing every run on a host without a
+        CUDA toolchain (validation is a quality improvement, not a
+        hard requirement, exactly as for the Kokkos gate).
+
+        nvcc has no true parse-only mode: it rejects `-fsyntax-only`
+        (verified empirically — `nvcc fatal: Unknown option
+        '-fsyntax-only'`). The closest it offers is `-c -o /dev/null`,
+        which compiles both the host and device sides to an object but
+        never links (no CUDA runtime libraries, no GPU required beyond
+        nvcc itself) and never writes an artifact. That is a strict
+        subset of the real compile flags (`_build_compile_command`):
+        same `-std`, `-O2`, and `-arch`, but the final `-o <bin>` is
+        replaced with `-c -o /dev/null`. It catches the malformed-
+        driver class the gate exists for (e.g. the inconsistent alias-
+        naming that motivated the Kokkos gate) at a fraction of a full
+        compile+link, before any file is written to disk.
 
     The `-arch` value is read at call time (same contract as
     `_build_compile_command`) so a monkeypatched env is honored.
     """
+    if QUAD_PROBE_TOKEN in driver_src.read_text():
+        if shutil.which(QUAD_HOST_CXX) is None:
+            return None
+        return [
+            QUAD_HOST_CXX,
+            CXX_STD,
+            "-fsyntax-only",
+            str(driver_src),
+        ]
     if shutil.which(NVCC) is None:
         return None
     arch = os.environ.get(ARCH_ENV, DEFAULT_ARCH)
@@ -171,20 +256,47 @@ BASELINE_HARNESS_OUTPUT_SCHEMA = {
         "drivers": {
             "type": "object",
             "description": (
-                "Three self-contained .cu driver translation units, one per "
+                "Four self-contained .cu driver translation units, one per "
                 "probe precision. Each MUST inline the kernel source "
-                "verbatim between the KERNEL BEGIN/END sentinels, compile "
-                "with nvcc, and on execution write reference outputs to "
-                "./reference.json. All three share the same kernel body, "
-                "the same per-parameter <ParamName>Type alias NAMES, the "
-                "same RNG_SEED, and the same output-array names and "
-                "lengths; they differ only in the alias RHSes (which set "
-                "per-parameter storage precision), any host-side scratch "
-                "values that flow into the kernel, and the JSON floating-"
-                "point formatting. See the PER-PRECISION DRIVERS block in "
-                "the system prompt for the full contract."
+                "verbatim between the KERNEL BEGIN/END sentinels and on "
+                "execution write reference outputs to ./reference.json. "
+                "The `quad` driver is a plain-C++ host port that compiles "
+                "with g++ + libquadmath (nvcc has no __float128); the "
+                "other three compile with nvcc. All four share the same "
+                "kernel body, the same per-parameter <ParamName>Type "
+                "alias NAMES, the same RNG_SEED, and the same output-"
+                "array names and lengths; they differ in the alias RHSes "
+                "(which set per-parameter storage precision), any host-"
+                "side scratch values that flow into the kernel, the JSON "
+                "floating-point formatting, and (for `quad` only) the "
+                "compile model itself. See the PER-PRECISION DRIVERS "
+                "block in the system prompt for the full contract."
             ),
             "properties": {
+                "quad": {
+                    "type": "string",
+                    "description": (
+                        "Host-only quad-precision oracle. Does NOT use "
+                        "nvcc or the CUDA runtime: emit plain C++ that "
+                        "unrolls the kernel launch into a serial host "
+                        "`for` loop, uses `__float128` throughout via "
+                        "<quadmath.h>, and writes reference.json values "
+                        "via `quadmath_snprintf(buf, sizeof(buf), "
+                        "\"%.34Qg\", value)`. The compile step auto-"
+                        "detects the driver as a quad driver by scanning "
+                        "for the `__float128` token and switches from "
+                        "nvcc to `g++ -lquadmath`. Feeds the probe-"
+                        "evidence pipeline as the ground-truth oracle "
+                        "against which `double` and `float` are measured, "
+                        "and is promoted to `baselines/<stem>/reference"
+                        ".json` after `probe_compare` succeeds so the "
+                        "finish-gate comparator measures the rewritten "
+                        "kernel against true quad ground truth. See the "
+                        "`quad` bullet in PER-PRECISION DRIVERS below for "
+                        "the intrinsic-refusal clause and the required "
+                        "transcendental substitutions."
+                    ),
+                },
                 "double": {
                     "type": "string",
                     "description": (
@@ -220,7 +332,7 @@ BASELINE_HARNESS_OUTPUT_SCHEMA = {
                     ),
                 },
             },
-            "required": ["double", "float", "original"],
+            "required": ["quad", "double", "float", "original"],
         },
         "kernel_function_name": {
             "type": "string",
@@ -605,23 +717,29 @@ CUDA_PROFILE = LanguageProfile(
     build_syntax_check_command=_build_syntax_check_command,
     preflight=_preflight,
     detect_from_source=_detect_from_source,
-    # v1a probe pipeline for CUDA. Baseline is `double` (not `quad`
-    # like Kokkos) because nvcc has no `__float128` support and there
-    # is no comparably portable software-quad path on the device side.
-    # A host-side quad oracle port is Phase 1b (see AGENTS.md
-    # "Planned next steps"). Consequences of baseline_precision=
-    # "double" (documented in AGENTS.md):
-    #   * Oracle promotion is a no-op — the finish-gate comparator
-    #     measures rewritten output against the `original`-precision
-    #     `baselines/<stem>/reference.json`, not a promoted quad
-    #     reference. For typical `--sig-figs 6` runs on double
-    #     baselines this suffices (double has ~15-17 sig figs of
-    #     headroom over the tolerance).
+    # v1b probe pipeline for CUDA. Baseline is `quad` (matching
+    # Kokkos) via a host-only C++ + libquadmath oracle: nvcc has no
+    # `__float128` support on either the host or device side, so the
+    # quad driver cannot be a real CUDA program. The harness emits it
+    # as plain C++ that unrolls the kernel launch into a serial host
+    # `for` loop and swaps CUDA math intrinsics for their `q`-suffixed
+    # quadmath equivalents (sqrtq, sinq, expq, fmaq, ...); the compile
+    # step sniffs the driver source for `__float128` and switches from
+    # nvcc to `g++ -lquadmath`. The harness is instructed to REFUSE to
+    # emit a quad driver when the kernel uses rounding-mode intrinsics
+    # (__fadd_rd, __fmul_ru, etc.) because those have no quadmath
+    # analogue — see the `quad` bullet in the baseline_harness prompt.
+    # Consequences of baseline_precision="quad":
+    #   * Oracle promotion is active: after probe_compare succeeds,
+    #     baselines/<stem>/probe/quad_seed42/reference.json is copied
+    #     over baselines/<stem>/reference.json so the finish-gate
+    #     comparator measures the rewritten kernel against true quad
+    #     ground truth. Symmetric with Kokkos.
     #   * measure_speedup still takes the probe path
     #     (baselines/<stem>/probe/original_seed42/reference.json)
     #     since probe_precisions is non-empty; symmetric with Kokkos.
-    baseline_precision="double",
-    probe_precisions=("double", "float", "original"),
+    baseline_precision="quad",
+    probe_precisions=("quad", "double", "float", "original"),
 )
 
 
@@ -631,6 +749,9 @@ __all__ = [
     "NVCC",
     "CXX_STD",
     "OPT_FLAGS",
+    "QUAD_PROBE_TOKEN",
+    "QUAD_LIB",
+    "QUAD_HOST_CXX",
     "BASELINE_HARNESS_SYSTEM_PROMPT",
     "BASELINE_HARNESS_OUTPUT_SCHEMA",
     "CUDA_PROFILE",

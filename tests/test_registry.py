@@ -510,17 +510,14 @@ def test_baseline_harness_cuda_schema_required_fields():
     assert schema["properties"]["output_arrays"]["items"]["type"] == "string"
 
 
-def test_baseline_harness_cuda_schema_drivers_object_has_three_precision_keys():
-    """The CUDA `drivers` object requires exactly three precision keys — double, float, original — and each is a string (a full .cu translation unit). No `quad` key (Phase 1a has no quad oracle; deferred to Phase 1b's host-side quad port); the shape is otherwise structurally identical to the Kokkos 4-driver payload so orchestrator._execute_tool's multi-driver dispatch handles both uniformly."""
+def test_baseline_harness_cuda_schema_drivers_object_has_four_precision_keys():
+    """The CUDA `drivers` object requires exactly four precision keys — quad, double, float, original — and each is a string (a full .cu translation unit, or plain-C++ + libquadmath in the quad case). Phase 1b landed the host-only quad oracle; the shape is now structurally identical to the Kokkos 4-driver payload so orchestrator._execute_tool's multi-driver dispatch handles both uniformly. The `quad` driver is compiled with `g++ -lquadmath` rather than nvcc — the compile step auto-detects the switch by sniffing the driver source for `__float128`."""
     schema = AGENTS["baseline_harness_cuda"]["output_schema"]
     drivers = schema["properties"]["drivers"]
     assert drivers["type"] == "object"
-    assert set(drivers["required"]) == {"double", "float", "original"}
-    for precision in ("double", "float", "original"):
+    assert set(drivers["required"]) == {"quad", "double", "float", "original"}
+    for precision in ("quad", "double", "float", "original"):
         assert drivers["properties"][precision]["type"] == "string"
-    assert "quad" not in drivers["properties"], (
-        "Phase 1a CUDA has no quad oracle; quad is deferred to Phase 1b"
-    )
 
 
 def test_baseline_harness_cuda_prompt_mentions_cuda_runtime_and_global():

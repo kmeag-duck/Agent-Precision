@@ -128,10 +128,10 @@ def test_kokkos_profile_probe_precisions_v1_set():
     )
 
 
-def test_cuda_profile_probe_precisions_v1a_set():
-    """CUDA_PROFILE.probe_precisions == ('double', 'float', 'original') with baseline_precision='double'. Phase 1a extends the probe pipeline to CUDA without a quad oracle (nvcc has no __float128 device-side support; host-side quad oracle is deferred to Phase 1b). The 3-cell matrix measures float-vs-double drift and float-vs-original drift; the `original` cell doubles as the splice scaffold and the measure_speedup timing source, same as under Kokkos. Consequences of baseline_precision='double' (no quad oracle): oracle promotion is a no-op, and the finish-gate comparator measures rewritten output against the `original`-precision reference rather than a promoted higher-precision one."""
-    assert CUDA_PROFILE.probe_precisions == ("double", "float", "original")
-    assert CUDA_PROFILE.baseline_precision == "double"
+def test_cuda_profile_probe_precisions_v1b_set():
+    """CUDA_PROFILE.probe_precisions == ('quad', 'double', 'float', 'original') with baseline_precision='quad'. Phase 1b adds a host-only quad oracle (plain C++ + libquadmath; nvcc has no __float128 support so the quad driver deliberately does NOT use CUDA — it unrolls the kernel launch into a serial host `for` loop and swaps device math intrinsics for their `q`-suffixed quadmath equivalents). The compile step sniffs the driver source for `__float128` and switches from nvcc to `g++ -lquadmath`. Consequences of baseline_precision='quad': oracle promotion is now active — after probe_compare succeeds, quad_seed42/reference.json is copied over baselines/<stem>/reference.json so the finish-gate comparator measures rewritten output against true quad ground truth, symmetric with Kokkos."""
+    assert CUDA_PROFILE.probe_precisions == ("quad", "double", "float", "original")
+    assert CUDA_PROFILE.baseline_precision == "quad"
 
 
 def test_hip_sycl_omp_profiles_have_default_probe_fields():

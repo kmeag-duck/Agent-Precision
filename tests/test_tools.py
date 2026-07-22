@@ -2525,11 +2525,93 @@ def test_compile_baseline_driver_cuda_result_keys_are_stable(
     assert set(compile_baseline_driver("x", "cuda").keys()) == expected_keys
 
 
+def test_compile_baseline_driver_cuda_quad_branch_switches_to_gpp_and_lquadmath(
+    monkeypatch, tmp_path
+):
+    """Phase 1b: when the CUDA driver source contains `__float128` (the quad-oracle sniff token), compile_baseline_driver switches from nvcc to `g++ -std=c++17 -O2 <src> -lquadmath -o <bin>`. No `-arch` (host-only), no nvcc anywhere in the command. The tail order matters: `-lquadmath` must come AFTER the source file so g++'s left-to-right symbol resolution sees the `__float128`-referencing symbols in the .o before it scans `-lquadmath` (same idiom as the Kokkos quad path)."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv(CUDA_ARCH_ENV, raising=False)
+    # Quad-shaped body: any occurrence of the token triggers the sniff.
+    quad_body = (
+        "#include <quadmath.h>\n"
+        "#include <cstdio>\n"
+        "int main() {\n"
+        "  __float128 x = (__float128)1.0;\n"
+        "  return 0;\n"
+        "}\n"
+    )
+    _stage_cuda_driver(tmp_path, "quad_saxpy", body=quad_body)
+    monkeypatch.setattr(cuda_profile.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    captured = {}
+
+    class FakeProc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(cmd, capture_output, text, check):
+        captured["cmd"] = cmd
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = compile_baseline_driver("quad_saxpy", "cuda")
+
+    assert result["status"] == "ok"
+    assert result["artifacts"] == ["baselines/quad_saxpy/driver"]
+    cmd = captured["cmd"]
+    assert cmd[0] == cuda_profile.QUAD_HOST_CXX
+    assert cmd[0] != NVCC
+    assert "-std=c++17" in cmd
+    assert "-O2" in cmd
+    assert cuda_profile.QUAD_LIB in cmd
+    # No nvcc-specific flags anywhere.
+    assert not any(a.startswith("-arch") for a in cmd)
+    # Link order: source must appear before -lquadmath so left-to-right
+    # symbol resolution sees the __float128-referencing symbols first.
+    src_idx = cmd.index("baselines/quad_saxpy/driver.cu")
+    lquad_idx = cmd.index(cuda_profile.QUAD_LIB)
+    assert src_idx < lquad_idx
+
+
+def test_compile_baseline_driver_cuda_quad_branch_ignores_arch_env(
+    monkeypatch, tmp_path
+):
+    """Phase 1b: the quad-branch compile is host-only, so AGENT_PRECISION_CUDA_ARCH is irrelevant to it — even a set env var must not leak an `-arch=` flag into the g++ line (g++ would reject it with an 'unrecognized command-line option' warning)."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv(CUDA_ARCH_ENV, "sm_70")
+    quad_body = "#include <quadmath.h>\nint main(){ __float128 x = 1; return 0; }\n"
+    _stage_cuda_driver(tmp_path, "q", body=quad_body)
+    monkeypatch.setattr(cuda_profile.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    captured = {}
+
+    class FakeProc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(cmd, capture_output, text, check):
+        captured["cmd"] = cmd
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = compile_baseline_driver("q", "cuda")
+
+    assert result["status"] == "ok"
+    cmd = captured["cmd"]
+    assert cmd[0] == cuda_profile.QUAD_HOST_CXX
+    assert not any(a.startswith("-arch") for a in cmd)
+
+
 def test_cuda_build_syntax_check_command_shape(monkeypatch, tmp_path):
-    """The CUDA syntax-check command is a strict subset of the compile command: nvcc -std=c++17 -O2 -arch=<arch> -c <src> -o /dev/null (compile-to-object, no link, no artifact). nvcc has no -fsyntax-only, so -c -o os.devnull is the parse+typecheck-without-link surrogate."""
+    """The CUDA syntax-check command (nvcc branch — driver source has no __float128 token) is a strict subset of the nvcc compile command: nvcc -std=c++17 -O2 -arch=<arch> -c <src> -o /dev/null (compile-to-object, no link, no artifact). nvcc has no -fsyntax-only, so -c -o os.devnull is the parse+typecheck-without-link surrogate."""
     monkeypatch.delenv(CUDA_ARCH_ENV, raising=False)
     monkeypatch.setattr(cuda_profile.shutil, "which", lambda name: f"/usr/bin/{name}")
     src = tmp_path / "driver.cu"
+    src.write_text("__global__ void k() {}\n")
     cmd = cuda_profile._build_syntax_check_command(src)
     assert cmd is not None
     assert cmd[0] == NVCC
@@ -2546,10 +2628,12 @@ def test_cuda_build_syntax_check_command_shape(monkeypatch, tmp_path):
 
 
 def test_cuda_build_syntax_check_command_honors_arch_env(monkeypatch, tmp_path):
-    """AGENT_PRECISION_CUDA_ARCH is read at call time by the syntax-check builder, same contract as the compile builder."""
+    """AGENT_PRECISION_CUDA_ARCH is read at call time by the syntax-check builder (nvcc branch), same contract as the compile builder. The quad branch does NOT consult ARCH_ENV (it's a host-only g++ compile), so this test explicitly uses a non-quad driver source."""
     monkeypatch.setenv(CUDA_ARCH_ENV, "sm_75")
     monkeypatch.setattr(cuda_profile.shutil, "which", lambda name: f"/usr/bin/{name}")
-    cmd = cuda_profile._build_syntax_check_command(tmp_path / "driver.cu")
+    src = tmp_path / "driver.cu"
+    src.write_text("__global__ void k() {}\n")
+    cmd = cuda_profile._build_syntax_check_command(src)
     assert cmd is not None
     assert "-arch=sm_75" in cmd
     assert f"-arch={CUDA_DEFAULT_ARCH}" not in cmd
@@ -2558,9 +2642,42 @@ def test_cuda_build_syntax_check_command_honors_arch_env(monkeypatch, tmp_path):
 def test_cuda_build_syntax_check_command_none_when_nvcc_missing(
     monkeypatch, tmp_path
 ):
-    """When nvcc is not on PATH, the syntax-check builder returns None so the gate skips silently — validation is a quality improvement, not a hard prerequisite (same idiom as the Kokkos gate skipping on unset AGENT_PRECISION_KOKKOS_ROOT)."""
+    """When nvcc is not on PATH and the driver source is a non-quad nvcc driver, the syntax-check builder returns None so the gate skips silently — validation is a quality improvement, not a hard prerequisite (same idiom as the Kokkos gate skipping on unset AGENT_PRECISION_KOKKOS_ROOT). The quad branch is symmetric: it returns None when g++ is missing (separate test)."""
     monkeypatch.setattr(cuda_profile.shutil, "which", lambda name: None)
-    assert cuda_profile._build_syntax_check_command(tmp_path / "driver.cu") is None
+    src = tmp_path / "driver.cu"
+    src.write_text("__global__ void k() {}\n")
+    assert cuda_profile._build_syntax_check_command(src) is None
+
+
+def test_cuda_build_syntax_check_command_quad_branch_uses_gpp_fsyntax_only(
+    monkeypatch, tmp_path
+):
+    """Phase 1b: when the driver source contains `__float128`, the CUDA syntax-check builder switches to `g++ -std=c++17 -fsyntax-only <src>` — a real parse-only mode (g++ supports -fsyntax-only, unlike nvcc). No -O2 (irrelevant for parse), no -lquadmath (link is not exercised; the __float128 type is a GCC built-in with no header dependency, same rationale as the Kokkos quad path), no -arch (host-only compile)."""
+    monkeypatch.delenv(CUDA_ARCH_ENV, raising=False)
+    monkeypatch.setattr(cuda_profile.shutil, "which", lambda name: f"/usr/bin/{name}")
+    src = tmp_path / "driver.cu"
+    src.write_text("#include <quadmath.h>\nint main(){ __float128 x = 1; return 0; }\n")
+    cmd = cuda_profile._build_syntax_check_command(src)
+    assert cmd is not None
+    assert cmd[0] == cuda_profile.QUAD_HOST_CXX
+    assert "-std=c++17" in cmd
+    assert "-fsyntax-only" in cmd
+    assert str(src) in cmd
+    # No nvcc, no -arch, no -lquadmath, no -O2.
+    assert NVCC not in cmd
+    assert not any(a.startswith("-arch") for a in cmd)
+    assert cuda_profile.QUAD_LIB not in cmd
+    assert "-O2" not in cmd
+
+
+def test_cuda_build_syntax_check_command_quad_branch_none_when_gpp_missing(
+    monkeypatch, tmp_path
+):
+    """Phase 1b: when the driver source contains `__float128` but g++ is not on PATH, the syntax-check builder returns None so the gate skips silently — same idiom as the nvcc branch. Validation is a quality improvement, not a hard prerequisite."""
+    monkeypatch.setattr(cuda_profile.shutil, "which", lambda name: None)
+    src = tmp_path / "driver.cu"
+    src.write_text("__float128 x;\n")
+    assert cuda_profile._build_syntax_check_command(src) is None
 
 
 def test_cuda_profile_wires_syntax_check_builder():
@@ -3702,20 +3819,20 @@ def test_probe_compare_errors_when_quad_seed42_missing(monkeypatch, tmp_path):
     assert result["artifacts"] == []
 
 
-def test_probe_compare_errors_when_cuda_double_seed42_missing(
+def test_probe_compare_errors_when_cuda_quad_seed42_missing(
     monkeypatch, tmp_path
 ):
-    """probe_compare on CUDA hard-errors when the canonical baseline_precision cell (double_seed42) is missing -- the CUDA profile has baseline_precision='double' (no host-side quad oracle in v1a), so the ground-truth cell name and the error message must reflect that. Kokkos and CUDA share the same code path via LanguageProfile.baseline_precision; only the cell name changes."""
+    """probe_compare on CUDA hard-errors when the canonical baseline_precision cell (quad_seed42) is missing -- Phase 1b flipped CUDA's baseline_precision from 'double' to 'quad' (host-side quad oracle via g++ + libquadmath), so the ground-truth cell name matches Kokkos. Kokkos and CUDA now share the exact same code path AND the exact same ground-truth cell name via LanguageProfile.baseline_precision='quad'. This is the CUDA counterpart of test_probe_compare_errors_when_quad_seed42_missing (which tests the Kokkos path) -- both must hard-error identically on the same missing cell."""
     monkeypatch.chdir(tmp_path)
+    _stage_probe_template_dir(tmp_path, "k", "quad")
     _stage_probe_template_dir(tmp_path, "k", "double")
     _stage_probe_template_dir(tmp_path, "k", "float")
-    # Note: NO double_seed42 cell written.
+    # Note: NO quad_seed42 cell written.
 
     result = probe_compare("k", "cuda")
 
     assert result["status"] == "error"
-    assert "double_seed42" in result["stderr"]
-    assert "quad" not in result["stderr"].lower()  # not a Kokkos error message
+    assert "quad_seed42" in result["stderr"]
     assert "probe_step" in result["stderr"]
     assert result["artifacts"] == []
 
@@ -3994,16 +4111,23 @@ def test_probe_compare_summary_reports_worst_cell_and_output(
     assert "max_absrel" in result["stdout"]
 
 
-def test_probe_compare_cuda_writes_evidence_with_double_baseline(
+def test_probe_compare_cuda_writes_evidence_with_quad_baseline(
     monkeypatch, tmp_path
 ):
-    """probe_compare on CUDA uses double as the ground-truth baseline (no host-side quad oracle in v1a). The float_seed42 cell's stats are computed vs double_seed42, evidence.json['baseline_precision'] records the choice, and the summary line says 'vs double' not 'vs quad'. This is the counterpart to the Kokkos happy-path test above."""
+    """probe_compare on CUDA now uses quad as the ground-truth baseline (Phase 1b: host-side quad oracle via g++ + libquadmath, symmetric with Kokkos). The double_seed42 and float_seed42 cells' stats are computed vs quad_seed42, evidence.json['baseline_precision'] records 'quad', and the summary line says 'vs quad'. This exercises the 4-cell CUDA probe matrix end-to-end through probe_compare. NB: probe_compare is a language-agnostic file-shuffler — the fact that the CUDA quad reference was produced by a plain g++/quadmath compile rather than nvcc is invisible here; only the on-disk JSON matters."""
     monkeypatch.chdir(tmp_path)
+    _stage_probe_template_dir(tmp_path, "k", "quad")
     _stage_probe_template_dir(tmp_path, "k", "double")
     _stage_probe_template_dir(tmp_path, "k", "float")
     _stage_probe_template_dir(tmp_path, "k", "original")
 
-    # double ground truth, seed=42.
+    # quad ground truth, seed=42.
+    _stage_probe_cell_reference(
+        tmp_path, "k", "quad", 42,
+        _make_ref_payload("k", 42, {"y": [1.0, 2.0, 3.0]}),
+    )
+    # double cell, seed=42 exactly matches (double has enough precision
+    # to reproduce these small integer-valued outputs).
     _stage_probe_cell_reference(
         tmp_path, "k", "double", 42,
         _make_ref_payload("k", 42, {"y": [1.0, 2.0, 3.0]}),
@@ -4022,24 +4146,29 @@ def test_probe_compare_cuda_writes_evidence_with_double_baseline(
 
     result = probe_compare("k", "cuda")
     assert result["status"] == "ok"
-    # Summary says vs double, not vs quad.
-    assert "vs double" in result["stdout"]
-    assert "vs quad" not in result["stdout"]
+    # Summary says vs quad, matching Kokkos's summary now that CUDA has
+    # its own quad oracle.
+    assert "vs quad" in result["stdout"]
 
     evidence = json.loads(
         (tmp_path / "baselines" / "k" / "probe" / "evidence.json").read_text()
     )
     # Baseline precision is recorded verbatim.
-    assert evidence["baseline_precision"] == "double"
-    # No quad cells exist on CUDA.
-    assert set(evidence["precisions"]) == {"double", "float", "original"}
+    assert evidence["baseline_precision"] == "quad"
+    # All four CUDA probe cells appear in the matrix.
+    assert set(evidence["precisions"]) == {"quad", "double", "float", "original"}
 
-    # double_seed42 is the ground truth (no stats computed for itself).
+    # quad_seed42 is the ground truth (no stats computed for itself).
     cells = evidence["cells"]
-    assert cells["double_seed42"]["status"] == "ok"
-    assert "stats" not in cells["double_seed42"]
+    assert cells["quad_seed42"]["status"] == "ok"
+    assert "stats" not in cells["quad_seed42"]
 
-    # float_seed42 stats are vs the double baseline, not vs original.
+    # double_seed42 stats vs quad_seed42: exact match.
+    double_cell = cells["double_seed42"]
+    assert double_cell["status"] == "ok"
+    assert double_cell["stats"]["y"]["max_absrel"] == 0.0
+
+    # float_seed42 stats vs quad_seed42: ~1e-7.
     float_cell = cells["float_seed42"]
     assert float_cell["status"] == "ok"
     y_stats = float_cell["stats"]["y"]
@@ -4047,7 +4176,7 @@ def test_probe_compare_cuda_writes_evidence_with_double_baseline(
     assert y_stats["n_finite"] == 3
     assert 5e-8 < y_stats["max_absrel"] < 2e-7
 
-    # original_seed42 also gets stats vs double_seed42 (exact match).
+    # original_seed42 also gets stats vs quad_seed42 (exact match).
     original_cell = cells["original_seed42"]
     assert original_cell["status"] == "ok"
     assert original_cell["stats"]["y"]["max_absrel"] == 0.0
