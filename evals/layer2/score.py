@@ -92,11 +92,14 @@ class PerVariableScore:
     # observed_action='<missing>'), but also surfaced as a count so
     # callers can distinguish "wrong action" from "no action".
     missing_count: int = 0
-    # True iff no spawn_analyst call appears in the trace at all (the
-    # workflow died before reaching the analyst). When True, total
-    # equals len(expected.per_variable) and matched is 0; mismatches
-    # is left empty since we don't want to attribute K mismatches to
-    # an analyst that never ran.
+    # True iff no successful analyst-verdict call (spawn_analyst_finalizer
+    # since Step 5c, or the legacy spawn_analyst) appears in the trace
+    # (the workflow died before reaching the finalizer, or the
+    # finalizer itself errored — see _collect_analyst_results for the
+    # errored-finalizer no-fallback rule). When True, total equals
+    # len(expected.per_variable) and matched is 0; mismatches is left
+    # empty since we don't want to attribute K mismatches to an
+    # analyst that never ran.
     analyst_absent: bool = False
 
 
@@ -138,7 +141,8 @@ class KernelResult:
         aggregates.
 
       - `per_variable_best` is the analyst cycle (across all
-        successful spawn_analyst calls in the trace) with the highest
+        successful analyst-verdict calls in the trace — finalizer
+        preferred, spawn_analyst as legacy fallback) with the highest
         match count, with ties broken by earliest cycle. This is a
         diagnostic that surfaces "the analyst got the right answer at
         some point but the workflow regressed on retry" — a real
@@ -155,9 +159,10 @@ class KernelResult:
     per_variable: PerVariableScore
     per_variable_best: PerVariableScore
     outcome: OutcomeScore
-    # Raw analyst verdict (the .result dict from the last spawn_analyst
-    # exec_result) for diagnostic dumping. Empty dict if no analyst
-    # call was found.
+    # Raw analyst verdict (the .result dict from the last
+    # analyst-verdict call — spawn_analyst_finalizer preferred,
+    # spawn_analyst as legacy fallback) for diagnostic dumping. Empty
+    # dict if no analyst-verdict call was found.
     analyst_verdict: dict = field(default_factory=dict)
 
 
@@ -200,25 +205,63 @@ def _normalize_name(name: str) -> str:
 
 
 def _collect_analyst_results(records: Iterable[dict]) -> list[dict]:
-    """Return the .result payloads of ALL successful spawn_analyst
+    """Return the .result payloads of ALL successful analyst-verdict
     calls in trace order.
 
-    The orchestrator may re-spawn the analyst after a comparator
+    Prefers spawn_analyst_finalizer (the per-variable pipeline's final
+    synthesis step, Step 5c). If any successful finalizer call exists
+    in the trace, ONLY finalizer results are returned; the deprecated
+    monolithic spawn_analyst is silently ignored in that case (the two
+    agents can never coexist in real orchestrator output, but a
+    hand-crafted or archived trace might mix them). Falls back to
+    spawn_analyst only when NO finalizer call is present anywhere in
+    the trace — this keeps pre-Step-5c archived traces scorable
+    without teaching the scorer to double-count.
+
+    Errored calls (status != "ok") are skipped for both agents. An
+    errored finalizer does NOT trigger the legacy fallback: a run
+    whose authoritative agent errored genuinely failed at its final
+    step, and grading a stale earlier verdict would be wrong signal.
+    In that case the caller sees the finalizer list empty AND the
+    legacy list ignored, producing analyst_absent=True downstream.
+
+    The two agents share ANALYST_OUTPUT_SCHEMA verbatim (per
+    AGENTS.md "The per-variable analyst pipeline" section), so the
+    scoring code below is agnostic to which agent produced a given
+    result.
+
+    The orchestrator may re-spawn either agent after a comparator
     failure (per the system prompt's retry guidance). Callers that
     want only the last verdict take `results[-1] if results else None`;
     callers that want best-of-K iterate.
     """
-    out: list[dict] = []
+    finalizer_out: list[dict] = []
+    legacy_out: list[dict] = []
+    finalizer_seen = False  # any finalizer record, successful OR errored
     for rec in records:
-        if rec.get("tool_name") != "spawn_analyst":
+        tool = rec.get("tool_name")
+        if tool not in ("spawn_analyst_finalizer", "spawn_analyst"):
             continue
+        if tool == "spawn_analyst_finalizer":
+            finalizer_seen = True
         exec_result = rec.get("exec_result", {})
         if exec_result.get("status") != "ok":
             continue
         result = exec_result.get("result")
-        if isinstance(result, dict):
-            out.append(result)
-    return out
+        if not isinstance(result, dict):
+            continue
+        if tool == "spawn_analyst_finalizer":
+            finalizer_out.append(result)
+        else:
+            legacy_out.append(result)
+    # If any finalizer record appeared at all (even errored), do NOT
+    # fall back to legacy — an errored finalizer means the run
+    # genuinely failed at its authoritative final step, and grading a
+    # stale earlier verdict from the tests-only legacy backdoor would
+    # be wrong signal.
+    if finalizer_seen:
+        return finalizer_out
+    return legacy_out
 
 
 def _score_single_verdict(
@@ -305,20 +348,21 @@ def score_per_variable(
 
     Returns (last_cycle_score, best_cycle_score, last_analyst_verdict_dict).
 
-    `last_cycle_score` scores the LAST successful spawn_analyst —
-    the verdict the workflow ultimately committed to. This is the
-    primary score.
+    `last_cycle_score` scores the LAST successful analyst-verdict call
+    (spawn_analyst_finalizer preferred, spawn_analyst as legacy
+    fallback — see _collect_analyst_results) — the verdict the
+    workflow ultimately committed to. This is the primary score.
 
-    `best_cycle_score` scores the analyst call with the highest match
-    count, with ties broken by earliest cycle (smallest trace index).
-    This surfaces "the analyst got it right once but the workflow
-    regressed on retry" as a diagnostic distinct from "the analyst
-    never got it right". When there are 0 or 1 successful analyst
-    calls, best == last by construction.
+    `best_cycle_score` scores the analyst-verdict call with the
+    highest match count, with ties broken by earliest cycle (smallest
+    trace index). This surfaces "the analyst got it right once but
+    the workflow regressed on retry" as a diagnostic distinct from
+    "the analyst never got it right". When there are 0 or 1
+    successful analyst-verdict calls, best == last by construction.
 
-    The verdict dict (from the LAST analyst) is returned alongside so
-    the caller can stash it on KernelResult for diagnostic dumping
-    without re-walking the trace.
+    The verdict dict (from the LAST analyst-verdict call) is returned
+    alongside so the caller can stash it on KernelResult for
+    diagnostic dumping without re-walking the trace.
     """
     expected_map = {
         _normalize_name(k): v for k, v in expected.per_variable.items()

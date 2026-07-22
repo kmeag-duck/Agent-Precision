@@ -69,6 +69,15 @@ def _analyst_ok(variables: list[dict]) -> dict:
     }
 
 
+def _finalizer_ok(variables: list[dict]) -> dict:
+    """exec_result for a successful spawn_analyst_finalizer. Payload
+    shape is identical to _analyst_ok (the two agents share
+    ANALYST_OUTPUT_SCHEMA verbatim by AGENTS.md contract); this helper
+    exists so scoring tests can spell out which agent produced a given
+    record at the call site."""
+    return _analyst_ok(variables)
+
+
 def _verifier_ok(verdict: str) -> dict:
     return {"status": "ok", "result": {"verdict": verdict}}
 
@@ -241,6 +250,127 @@ def test_per_variable_empty_expected_map():
     assert score.total == 0
     assert score.matched == 0
     assert score.analyst_absent is False
+
+
+# ----------------------------------------------------------------------
+# Finalizer / legacy-analyst dispatch (Step 5c: spawn_analyst_finalizer
+# is the production analyst-verdict agent; spawn_analyst is a
+# legacy-trace fallback).
+# ----------------------------------------------------------------------
+
+
+def test_per_variable_reads_finalizer_verdict():
+    """A trace whose only analyst-verdict record is spawn_analyst_finalizer
+    scores exactly like the legacy spawn_analyst equivalent — the two
+    agents share ANALYST_OUTPUT_SCHEMA so scoring is agnostic. Pins
+    the primary Step-5c contract: the scorer recognizes the finalizer.
+    """
+    records = [
+        _rec(1, "spawn_analyst_finalizer", {}, _finalizer_ok([
+            {"name": "x", "action": "downcast"},
+            {"name": "y", "action": "downcast"},
+            {"name": "z", "action": "downcast"},
+        ])),
+    ]
+    score, _best, verdict = score_per_variable(records, _KERNEL)
+    assert score.analyst_absent is False
+    assert score.total == 3
+    assert score.matched == 3
+    assert score.missing_count == 0
+    assert score.mismatches == []
+    # Verdict dict is returned for diagnostic dumping.
+    assert verdict.get("variables"), "finalizer verdict should be returned"
+
+
+def test_per_variable_prefers_finalizer_over_legacy_analyst():
+    """When both spawn_analyst_finalizer AND legacy spawn_analyst records
+    exist in the trace (impossible on the production path but possible
+    in a hand-crafted or archived trace), the finalizer wins
+    unconditionally. Legacy is silently ignored — NOT merged into
+    best-of-K, NOT used as a tiebreak. Pins the precedence rule."""
+    records = [
+        # Legacy first with a wrong verdict.
+        _rec(1, "spawn_analyst", {}, _analyst_ok([
+            {"name": "x", "action": "keep"},
+            {"name": "y", "action": "keep"},
+            {"name": "z", "action": "keep"},
+        ])),
+        # Finalizer later with the correct verdict.
+        _rec(5, "spawn_analyst_finalizer", {}, _finalizer_ok([
+            {"name": "x", "action": "downcast"},
+            {"name": "y", "action": "downcast"},
+            {"name": "z", "action": "downcast"},
+        ])),
+    ]
+    score, best, _ = score_per_variable(records, _KERNEL)
+    assert score.matched == 3, "finalizer's verdict should win"
+    assert best.matched == 3, "legacy should not appear in best-of-K"
+
+
+def test_per_variable_falls_back_to_spawn_analyst_when_no_finalizer():
+    """A trace that contains only legacy spawn_analyst records (e.g. a
+    pre-Step-5c archived trace) is scored via the legacy fallback.
+    Pins backward compatibility so archived traces stay scorable."""
+    records = [
+        _rec(1, "spawn_analyst", {}, _analyst_ok([
+            {"name": "x", "action": "downcast"},
+            {"name": "y", "action": "downcast"},
+            {"name": "z", "action": "downcast"},
+        ])),
+    ]
+    score, _best, verdict = score_per_variable(records, _KERNEL)
+    assert score.analyst_absent is False
+    assert score.matched == 3
+    assert verdict.get("variables"), "legacy verdict should be returned"
+
+
+def test_per_variable_errored_finalizer_does_not_fall_back():
+    """When the finalizer errors AND a successful legacy spawn_analyst
+    record ALSO exists in the trace, the scorer must NOT fall back to
+    the legacy verdict — an errored finalizer means the run genuinely
+    failed at its authoritative final step, and grading a stale
+    earlier verdict would be wrong signal. Result: analyst_absent=True,
+    same as if no verdict existed at all. Pins the errored-finalizer
+    no-fallback rule."""
+    records = [
+        _rec(1, "spawn_analyst", {}, _analyst_ok([
+            {"name": "x", "action": "downcast"},
+            {"name": "y", "action": "downcast"},
+            {"name": "z", "action": "downcast"},
+        ])),
+        _rec(5, "spawn_analyst_finalizer", {}, {"status": "error", "stderr": "boom"}),
+    ]
+    score, best, verdict = score_per_variable(records, _KERNEL)
+    assert score.analyst_absent is True
+    assert score.matched == 0
+    assert score.missing_count == 3
+    assert best.analyst_absent is True
+    assert verdict == {}
+
+
+def test_per_variable_multiple_finalizer_cycles_last_wins():
+    """The orchestrator may re-spawn the finalizer after a comparator
+    failure (per the system prompt's retry guidance). last_score uses
+    the most recent successful finalizer; best_score iterates across
+    all cycles for its highest-match pick. Pins that retry semantics
+    carry over from the legacy spawn_analyst behavior."""
+    records = [
+        # First cycle: matches 1/3.
+        _rec(1, "spawn_analyst_finalizer", {}, _finalizer_ok([
+            {"name": "x", "action": "downcast"},
+            {"name": "y", "action": "keep"},
+            {"name": "z", "action": "keep"},
+        ])),
+        # Second cycle after retry: matches 3/3.
+        _rec(5, "spawn_analyst_finalizer", {}, _finalizer_ok([
+            {"name": "x", "action": "downcast"},
+            {"name": "y", "action": "downcast"},
+            {"name": "z", "action": "downcast"},
+        ])),
+    ]
+    last, best, _ = score_per_variable(records, _KERNEL)
+    assert last.matched == 3, "LAST cycle wins for last_score"
+    assert best.matched == 3, "best_score picks the highest-match cycle"
 
 
 # ----------------------------------------------------------------------
