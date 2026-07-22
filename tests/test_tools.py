@@ -4607,6 +4607,33 @@ def test_variable_downcast_errors_when_oracle_missing(monkeypatch, tmp_path):
     assert result["artifacts"] == []
 
 
+def test_variable_downcast_refuses_scalar_parameter_as_verdict_fail(
+    monkeypatch, tmp_path
+):
+    """A scalar kernel PARAMETER (`using alphaType = double;`) is refused by the per-variable gate, but as a NORMAL VERDICT: fail (status='ok'), not an infra error. This is deliberate: an infra error risks the orchestrator LLM retrying, whereas VERDICT: fail cleanly demotes the variable to action='keep' in the finalizer with no rewriter ever seeing an unimplementable lone-scalar downcast (the mixed_potential.cu rewriter<->verifier loop root cause, 2026-07-16). No subprocess is invoked -- the refusal happens at splice time, before compile."""
+    monkeypatch.chdir(tmp_path)
+    _stage_baseline_for_singleton(
+        tmp_path, "k",
+        oracle_payload={"kernel": "k", "seed": 42, "inputs": {}, "outputs": {}},
+    )
+
+    def fail_run(*a, **kw):
+        raise AssertionError(
+            "subprocess.run must not be called on a refused scalar parameter"
+        )
+
+    monkeypatch.setattr(subprocess, "run", fail_run)
+
+    result = tools.test_variable_downcast(
+        "k", "alpha", "float", _TOL_SIG_FIGS_3, "kokkos"
+    )
+
+    assert result["status"] == "ok"
+    assert "VERDICT: fail" in result["stdout"]
+    assert "scalar" in result["stdout"].lower()
+    assert result["artifacts"] == []
+
+
 def test_variable_downcast_errors_on_unsupported_target_precision(
     monkeypatch, tmp_path
 ):
@@ -5792,10 +5819,15 @@ void run() {{
 
 def test_splice_singleton_variable_dispatches_to_alias_first():
     """The dispatcher prefers the alias splicer when an alias for the variable exists. This preserves the existing parameter-downcast behavior byte-for-byte and confirms the fallback only activates when the alias splicer specifically returns 'alias line absent'. If dispatch order were swapped, a parameter that happens to also have a same-named local (rare but possible when the local shadows the parameter for clarity) would get the wrong splice."""
+    # Use a View (array) parameter, not a bare scalar: scalar-parameter
+    # downcasts are now refused by the alias splicer (no speedup + ABI
+    # trap), so a scalar here would exercise the refusal path instead of
+    # the alias-first dispatch this test is about. A View param is a
+    # legitimate downcast that still goes through the alias splicer.
     src = f"""\
 int main() {{
 {KERNEL_BEGIN_SENTINEL}
-using xType = double;
+using xType = Kokkos::View<double*>;
 void run(xType x) {{
   (void)x;
 }}
@@ -5809,7 +5841,7 @@ void run(xType x) {{
     )
     assert err is None, err
     # Alias mutation happened (RHS became float); no local-decl edit needed.
-    assert "using xType = float;" in new_src
+    assert "using xType = Kokkos::View<float*>;" in new_src
 
 
 def test_splice_singleton_variable_falls_through_on_alias_absent():
@@ -5832,6 +5864,42 @@ void run(aType a) {{
     )
     assert err is None, err
     assert "float inv_r = 1.0 / a(0);" in new_src
+
+
+def test_splice_singleton_alias_refuses_scalar_parameter():
+    """A bare scalar parameter alias (`using epsType = double;`) is refused by the alias splicer: downcasting a lone scalar parameter yields no speedup and creates an ABI/faithfulness trap that loops the rewriter<->verifier cycle (observed on mixed_potential.cu, 2026-07-16). The error carries the _SCALAR_PARAM_REFUSED_ERR_PREFIX, and the dispatcher does NOT fall through to the local splicer (a scalar param is a param, not a local)."""
+    src = f"""\
+int main() {{
+{KERNEL_BEGIN_SENTINEL}
+using epsType = double;
+void run(epsType eps) {{
+  (void)eps;
+}}
+{KERNEL_END_SENTINEL}
+  return 0;
+}}
+"""
+    from workflow.languages import kokkos as kokkos_profile
+    new_src, err = tools._splice_singleton_variable(
+        src, kokkos_profile.KOKKOS_PROFILE, "eps", "float"
+    )
+    assert new_src is None
+    assert err is not None
+    assert tools._SCALAR_PARAM_REFUSED_ERR_PREFIX in err
+    # Must NOT have fallen through to the local splicer.
+    assert "Local attempt:" not in err
+
+
+def test_alias_rhs_is_scalar_classification():
+    """_alias_rhs_is_scalar treats bare fp types as scalar and any pointer / array / View / reference indirection as non-scalar. This is the discriminator that lets scalar-parameter downcasts be refused while array/View parameter downcasts pass through the same alias path."""
+    assert tools._alias_rhs_is_scalar("double") is True
+    assert tools._alias_rhs_is_scalar("const double") is True
+    assert tools._alias_rhs_is_scalar("float") is True
+    assert tools._alias_rhs_is_scalar("const double*") is False
+    assert tools._alias_rhs_is_scalar("double*") is False
+    assert tools._alias_rhs_is_scalar("Kokkos::View<double*>") is False
+    assert tools._alias_rhs_is_scalar("double[4]") is False
+    assert tools._alias_rhs_is_scalar("const double&") is False
 
 
 def test_splice_singleton_variable_does_not_fall_through_on_non_absent_alias_error():

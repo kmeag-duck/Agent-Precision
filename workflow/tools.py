@@ -2167,6 +2167,43 @@ _TARGET_PRECISION_TO_CXX = {
     "float": "float",
 }
 
+# Sentinel error prefix returned by _splice_singleton_alias when the
+# variable IS a kernel parameter but its alias RHS is a bare floating-
+# point SCALAR (e.g. `using epsType = double;`), not a pointer / array /
+# View. Downcasting a lone scalar parameter is deliberately refused by
+# the per-variable gate: it yields ~zero speedup (a single scalar in
+# registers costs the same in float or double on every backend) AND it
+# creates an unsatisfiable faithfulness trap for the rewriter -- a scalar
+# parameter is an ABI-visible argument, so "downcast it end-to-end" means
+# changing the function signature (breaking callers) while "cast it
+# internally" is judged unfaithful to the verdict, and the two verifier
+# lenses whipsaw between those, looping the rewriter<->verifier cycle to
+# MAX_TURNS. (Observed on mixed_potential.cu, 2026-07-16: the gate marked
+# scalar param `corr_scale` downcastable -- downcasting one scalar never
+# breaks tolerance -- and the rewriter/verifier then looped forever.)
+# Downcasting should target things that actually speed up: pointer/array/
+# View parameters (memory bandwidth) or hot-loop local accumulators /
+# intermediates (compute throughput -- these go through the local-decl
+# splicer, not this alias path, so they are unaffected by this refusal).
+# The dispatcher prefix-matches this string to turn the refusal into a
+# normal VERDICT-style "not downcastable" outcome rather than an infra
+# error, so the finalizer cleanly demotes the variable to `keep`.
+_SCALAR_PARAM_REFUSED_ERR_PREFIX = "Scalar-parameter downcast refused"
+
+
+def _alias_rhs_is_scalar(rhs: str) -> bool:
+    """True iff an alias RHS is a bare floating-point scalar type.
+
+    A scalar RHS has no pointer (`*`), no array/template indirection
+    (`<` / `[`), and no reference (`&`) -- e.g. `double`, `const double`.
+    A View / pointer / array RHS (`const double*`, `double*`,
+    `Kokkos::View<double*>`, `double[4]`) is NOT scalar. Used to refuse
+    lone scalar-parameter downcasts (see
+    _SCALAR_PARAM_REFUSED_ERR_PREFIX) while still allowing array/View
+    parameter downcasts through the same alias path.
+    """
+    return not any(tok in rhs for tok in ("*", "<", "[", "&"))
+
 
 def _mutate_alias_rhs(old_rhs: str, target_cxx: str) -> tuple[str | None, str | None]:
     """Rewrite an alias RHS by replacing every `double` token with `target_cxx`.
@@ -2276,6 +2313,22 @@ def _splice_singleton_alias(
             f"so the singleton splice is unambiguous."
         ))
     alias_offset, old_rhs = matches[0]
+
+    # Refuse a lone scalar-parameter downcast: no speedup + faithfulness
+    # trap for the rewriter. Array/View/pointer parameters (RHS contains
+    # `*`/`<`/`[`) fall through and are downcast normally. Scalar LOCALS
+    # are unaffected -- they have no alias and go through the local-decl
+    # splicer path instead. See _SCALAR_PARAM_REFUSED_ERR_PREFIX.
+    if _alias_rhs_is_scalar(old_rhs):
+        return (None, (
+            f"{_SCALAR_PARAM_REFUSED_ERR_PREFIX}: variable "
+            f"{variable_name!r} is a scalar kernel parameter (alias RHS "
+            f"{old_rhs!r}). Downcasting a lone scalar parameter yields no "
+            f"speedup and breaks the caller ABI, so the per-variable gate "
+            f"refuses it. Keep this variable at its original precision; "
+            f"downcast arrays/Views (bandwidth) or hot-loop locals "
+            f"(compute) instead."
+        ))
 
     new_rhs, err = _mutate_alias_rhs(old_rhs, target_cxx)
     if err is not None:
@@ -2789,6 +2842,23 @@ def test_variable_downcast(
         baseline_text, profile, variable_name, target_cxx
     )
     if err is not None:
+        # A scalar-parameter refusal is a NORMAL verdict, not an infra
+        # error: the variable simply is not a useful/safe downcast target.
+        # Return VERDICT: fail (status='ok') so the finalizer cleanly
+        # demotes it to `keep` without the LLM retrying, and no rewriter
+        # ever sees a downcast it cannot faithfully implement.
+        if _SCALAR_PARAM_REFUSED_ERR_PREFIX in err:
+            return {
+                "status": "ok",
+                "stdout": (
+                    f"VERDICT: fail -- variable {variable_name!r} is a "
+                    f"scalar kernel parameter; the per-variable gate "
+                    f"refuses lone scalar-parameter downcasts (no speedup, "
+                    f"ABI break). Treat as action='keep'. ({err})"
+                ),
+                "stderr": "",
+                "artifacts": [],
+            }
         return _error(f"In {baseline_driver_path}: {err}")
 
     singleton_dir = (
