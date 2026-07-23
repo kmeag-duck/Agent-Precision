@@ -2477,14 +2477,22 @@ def _mutate_local_decl(
 
 def _has_top_level_comma(text: str) -> bool:
     """Return True iff `text` contains a `,` at paren/bracket/brace
-    depth 0. Used by _splice_singleton_local to reject multi-var-
+    depth 0. Used by _splice_singleton_local to detect multi-var-
     per-line declarations after the initial regex match, without
-    also rejecting legitimate initializers whose RHS calls a
+    also flagging legitimate initializers whose RHS calls a
     multi-argument function (e.g. `pow(x, 2.0)`) or references a
     braced initializer list. Character-level scan is sufficient for
     the safe subset -- we do not attempt to parse comments or string
     literals because the harness contract forbids them on a decl
     line inside the kernel body.
+
+    Historically this was a REJECT trigger (multi-var-with-init
+    decls were demoted to `keep` unconditionally). It is now a
+    NORMALIZE trigger: `_split_multi_var_decl_line` uses the same
+    paren-tracking scan to find split positions, splits the decl
+    into N single-var-per-line decls, and then the existing
+    single-var mutation runs on the resulting normalized line. See
+    the "Two-splicer contract" paragraph in AGENTS.md.
     """
     depth = 0
     for ch in text:
@@ -2496,6 +2504,122 @@ def _has_top_level_comma(text: str) -> bool:
         elif ch == "," and depth == 0:
             return True
     return False
+
+
+def _top_level_comma_positions(text: str) -> list[int]:
+    """Return the indices of every `,` at paren/bracket/brace depth 0
+    in `text`, in order. Sister to `_has_top_level_comma`; the two
+    share the same paren-tracking logic and must stay aligned.
+
+    Used by `_split_multi_var_decl_line` to slice the declarator
+    list of a multi-var decl (`x = a, y = b, z = c`) into N
+    per-declarator substrings without corrupting commas nested
+    inside function-call RHSs (e.g. `pow(x, 2.0)`).
+    """
+    depth = 0
+    positions: list[int] = []
+    for i, ch in enumerate(text):
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            if depth > 0:
+                depth -= 1
+        elif ch == "," and depth == 0:
+            positions.append(i)
+    return positions
+
+
+# Header of a `[const ]<double|float>` decl: everything up to and
+# including the trailing whitespace after the type token. Groups:
+#   1. leading whitespace (may be empty)
+#   2. optional `const ` (may be empty)
+#   3. the fp type token (`double` or `float`)
+# Used by `_split_multi_var_decl_line` to peel off the shared
+# prefix that every split line needs to reproduce. Deliberately
+# name-agnostic: unlike `_LOCAL_DECL_RE_TEMPLATE`, this pattern
+# does NOT bind a variable name -- it stops at the type token so
+# the caller can inspect the raw declarator list that follows.
+_LOCAL_DECL_HEADER_RE = re.compile(
+    r"^(\s*)(const\s+)?\b(double|float)\b\s+"
+)
+
+
+def _split_multi_var_decl_line(matched_line: str) -> list[str]:
+    """Split a multi-var-per-line decl into N single-var-per-line
+    decls, preserving the indent, optional `const`, type token,
+    per-declarator name and initializer, and the trailing semicolon
+    and whitespace.
+
+    Idempotent on already-single-var decls: if `matched_line` has
+    no top-level comma in its declarator list, returns
+    `[matched_line]` unchanged. This keeps the caller code simple
+    (unconditional call, no pre-check needed) and, more importantly,
+    makes the union splicer's "sequence of single-var splices"
+    pattern work for free: iteration N+1 sees a source that
+    iteration N already normalized, and the top-level-comma check
+    is a no-op.
+
+    Contract on the input: `matched_line` MUST already match
+    `_LOCAL_DECL_RE_TEMPLATE.format(var=<some name>)` for at least
+    one variable in the decl -- i.e. the caller has already
+    confirmed this line is a well-formed `[const] <fptype>
+    <declarator-list>;` decl. Passing an arbitrary line is a
+    caller bug and returns `[matched_line]` unchanged (defensive
+    fallback: silently degrade rather than raise, because this
+    helper is called on an already-vetted line and a mid-splice
+    exception would obscure the real error).
+
+    Preserves trailing whitespace after the semicolon on the LAST
+    output line only. The N-1 preceding lines are terminated with
+    just `;\n`-free (the caller reinserts the newline via
+    `"\n".join(...)`), no trailing whitespace, no comment. This is
+    a v0 simplification: multi-var decls with inline comments after
+    the semicolon are outside the current safe subset anyway.
+    """
+    header = _LOCAL_DECL_HEADER_RE.match(matched_line)
+    if header is None:
+        # Defensive: caller should have matched already.
+        return [matched_line]
+    prefix = matched_line[: header.end()]  # e.g. "  const double "
+
+    # Strip the trailing semicolon (and whitespace after it) from
+    # what remains, so we can split the declarator list cleanly.
+    tail = matched_line[header.end():]
+    # Find the last `;` (there should be exactly one, at the end).
+    semi_idx = tail.rfind(";")
+    if semi_idx < 0:
+        # Defensive: input line has no semicolon; caller regex
+        # requires one so this branch should be unreachable.
+        return [matched_line]
+    declarator_list = tail[:semi_idx]
+    trailing = tail[semi_idx:]  # ";" plus any trailing whitespace
+
+    positions = _top_level_comma_positions(declarator_list)
+    if not positions:
+        return [matched_line]
+
+    # Slice declarator_list on top-level commas.
+    declarators: list[str] = []
+    prev = 0
+    for pos in positions:
+        declarators.append(declarator_list[prev:pos])
+        prev = pos + 1  # skip the comma itself
+    declarators.append(declarator_list[prev:])
+
+    # Rebuild N single-var-per-line decls. Each declarator gets the
+    # same prefix and a `;` terminator; only the LAST line keeps
+    # any trailing whitespace that followed the original semicolon.
+    result: list[str] = []
+    for i, decl in enumerate(declarators):
+        # Strip leading whitespace on middle/last declarators (which
+        # sat after `, ` in the source) so the rebuilt line has
+        # exactly one space between the type token and the name.
+        decl_stripped = decl.lstrip()
+        if i < len(declarators) - 1:
+            result.append(prefix + decl_stripped + ";")
+        else:
+            result.append(prefix + decl_stripped + trailing)
+    return result
 
 
 def _splice_singleton_local(
@@ -2526,18 +2650,33 @@ def _splice_singleton_local(
     downcast can be applied entirely inside the sentinels without
     any main()-side ripple.
 
-    v0 scope: single-line `[const ] <double|float> <name> = <RHS>;`
-    declarations. `auto` locals, arrays, multi-var-per-line
-    declarations, and pure declarations without initializers all
-    return `(None, "no declaration line found")` and get demoted to
-    `keep` by the orchestrator. See AGENTS.md for the semantic
-    argument -- `auto` in particular is intentionally out of scope
-    because a storage-only downcast on an `auto` is semantically
-    incoherent (the type is deduced from the initializer, so
-    changing storage alone means the RHS is computed at one
-    precision and rounded to another at exactly the assignment
-    point, which is not what the analyst usually means by
-    'downcast').
+    Safe subset: single-line `[const ] <double|float> <name> =
+    <RHS>;` declarations AND single-line `[const ] <double|float>
+    <name1> = <RHS1>, <name2> = <RHS2>, ...;` multi-var-per-line
+    declarations WITH initializers. The multi-var-with-initializers
+    case is handled via a split-then-rewrite step
+    (`_split_multi_var_decl_line`): the original single source
+    line is expanded into N single-var-per-line decls preserving
+    indent / const / type / per-declarator name-and-initializer,
+    and then the standard single-var mutation runs on the
+    normalized line naming `variable_name`. This is idempotent on
+    already-single-var input, so the union splicer's
+    "sequence-of-single-var-splices" pattern composes trivially:
+    iteration N+1 sees a normalized source and its top-level-comma
+    check is a no-op.
+
+    Still out of scope: `auto` locals (storage-only downcast on
+    `auto` is semantically incoherent -- the RHS is computed at
+    one precision and rounded to another at exactly the
+    assignment point, which is not what the analyst means by
+    'downcast'), arrays, multi-var-per-line declarations
+    WITHOUT initializers (`double a, b;`; caught by the regex --
+    the pattern requires `=<RHS>` for each declarator), pure
+    declarations without initializers, decls split across multiple
+    source lines, `long double`, and decl lines with inline
+    comments after the semicolon. Any of these returns `(None,
+    "no declaration line found")` and gets demoted to `keep` by
+    the orchestrator.
     """
     lines = driver_text.splitlines()
 
@@ -2567,34 +2706,86 @@ def _splice_singleton_local(
     kernel_region_end = end_idx  # exclusive
     kernel_region_lines = lines[kernel_region_start:kernel_region_end]
 
-    pattern = re.compile(
+    # Two-phase match: the outer scan is name-agnostic -- it flags
+    # every source line whose SHAPE could be a well-formed
+    # `[const ] <fptype> <declarator-list>;` (matched by
+    # `_LOCAL_DECL_HEADER_RE` for the prefix AND terminated with
+    # `;`). Using the per-var regex here directly would fail on the
+    # multi-var-decl case where the target is a MIDDLE or LAST
+    # declarator: `const double xi = x[i], yi = y[i], zi = z[i];`
+    # does NOT match `_LOCAL_DECL_RE_TEMPLATE.format(var="yi")`
+    # because the header requires the type token to be immediately
+    # followed by the target name (which is `xi`, not `yi`, on the
+    # unsplit line). So we scan by shape, split, and then let the
+    # per-var regex do the name discrimination on the split lines
+    # -- where each declarator IS at the "immediately after the
+    # type token" position by construction.
+    per_var_pattern = re.compile(
         _LOCAL_DECL_RE_TEMPLATE.format(var=re.escape(variable_name))
     )
-    matches: list[tuple[int, str]] = []
+    # We accumulate (kernel-region-relative offset, split-line list,
+    # index-within-split-list of the target line) so the write phase
+    # can replace the original single source line with the split
+    # list (target rewritten to `target_cxx`, siblings unchanged).
+    matches: list[tuple[int, list[str], int]] = []
     for offset, line in enumerate(kernel_region_lines):
-        if pattern.match(line) is None:
+        # Cheap name-agnostic shape gate: must start with the
+        # `[const ] <fptype> ` header AND end with `;` (plus
+        # optional trailing whitespace). This rejects most kernel-
+        # body lines (loop headers, assignments, function calls,
+        # etc.) without spending a per-var regex compile on them.
+        if _LOCAL_DECL_HEADER_RE.match(line) is None:
             continue
-        # Post-filter: reject multi-variable-per-line declarations like
-        # `double a = 0.0, b = 0.0;` where the RHS regex greedily
-        # consumes across a comma. We can't ban `,` outright in the
-        # RHS because legitimate initializers may contain function
-        # calls with multiple arguments (e.g. `pow(x, 2.0)`), so we
-        # count top-level commas -- ones that appear at paren depth
-        # 0. Any top-level comma means the "decl" is actually a
-        # multi-var decl and belongs to the safe-subset reject list.
-        rhs = line.split("=", 1)[1]
-        if _has_top_level_comma(rhs):
+        if not line.rstrip().endswith(";"):
             continue
-        matches.append((offset, line))
+        # Normalize: no-op on single-var; split on multi-var.
+        split_lines = _split_multi_var_decl_line(line)
+        # Find which of the split lines is the one naming
+        # `variable_name` as its own declarator. On a solo decl,
+        # split_lines has length 1 and either the single element
+        # matches (target is here) or it doesn't (target is on a
+        # different line). On a multi-var decl, at most one of the
+        # N split lines names `variable_name`; the others name
+        # OTHER declarators. The per-var regex is applied to each
+        # split line, and only lines where `variable_name` is at
+        # the "immediately-after-the-type-token" position match --
+        # so this filter also implicitly rejects the shapes the
+        # per-var regex was always designed to reject (auto,
+        # arrays, no-initializer decls, long double, ...): those
+        # would have failed the split-line per-var check.
+        target_indices = [
+            idx for idx, sub in enumerate(split_lines)
+            if per_var_pattern.match(sub) is not None
+        ]
+        if len(target_indices) == 0:
+            # Shape-matched line, but the target variable isn't
+            # named by any of its declarators. That's normal --
+            # this line declares SOME variable, just not the one
+            # we're looking for. Skip.
+            continue
+        if len(target_indices) > 1:
+            # Same variable name appears more than once in the
+            # declarator list of a single source line. Not valid
+            # C++ (two declarators with the same name would be a
+            # redefinition), but defensive: refuse rather than
+            # guess which one to mutate.
+            return (None, (
+                f"Line {kernel_region_start + offset + 1} declares "
+                f"{variable_name!r} more than once in its declarator "
+                f"list; the singleton splice cannot disambiguate which "
+                f"occurrence to downcast."
+            ))
+        matches.append((offset, split_lines, target_indices[0]))
     if not matches:
         return (None, (
             f"No `[const] <double|float> {variable_name} = <RHS>;` "
             f"local declaration line found between the kernel sentinels. "
             f"Either the variable is not a local in this kernel, its "
             f"declaration is outside the safe subset the singleton "
-            f"splicer supports (auto-typed, multi-variable-per-line, "
-            f"array-typed, or split across multiple lines), or it is "
-            f"actually a kernel parameter -- parameters use the "
+            f"splicer supports (auto-typed, array-typed, split across "
+            f"multiple lines, or a multi-var-per-line decl without "
+            f"initializers such as `double a, b;`), or it is actually "
+            f"a kernel parameter -- parameters use the "
             f"`using <Name>Type = ...;` alias contract instead, see the "
             f"precision-alias contract in the harness prompt."
         ))
@@ -2608,14 +2799,24 @@ def _splice_singleton_local(
             f"enough that the tool refuses to guess which one to "
             f"downcast."
         ))
-    line_offset, matched_line = matches[0]
+    line_offset, split_lines, target_idx = matches[0]
 
-    new_line, err = _mutate_local_decl(matched_line, target_cxx, variable_name)
+    target_line = split_lines[target_idx]
+    new_target_line, err = _mutate_local_decl(
+        target_line, target_cxx, variable_name
+    )
     if err is not None:
         return (None, err)
+    rewritten_split = list(split_lines)
+    rewritten_split[target_idx] = new_target_line
+
     absolute_line_idx = kernel_region_start + line_offset
     new_lines = list(lines)
-    new_lines[absolute_line_idx] = new_line
+    # Replace the single original source line with N split lines.
+    # On single-var decls, N == 1 and this is a straight
+    # in-place replacement (same as the old code path). On
+    # multi-var decls, N > 1 and the source grows by N-1 lines.
+    new_lines[absolute_line_idx:absolute_line_idx + 1] = rewritten_split
 
     trailing_newline = "\n" if driver_text.endswith("\n") else ""
     return ("\n".join(new_lines) + trailing_newline, None)

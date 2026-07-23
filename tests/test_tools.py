@@ -5855,7 +5855,7 @@ def test_local_decl_regex_rejects_arrays():
 
 
 def test_local_decl_regex_rejects_multi_variable_declarations_without_initializer():
-    """Multi-variable-per-line declarations WITHOUT initializers (`double a, b, c;`) are rejected at the REGEX level: the pattern requires `\\s*=\\s*<RHS>;` immediately after the variable name, so a `,` (not `=`) after `a` fails the match. Multi-variable declarations WITH initializers (`double a = 0.0, b = 0.0;`) require a second-stage filter (see `test_splice_singleton_local_rejects_multi_variable_with_initializers` below) because the RHS regex `[^;\\n]+` intentionally allows commas so legitimate initializers like `pow(x, 2.0)` still match. This split (regex catches the easy case, splicer catches the hard case) keeps the regex simple and the RHS-comma discrimination in one place."""
+    """Multi-variable-per-line declarations WITHOUT initializers (`double a, b, c;`) are rejected at the REGEX level: the pattern requires `\\s*=\\s*<RHS>;` immediately after the variable name, so a `,` (not `=`) after `a` fails the match. Multi-variable declarations WITH initializers (`double a = 0.0, b = 0.0;`) are handled via a split-then-rewrite step (see `test_splice_singleton_local_accepts_multi_variable_with_initializers_via_split` below and `_split_multi_var_decl_line` in workflow/tools.py) because the RHS regex `[^;\\n]+` intentionally allows commas so legitimate initializers like `pow(x, 2.0)` still match. This split of responsibility (regex catches the without-init easy case as a hard reject, splicer normalizes the with-init case into N single-var-per-line decls) keeps the regex simple and the RHS-comma discrimination in one place."""
     pat = _local_decl_pattern("a")
     assert pat.match("double a, b, c;") is None
     assert pat.match("const double a, b, c;") is None
@@ -5932,8 +5932,8 @@ void run(aType a) {{
     assert "double outside = 1.0;" in new_src
 
 
-def test_splice_singleton_local_rejects_multi_variable_with_initializers():
-    """Multi-variable-per-line declarations WITH initializers (`double a = 0.0, b = 0.0;`) are the case the regex CANNOT reject on its own: the RHS slot `[^;\\n]+` is deliberately permissive so legitimate initializers like `pow(x, 2.0)` still match. The splicer's `_has_top_level_comma` post-filter is what catches this shape, by scanning the RHS for a `,` at paren depth 0. This test pins that behavior: a decl of the multi-var-with-init shape must produce an 'absent' error (as if no matching decl were found), not a silent partial mutation of just the first variable's type token."""
+def test_splice_singleton_local_accepts_multi_variable_with_initializers_via_split():
+    """Multi-variable-per-line declarations WITH initializers (`double a = 0.0, b = 0.0;`) are handled via the split-then-rewrite path introduced after the Phase-1b lj_pair_force diagnosis (see AGENTS.md "Two-splicer contract"). The splicer normalizes the source by splitting the original single line into N single-var-per-line decls preserving indent / const / type / per-declarator name-and-initializer, then applies the single-var mutation to the split line naming the target. This test replaces the historical reject-behavior test; it locks in that the target declarator's type token becomes `float` while the sibling declarator stays `double` on its own line. A silent partial mutation of just the first type token (which would have changed BOTH `a` and `b` to float — C++ semantic per simple-declaration) is what the split-then-rewrite path exists to prevent."""
     src = f"""\
 int main() {{
 {KERNEL_BEGIN_SENTINEL}
@@ -5949,9 +5949,14 @@ void run() {{
     new_src, err = tools._splice_singleton_local(
         src, kokkos_profile.KOKKOS_PROFILE, "a", "float"
     )
-    assert new_src is None
-    assert err is not None
-    assert "a" in err
+    assert err is None, err
+    # Target got its own line, retargeted to float; sibling kept
+    # `double` on its own line.
+    assert "  float a = 0.0;" in new_src
+    assert "  double b = 0.0;" in new_src
+    # The original one-line form should be GONE (otherwise we'd have
+    # duplicated the decl instead of normalizing it).
+    assert "double a = 0.0, b = 0.0;" not in new_src
 
 
 def test_has_top_level_comma_helper_distinguishes_multi_var_from_function_call():
@@ -5968,6 +5973,198 @@ def test_has_top_level_comma_helper_distinguishes_multi_var_from_function_call()
     # empty and no-comma are False
     assert tools._has_top_level_comma("") is False
     assert tools._has_top_level_comma("sqrt(x)") is False
+
+
+def test_split_multi_var_decl_line_happy_path():
+    """`_split_multi_var_decl_line` on the exact idiom that motivated this feature (`const double xi = x[i], yi = y[i], zi = z[i];`, from Phase-1b lj_pair_force.cu) produces exactly 3 lines: one `const double xi = x[i];`, one `const double yi = y[i];`, one `const double zi = z[i];`. Each line individually matches the per-var regex for its own declarator name; none matches the per-var regex for the OTHER two names (the tail `,` and next declarator are gone). This is the invariant the split-then-rewrite path relies on."""
+    line = "  const double xi = x[i], yi = y[i], zi = z[i];"
+    result = tools._split_multi_var_decl_line(line)
+    assert result == [
+        "  const double xi = x[i];",
+        "  const double yi = y[i];",
+        "  const double zi = z[i];",
+    ]
+
+
+def test_split_multi_var_decl_line_preserves_const_prefix_and_indent():
+    """The shared prefix (leading whitespace + optional `const ` + type token + one space) is reproduced on every split line, byte-for-byte. This locks the "each split line looks like a real solo decl" invariant that lets the per-var regex match each split line individually. Rebuilding the prefix any other way (e.g. stripping const or normalizing indentation) would either drop `const` (silent semantic change: the decl becomes writable) or break the alignment with the surrounding kernel body's indentation."""
+    line = "    const double a = 0.0, b = 1.0;"
+    result = tools._split_multi_var_decl_line(line)
+    assert result == [
+        "    const double a = 0.0;",
+        "    const double b = 1.0;",
+    ]
+    # Non-const case: still preserves indent.
+    line2 = "\tdouble a = 0.0, b = 1.0;"
+    result2 = tools._split_multi_var_decl_line(line2)
+    assert result2 == [
+        "\tdouble a = 0.0;",
+        "\tdouble b = 1.0;",
+    ]
+
+
+def test_split_multi_var_decl_line_handles_function_call_rhs():
+    """A legitimate initializer containing a function-call comma (e.g. `pow(x, 2.0)`) must NOT be split at the inner comma — only at the top-level comma between declarators. `_split_multi_var_decl_line` inherits `_top_level_comma_positions`'s paren-tracking, so the split point is between the trailing `)` of the first RHS and the second declarator's name. This test pins that discrimination directly, since a regression here would corrupt real initializers into unparseable fragments."""
+    line = "  double a = pow(x, 2.0), b = sqrt(y);"
+    result = tools._split_multi_var_decl_line(line)
+    assert result == [
+        "  double a = pow(x, 2.0);",
+        "  double b = sqrt(y);",
+    ]
+
+
+def test_split_multi_var_decl_line_idempotent_on_single_var():
+    """When called on an already-single-var decl (no top-level comma), `_split_multi_var_decl_line` returns `[input]` unchanged. Idempotence here is the reason the union splicer's "sequence of single-var splices" pattern composes for free: iteration N+1 sees the source that iteration N already normalized, the top-level-comma scan returns no positions, and the input passes through untouched. Without this property, the second iteration would either fail to match (over-normalized) or duplicate declarators (double-normalized)."""
+    line = "  const double inv_r = 1.0 / r;"
+    result = tools._split_multi_var_decl_line(line)
+    assert result == [line]
+    # And with no leading whitespace, still idempotent.
+    line2 = "double x = 0.0;"
+    assert tools._split_multi_var_decl_line(line2) == [line2]
+
+
+def test_splice_singleton_local_handles_multi_var_target_first():
+    """Target is the FIRST declarator in a three-declarator multi-var decl (matches the exact xi position in Phase-1b lj_pair_force.cu). The target line gets its own line with the target type; the two sibling lines keep their original type. Result: exactly one line rewritten with `float xi = x[i];`, two lines with `double yi = y[i];` and `double zi = z[i];`."""
+    src = f"""\
+int main() {{
+{KERNEL_BEGIN_SENTINEL}
+void run() {{
+  const double xi = x[i], yi = y[i], zi = z[i];
+  (void)xi; (void)yi; (void)zi;
+}}
+{KERNEL_END_SENTINEL}
+  return 0;
+}}
+"""
+    from workflow.languages import kokkos as kokkos_profile
+    new_src, err = tools._splice_singleton_local(
+        src, kokkos_profile.KOKKOS_PROFILE, "xi", "float"
+    )
+    assert err is None, err
+    assert "  const float xi = x[i];" in new_src
+    assert "  const double yi = y[i];" in new_src
+    assert "  const double zi = z[i];" in new_src
+    # Original one-line form is gone.
+    assert "const double xi = x[i], yi = y[i], zi = z[i];" not in new_src
+
+
+def test_splice_singleton_local_handles_multi_var_target_middle():
+    """Target is the MIDDLE declarator. Splitting is orientation-agnostic: `_split_multi_var_decl_line` produces three lines and only the one naming the target (yi) is retargeted."""
+    src = f"""\
+int main() {{
+{KERNEL_BEGIN_SENTINEL}
+void run() {{
+  const double xi = x[i], yi = y[i], zi = z[i];
+  (void)xi; (void)yi; (void)zi;
+}}
+{KERNEL_END_SENTINEL}
+  return 0;
+}}
+"""
+    from workflow.languages import kokkos as kokkos_profile
+    new_src, err = tools._splice_singleton_local(
+        src, kokkos_profile.KOKKOS_PROFILE, "yi", "float"
+    )
+    assert err is None, err
+    assert "  const double xi = x[i];" in new_src
+    assert "  const float yi = y[i];" in new_src
+    assert "  const double zi = z[i];" in new_src
+
+
+def test_splice_singleton_local_handles_multi_var_target_last():
+    """Target is the LAST declarator. Symmetric with the first-target case above; guards against off-by-one in the split-position enumeration (which could truncate or duplicate the last declarator)."""
+    src = f"""\
+int main() {{
+{KERNEL_BEGIN_SENTINEL}
+void run() {{
+  const double xi = x[i], yi = y[i], zi = z[i];
+  (void)xi; (void)yi; (void)zi;
+}}
+{KERNEL_END_SENTINEL}
+  return 0;
+}}
+"""
+    from workflow.languages import kokkos as kokkos_profile
+    new_src, err = tools._splice_singleton_local(
+        src, kokkos_profile.KOKKOS_PROFILE, "zi", "float"
+    )
+    assert err is None, err
+    assert "  const double xi = x[i];" in new_src
+    assert "  const double yi = y[i];" in new_src
+    assert "  const float zi = z[i];" in new_src
+
+
+def test_splice_singleton_local_multi_var_preserves_line_count_delta():
+    """A three-declarator multi-var decl becomes exactly three output lines (net +2 lines vs the original single source line). Not four (would mean the splitter duplicated a declarator); not two (would mean the splitter dropped one); not "the same line count but split in-string" (would mean the splitter's output is not one-decl-per-line). This test pins the arithmetic directly so a future regression in the split-list construction fails loudly rather than silently producing malformed sources that only surface at compile time."""
+    src = f"""\
+int main() {{
+{KERNEL_BEGIN_SENTINEL}
+void run() {{
+  const double xi = x[i], yi = y[i], zi = z[i];
+  (void)xi; (void)yi; (void)zi;
+}}
+{KERNEL_END_SENTINEL}
+  return 0;
+}}
+"""
+    from workflow.languages import kokkos as kokkos_profile
+    original_line_count = len(src.splitlines())
+    new_src, err = tools._splice_singleton_local(
+        src, kokkos_profile.KOKKOS_PROFILE, "xi", "float"
+    )
+    assert err is None, err
+    assert len(new_src.splitlines()) == original_line_count + 2
+
+
+def test_splice_singleton_variable_dispatches_to_local_for_multi_var():
+    """End-to-end via the dispatcher: for a variable that isn't a kernel parameter (no `using <Name>Type = ...;` alias) but IS a member of a multi-var-per-line local decl, the alias splicer returns 'alias not found', the dispatcher falls through to the local splicer, and the local splicer normalizes-and-rewrites. This validates the full call path that `test_variable_downcast` / `test_variable_union_downcast` / `bisect_variable_downcast` actually take, not just the internal helper."""
+    src = f"""\
+int main() {{
+{KERNEL_BEGIN_SENTINEL}
+using xType = Kokkos::View<double*>;
+void run(xType x) {{
+  const double a = x(0), b = x(1);
+  (void)a; (void)b;
+}}
+{KERNEL_END_SENTINEL}
+  return 0;
+}}
+"""
+    from workflow.languages import kokkos as kokkos_profile
+    new_src, err = tools._splice_singleton_variable(
+        src, kokkos_profile.KOKKOS_PROFILE, "a", "float"
+    )
+    assert err is None, err
+    # Alias line untouched.
+    assert "using xType = Kokkos::View<double*>;" in new_src
+    # Target declarator on its own line with target type.
+    assert "  const float a = x(0);" in new_src
+    # Sibling declarator on its own line, still double.
+    assert "  const double b = x(1);" in new_src
+
+
+def test_splice_union_aliases_composes_over_multi_var_decl():
+    """The union splicer composes N single-var splices in sequence, reusing each iteration's output as the next iteration's input. This test pins that a two-target union over a multi-var decl works: iteration 1 splits `const double a = 0.0, b = 1.0;` into two lines and retargets `a`; iteration 2 sees the normalized source with `const double b = 1.0;` on its own line and retargets `b`. Both results present in the final source. This is the composition invariant the plan called out as "safe by construction (idempotent normalizer)" — belt-and-suspenders test to catch a future regression that breaks the composition."""
+    src = f"""\
+int main() {{
+{KERNEL_BEGIN_SENTINEL}
+void run() {{
+  const double a = 0.0, b = 1.0;
+  (void)a; (void)b;
+}}
+{KERNEL_END_SENTINEL}
+  return 0;
+}}
+"""
+    from workflow.languages import kokkos as kokkos_profile
+    new_src, err = tools._splice_union_aliases(
+        src, kokkos_profile.KOKKOS_PROFILE, ["a", "b"], ["float", "float"]
+    )
+    assert err is None, err
+    assert "  const float a = 0.0;" in new_src
+    assert "  const float b = 1.0;" in new_src
+    # Original multi-var form is gone.
+    assert "const double a = 0.0, b = 1.0;" not in new_src
 
 
 def test_splice_singleton_local_errors_when_decl_absent():
