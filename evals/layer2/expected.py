@@ -76,6 +76,41 @@ Methodology note (added after the vector_add finding):
       recomputed each step and never accumulated. Suggests the
       needs_precision label applies to state carriers, not to every
       float variable in the kernel.
+    - REVISED (Phase 1b re-run, 2026-07-23; re-verified 2026-07-24
+      with the multi-var-decl splicer): lj_pair_force.cu is a
+      mixed-category kernel whose SUMMARY marked dx/dy/dz, r2,
+      inv_r2, inv_r6, inv_r12, fmag, and the four scalars
+      (sigma/epsilon/rcut2/s2) as safely fp32-downcastable. The
+      empirical per-variable pipeline reduces this to a single
+      downcast: s2 (= sigma*sigma). Root cause of the mass keep
+      verdict is cancellation risk at two loci: (a) the coordinate
+      differences dx/dy/dz when two particles are close, which the
+      candidate finder correctly rules out a-priori; (b) the near-
+      zero-crossing of (2·inv_r12 − inv_r6) in fmag at
+      r ≈ 2^(1/6)·σ, which amplifies any relative error in the
+      inv_r2 → inv_r12 chain. s2 is the one exception because it
+      is a positive-definite scalar computed once outside the loop,
+      and its ~1e-7 float rounding enters every inv_r2ᵏ as a common
+      multiplicative factor — the ratio 2·inv_r12 / inv_r6 is
+      unchanged by the shared scale, so the zero-crossing is not
+      amplified. Singleton and union tests pass for s2 under
+      sig_figs=6 (1536/1536 outputs). xi/zi were empirically tested
+      (thanks to the splicer fix landing 2026-07-24) and
+      singleton-failed for the expected reason (coordinate
+      cancellation); yi was ruled out by its variable_analyst
+      before test dispatch. sigma/epsilon/rcut2 were rejected at
+      splice time as lone scalar-parameter downcasts (ABI break, no
+      throughput benefit). Comparator 1536/1536 at sig_figs=6;
+      speedup 0.989 ± 0.021 (noise; s2 is one register, not a
+      bandwidth mover). Pre-splicer-fix run: same verdict but
+      xi/yi/zi were demoted to keep by the splicer's own
+      infrastructure gate rather than by empirical test — the
+      2026-07-24 re-run confirms the multi-var-decl splicer
+      recovered the intended empirical signal without changing the
+      verdict. Pre-fix artifact preserved at
+      baselines/lj_pair_force.pre-splicer-fix/. See also
+      baselines/lj_pair_force/orchestrator_trace.jsonl and
+      baselines/lj_pair_force/rewritten/{comparison,timing}.json.
     - Speedups are pervasively noise-dominated on the current CUDA
       corpus. Of the 7 Phase-1b runs that reached measure_speedup,
       speedup ratios ranged from 0.411× to 1.020× and every result
@@ -442,29 +477,74 @@ _MIXED: list[ExpectedKernel] = [
         },
     ),
     ExpectedKernel(
+        # REVISED: empirical (Phase 1b re-run, 2026-07-23; re-verified
+        # 2026-07-24 with multi-var-decl splicer). SUMMARY marked
+        # dx/dy/dz, r2, inv_r2, inv_r6, inv_r12, fmag, and the four
+        # scalars (sigma/epsilon/rcut2/s2) as safely fp32-downcastable,
+        # arguing that r < rcut bounds the intermediates. The empirical
+        # per-variable pipeline reduces this to a single downcast: s2
+        # (= sigma*sigma). Root cause of the mass keep verdict is
+        # cancellation risk at two loci: (a) the coordinate differences
+        # dx/dy/dz when two particles are close, which the candidate
+        # finder correctly rules out a-priori; (b) the near-zero-crossing
+        # of (2·inv_r12 − inv_r6) in fmag at r ≈ 2^(1/6)·σ, which
+        # amplifies any relative error in the inv_r2 → inv_r12 chain.
+        # The 2026-07-24 re-run tested s2 as a singleton downcast under
+        # sig_figs=6: VERDICT: pass on the U(0, 6) fixture (1536/1536
+        # outputs agreed). s2 is the one exception because it is a
+        # positive-definite scalar computed once outside the loop, and
+        # its ~1e-7 float rounding enters every inv_r2ᵏ as a common
+        # multiplicative factor — the ratio 2·inv_r12 / inv_r6 is
+        # unchanged by the shared scale, so the zero-crossing is not
+        # amplified. Union test passed with s2 only (finalizer output).
+        # xi/zi were empirically tested (splicer fix landed
+        # 2026-07-24) and singleton-failed for the expected reason
+        # (coordinate cancellation); yi was ruled out by its
+        # variable_analyst before test dispatch. sigma/epsilon/rcut2
+        # were rejected at splice time as lone scalar-parameter
+        # downcasts (ABI break, no throughput benefit).
+        # Second-rewrite comparator: 1536/1536 agree at sig_figs=6.
+        # Speedup 0.989 ± 0.021 (noise; s2 is one register, not a
+        # bandwidth mover). Tolerance tightened from SUMMARY's rtol=1e-4
+        # to sig_figs=6, matching the actual CLI flag used in Phase 1b.
+        # See baselines/lj_pair_force/orchestrator_trace.jsonl and
+        # baselines/lj_pair_force/rewritten/{comparison,timing}.json.
+        # Pre-fix artifact preserved at
+        # baselines/lj_pair_force.pre-splicer-fix/ for reproducibility.
         path="test-kernels/cuda/mixed/lj_pair_force.cu",
         category="mixed",
         tolerance_kind="sig_figs",
-        tolerance_value=4,  # SUMMARY: rtol = 1e-4 on per-particle force
+        tolerance_value=6,  # Phase-1b re-run used --sig-figs 6
         per_variable={
-            # positions: keep
+            # positions: keep (unchanged from SUMMARY)
             "x": "keep", "y": "keep", "z": "keep",
             "xi": "keep", "yi": "keep", "zi": "keep",
-            # per-i accumulator: keep
+            # per-i accumulator: keep (unchanged from SUMMARY)
             "fxi": "keep", "fyi": "keep", "fzi": "keep",
-            # outputs: keep (feed downstream integration)
+            # outputs: keep (unchanged from SUMMARY)
             "fx_out": "keep", "fy_out": "keep", "fz_out": "keep",
-            # bounded after subtraction: downcast
-            "dx": "downcast", "dy": "downcast", "dz": "downcast",
-            "r2": "downcast",
-            "inv_r2": "downcast",
-            "inv_r6": "downcast",
-            "inv_r12": "downcast",
-            "fmag": "downcast",
-            # constants
-            "sigma": "downcast",
-            "epsilon": "downcast",
-            "rcut2": "downcast",
+            # REVISED downcast → keep: near-zero-crossing
+            # cancellation in fmag amplifies inv_r{2,6,12} errors.
+            # See header comment.
+            "dx": "keep", "dy": "keep", "dz": "keep",
+            "r2": "keep",
+            "inv_r2": "keep",
+            "inv_r6": "keep",
+            "inv_r12": "keep",
+            "fmag": "keep",
+            # REVISED downcast → keep for the ABI-affecting scalars:
+            # sigma / epsilon / rcut2 as kernel parameters are ABI
+            # breaks with no throughput benefit; empirically rejected
+            # at splice time by the lone-scalar-parameter refusal.
+            "sigma": "keep",
+            "epsilon": "keep",
+            "rcut2": "keep",
+            # s2 = sigma*sigma is the one downcast: positive-definite
+            # scalar computed once before the loop; its ~1e-7 float
+            # rounding enters as a common multiplicative factor in
+            # every inv_r2ᵏ so the (2·inv_r12 − inv_r6) ratio is
+            # unaffected at the zero-crossing. Empirically verified
+            # singleton + union pass, comparator 1536/1536.
             "s2": "downcast",
         },
     ),
