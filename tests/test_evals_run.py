@@ -26,6 +26,7 @@ import pytest
 from evals.layer2.expected import EXPECTED, ExpectedKernel
 from evals.layer2.run import (
     RunRecord,
+    _DEFAULT_TIMEOUT_SEC,
     _format_summary_line,
     _resolve_timeout_sec,
     _run_batch,
@@ -227,10 +228,16 @@ def test_select_kernels_empty_when_nothing_matches():
 
 
 def test_resolve_timeout_default(monkeypatch):
-    """Unset env var yields the 600s default."""
+    """Unset env var yields _DEFAULT_TIMEOUT_SEC.
+
+    The test compares against the module constant rather than a
+    hardcoded literal so future default bumps do not require test
+    edits — the invariant is "unset env var honors the constant",
+    not any specific number of seconds.
+    """
     monkeypatch.delenv("AGENT_PRECISION_ORCHESTRATOR_TIMEOUT_SEC",
                        raising=False)
-    assert _resolve_timeout_sec() == 600
+    assert _resolve_timeout_sec() == _DEFAULT_TIMEOUT_SEC
 
 
 def test_resolve_timeout_explicit(monkeypatch):

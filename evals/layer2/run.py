@@ -38,7 +38,7 @@ matches as a case-insensitive substring against the kernel path
 short strings).
 
 The per-kernel timeout is governed by the
-`AGENT_PRECISION_ORCHESTRATOR_TIMEOUT_SEC` env var (default 600s); it
+`AGENT_PRECISION_ORCHESTRATOR_TIMEOUT_SEC` env var (default 1800s); it
 is intentionally not a CLI flag, mirroring the env-var convention used
 by `AGENT_PRECISION_RUN_TIMEOUT_SEC` etc. in workflow/tools.py.
 
@@ -77,7 +77,7 @@ from .score import KernelResult, score_trace_file
 # Repo root: evals/layer2/run.py -> repo root is two parents up.
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
-_DEFAULT_TIMEOUT_SEC = 600
+_DEFAULT_TIMEOUT_SEC = 1800
 _TIMEOUT_ENV_VAR = "AGENT_PRECISION_ORCHESTRATOR_TIMEOUT_SEC"
 
 _VALID_CATEGORIES = ("lowerable", "needs_precision", "mixed")
@@ -255,7 +255,8 @@ def build_argv(
 
 
 def _resolve_timeout_sec() -> int:
-    """Read the per-kernel timeout from the env var, defaulting to 600s.
+    """Read the per-kernel timeout from the env var, defaulting to
+    _DEFAULT_TIMEOUT_SEC.
 
     A non-int or non-positive value is rejected with SystemExit(2) —
     same convention as `workflow/run.py` uses for its tolerance flags.
