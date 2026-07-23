@@ -18,3 +18,4 @@ error_dumps/
 baselines/
 kokkos/
 evals/results/
+poster-results/
