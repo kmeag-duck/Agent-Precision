@@ -399,6 +399,95 @@ def test_compile_baseline_driver_handles_missing_gxx(monkeypatch, tmp_path):
     assert result["artifacts"] == []
 
 
+# ---------- AGENT_PRECISION_KOKKOS_CXX override (CUDA-enabled Kokkos) ----------
+#
+# The Kokkos profile defaults to `g++` (matching v0 behavior on a CPU-
+# only OpenMP-host Kokkos install), and an operator running against a
+# CUDA-enabled Kokkos install overrides via
+# AGENT_PRECISION_KOKKOS_CXX=$KOKKOS_ROOT/bin/nvcc_wrapper. Same
+# call-time env-read + no-validation convention as
+# workflow.languages.omp_offload.CXX_ENV and .sycl.CXX_ENV.
+
+
+def test_compile_baseline_driver_kokkos_defaults_to_gpp_when_env_unset(
+    monkeypatch, tmp_path
+):
+    """With AGENT_PRECISION_KOKKOS_CXX unset, the Kokkos compile command starts with the literal `g++` (preserving v0 behavior on a CPU-only Kokkos install). The rest of the flag set (`-std=c++20`, `-fopenmp`, include/lib dirs, `-lkokkoscore`) is unaffected by the env-var addition."""
+    from workflow.languages.kokkos import CXX_ENV as KOKKOS_CXX_ENV
+
+    monkeypatch.chdir(tmp_path)
+    root = _make_fake_kokkos_root(tmp_path)
+    monkeypatch.setenv(KOKKOS_ROOT_ENV, str(root))
+    monkeypatch.delenv(KOKKOS_CXX_ENV, raising=False)
+    _stage_driver(tmp_path, "nbody_force")
+
+    captured = {}
+
+    class FakeProc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(cmd, capture_output, text, check):
+        captured["cmd"] = cmd
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = compile_baseline_driver("nbody_force", "kokkos")
+
+    assert result["status"] == "ok"
+    cmd = captured["cmd"]
+    assert cmd[0] == "g++"
+    # Sanity: the rest of the Kokkos flag set is still there (env-var
+    # addition must not accidentally strip any existing flag).
+    assert "-std=c++20" in cmd
+    assert "-fopenmp" in cmd
+    assert "-lkokkoscore" in cmd
+
+
+def test_compile_baseline_driver_kokkos_honors_cxx_env_override(
+    monkeypatch, tmp_path
+):
+    """AGENT_PRECISION_KOKKOS_CXX=<path> replaces the default `g++` in the Kokkos compile command. The env value is taken verbatim — there is no allowlist validation in `_cxx`; a typo (e.g. `gcc`) is caught downstream by subprocess.run's "not found on PATH" diagnostic or by the compiler's own "unrecognized option" error rather than by a Python-side check. This is the motivating case for the env-var: an operator on a CUDA-enabled Kokkos install points at `$KOKKOS_ROOT/bin/nvcc_wrapper` so device-touching translation units route through nvcc while the flag set stays identical."""
+    from workflow.languages.kokkos import CXX_ENV as KOKKOS_CXX_ENV
+
+    monkeypatch.chdir(tmp_path)
+    root = _make_fake_kokkos_root(tmp_path)
+    monkeypatch.setenv(KOKKOS_ROOT_ENV, str(root))
+    nvcc_wrapper = str(root / "bin" / "nvcc_wrapper")
+    monkeypatch.setenv(KOKKOS_CXX_ENV, nvcc_wrapper)
+    _stage_driver(tmp_path, "nbody_force")
+
+    captured = {}
+
+    class FakeProc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(cmd, capture_output, text, check):
+        captured["cmd"] = cmd
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = compile_baseline_driver("nbody_force", "kokkos")
+
+    assert result["status"] == "ok"
+    cmd = captured["cmd"]
+    assert cmd[0] == nvcc_wrapper
+    # The default `g++` must not appear anywhere in the argv (would
+    # indicate the override was ignored or that g++ leaked in via
+    # another flag). Bare-string match is safe: `-std=c++20` etc. do
+    # not contain `g++` as a substring.
+    assert "g++" not in cmd
+    # Same flag-preservation sanity as the default-path test.
+    assert "-std=c++20" in cmd
+    assert "-fopenmp" in cmd
+    assert "-lkokkoscore" in cmd
+
+
 # ---------- result schema invariants ----------
 
 

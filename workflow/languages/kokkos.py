@@ -23,12 +23,39 @@ from .base import LanguageProfile, make_error_result
 # or with a system-wide install.
 ROOT_ENV = "AGENT_PRECISION_KOKKOS_ROOT"
 
+# Environment variable that, when set, overrides the default Kokkos
+# host compiler driver. Intentionally namespaced under the project's
+# AGENT_PRECISION_* prefix so it does not collide with vendor knobs
+# like CXX (which build systems already overload heavily). The
+# motivating case is a Kokkos install with the CUDA backend enabled,
+# where the recommended host compiler is `nvcc_wrapper` (shipped as
+# `$KOKKOS_ROOT/bin/nvcc_wrapper` by both the Kokkos CMake install
+# and the CUDA-enabled Spack/Lmod modules on typical HPC hosts).
+# `nvcc_wrapper` is a g++-compatible front-end that scans the source
+# for Kokkos macros (KOKKOS_LAMBDA, KOKKOS_INLINE_FUNCTION, etc.) and
+# routes device-dispatched translation units through nvcc while
+# leaving host-only translation units on plain g++, so the same
+# -std=c++20 -O2 -fopenmp flag set continues to work unchanged. On a
+# CPU-only Kokkos install (the laptop's bundled ./kokkos/, or a
+# Spack/Lmod Kokkos with only the OpenMP host backend) leaving this
+# env unset falls back to plain g++, preserving v0 behavior verbatim.
+# A typo in the override is caught downstream by the compiler's own
+# "not found" or "unrecognized option" diagnostic rather than by a
+# Python-side allowlist (same convention as
+# workflow.languages.omp_offload.CXX_ENV and .sycl.CXX_ENV).
+CXX_ENV = "AGENT_PRECISION_KOKKOS_CXX"
+
 # Compile flags. C++20 is required by the baseline driver template; the
 # OpenMP host backend is what the Kokkos install in this repo was built
 # with, so -fopenmp is mandatory at link time. Kokkos here is shipped as
 # static archives (libkokkoscore.a, libkokkoscontainers.a), so no rpath
 # is needed and the resulting binary has no libkokkos* in its dynamic
 # NEEDED list.
+#
+# `CXX` is the DEFAULT host compiler; the effective compiler at call
+# time is `_cxx()`, which honors `CXX_ENV` when set. The literal
+# `CXX = "g++"` module-level constant is retained for backward
+# compatibility with tests that import it by name.
 CXX = "g++"
 CXX_STD = "-std=c++20"
 OPT_FLAGS = ("-O2", "-fopenmp")
@@ -54,13 +81,35 @@ QUAD_PROBE_TOKEN = "__float128"
 QUAD_LIB = "-lquadmath"
 
 
-def _build_compile_command(driver_src: Path, driver_bin: Path) -> list[str]:
-    """Assemble the g++ argv list for a Kokkos driver compile.
+def _cxx() -> str:
+    """Return the effective Kokkos host compiler, honoring CXX_ENV.
 
-    Reads AGENT_PRECISION_KOKKOS_ROOT at call time (not import time) so
-    a test that monkeypatches the env affects every subsequent compile
-    in the same process. Assumes preflight has already verified the
-    var is set and the directory layout looks Kokkos-shaped.
+    Read at call time, not at import time, so a test that
+    monkeypatches the env affects every subsequent compile in the
+    same process. Returns the literal env value when set (no
+    validation here — a typo surfaces as a "not found on PATH"
+    diagnostic from subprocess.run, which is a cleaner signal than a
+    Python-side allowlist). Falls back to `CXX` ("g++") when unset,
+    preserving v0 behavior on a CPU-only Kokkos install.
+    """
+    return os.environ.get(CXX_ENV, CXX)
+
+
+def _build_compile_command(driver_src: Path, driver_bin: Path) -> list[str]:
+    """Assemble the host-compiler argv list for a Kokkos driver compile.
+
+    Reads AGENT_PRECISION_KOKKOS_ROOT and AGENT_PRECISION_KOKKOS_CXX
+    at call time (not import time) so a test that monkeypatches either
+    env affects every subsequent compile in the same process. Assumes
+    preflight has already verified the root var is set and the
+    directory layout looks Kokkos-shaped.
+
+    The host compiler defaults to `g++` and is overridable via
+    CXX_ENV. On a CUDA-enabled Kokkos install the operator sets
+    `AGENT_PRECISION_KOKKOS_CXX=$KOKKOS_ROOT/bin/nvcc_wrapper`, which
+    is a g++-compatible front-end that dispatches device-touching
+    translation units through nvcc while leaving the same flag set
+    unchanged.
 
     Also peeks at `driver_src` to decide whether to append
     `-lquadmath` (the GNU libquadmath link) — needed when (and only
@@ -78,7 +127,7 @@ def _build_compile_command(driver_src: Path, driver_bin: Path) -> list[str]:
     if QUAD_PROBE_TOKEN in driver_src.read_text():
         extra_libs = extra_libs + (QUAD_LIB,)
     return [
-        CXX,
+        _cxx(),
         CXX_STD,
         *OPT_FLAGS,
         f"-I{include_dir}",
@@ -112,6 +161,14 @@ def _build_syntax_check_command(driver_src: Path) -> list[str] | None:
     -fopenmp stays in because Kokkos's OpenMP host backend uses
     `#pragma omp` directives that g++ warns about (and, with -Werror
     somewhere upstream, could fail) when the flag is missing.
+
+    Honors CXX_ENV the same way `_build_compile_command` does: the
+    parse-only check runs through whichever host compiler the operator
+    has configured (default `g++`, or `nvcc_wrapper` on a CUDA-enabled
+    Kokkos install). `nvcc_wrapper` passes `-fsyntax-only` through to
+    the underlying g++ (verified empirically — the wrapper's host-
+    only flag routing does not intercept it), so the parse-only
+    contract holds under both compilers.
     """
     kokkos_root = os.environ.get(ROOT_ENV)
     if not kokkos_root:
@@ -121,7 +178,7 @@ def _build_syntax_check_command(driver_src: Path) -> list[str] | None:
     if not include_dir.is_dir():
         return None
     return [
-        CXX,
+        _cxx(),
         CXX_STD,
         "-fsyntax-only",
         "-fopenmp",
@@ -733,6 +790,7 @@ KOKKOS_PROFILE = LanguageProfile(
 
 __all__ = [
     "ROOT_ENV",
+    "CXX_ENV",
     "CXX",
     "CXX_STD",
     "OPT_FLAGS",

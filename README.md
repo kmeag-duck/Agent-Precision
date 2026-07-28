@@ -141,6 +141,144 @@ installed on this host.
 See `AGENTS.md` for backend details (ports, model-id quirks, why both
 Argo paths exist).
 
+## Running on JLSE
+
+The workflow runs unmodified on a JLSE (Joint Laboratory for System
+Evaluation) A100 node via `qsub -I` (interactive PBS allocation).
+This is "Option A3" in the roadmap: the whole orchestrator, LLM
+calls, compile, and run all happen inside one interactive session
+on the compute node — HITL is preserved, and no per-tool scheduler
+submission is required. The only workflow change JLSE bring-up
+needed was the addition of `AGENT_PRECISION_KOKKOS_CXX` (see the
+env-var list below) so a CUDA-enabled Kokkos install can compile
+through `nvcc_wrapper` while the OpenMP-host path stays on `g++`.
+
+### One-time prep on laptop
+
+1. Transfer the repo (including `baselines/` if you want to reuse
+   prior traces — 4.3 GB as of this writing) and the Argo shim to
+   your JLSE home directory:
+
+   ```bash
+   rsync -avz --progress ~/Agent-Precision/ <user>@<jlse-login>:~/Agent-Precision/
+   rsync -avz ~/argo-shim-lite/ <user>@<jlse-login>:~/argo-shim-lite/
+   ```
+
+   JLSE home directories are 200 GB per the CELS docs, so the full
+   rsync fits comfortably.
+
+### Interactive session on JLSE
+
+2. Grab an A100 allocation. Consult `qstat -Q` and `pbsnodes -a`
+   inside a login-node session to find the correct queue and
+   project name for A100 hardware; the command shape is:
+
+   ```bash
+   qsub -I -A <project> -q <a100-queue> -l select=1:ngpus=1,walltime=04:00:00
+   ```
+
+3. On the compute node, initialize the JLSE Spack + Lmod module
+   tree (the interesting modules only appear after this):
+
+   ```bash
+   module load spack/linux-rhel7-x86_64
+   module avail kokkos 2>&1 | tee ~/jlse-modules-kokkos.txt
+   module avail cuda 2>&1 | tee ~/jlse-modules-cuda.txt
+   ```
+
+4. Probe the LLM plumbing route (result determines Step 5 branch):
+
+   ```bash
+   curl -v --max-time 10 https://apps.inside.anl.gov/ 2>&1 | head -30
+   curl -v --max-time 10 https://homes.cels.anl.gov/ 2>&1 | head -30
+   ```
+
+5. Bring up the Argo tunnel. **Path A** (compute node has outbound
+   HTTPS — Step 4 succeeded): run the tunnel + shim locally on the
+   compute node, same shape as `scripts/run-argo.sh` does on the
+   laptop. **Path B** (compute node has no outbound — Step 4 failed):
+   start the tunnel + shim on a JLSE login node, then reverse-forward
+   the shim's port from the compute node back to the login node
+   (`ssh -f -N -R 8083:127.0.0.1:8083 <jlse-login>`). Either way,
+   export:
+
+   ```bash
+   export ANTHROPIC_BASE_URL=http://127.0.0.1:8083/argoapi/
+   export ANTHROPIC_AUTH_TOKEN=$USER
+   ```
+
+6. Python env + tests:
+
+   ```bash
+   cd ~/Agent-Precision
+   module load python/3.10   # or whichever module Step 3 surfaced
+   python3 -m venv .venv-jlse
+   source .venv-jlse/bin/activate
+   pip install -r requirements.txt
+   python -m pytest -q       # S1: all tests pass
+   ```
+
+7. Set the A100-specific env vars for CUDA compiles:
+
+   ```bash
+   export AGENT_PRECISION_CUDA_ARCH=sm_80        # A100
+   export AGENT_PRECISION_RUN_TIMEOUT_SEC=120    # generous first-run
+   ```
+
+8. If Step 3 surfaced a CUDA-enabled Kokkos module (or you built one
+   from source with `-DKokkos_ENABLE_CUDA=ON
+   -DKokkos_ENABLE_OPENMP=ON -DKokkos_ARCH_AMPERE80=ON`), also
+   export:
+
+   ```bash
+   module load kokkos/<name-with-cuda>
+   export AGENT_PRECISION_KOKKOS_ROOT=$KOKKOS_ROOT
+   export AGENT_PRECISION_KOKKOS_CXX=$KOKKOS_ROOT/bin/nvcc_wrapper
+   ```
+
+   `AGENT_PRECISION_KOKKOS_CXX` defaults to `g++` (v0 behavior) when
+   unset, so a CPU-only Kokkos install needs no change; the
+   `nvcc_wrapper` override routes device-touching translation units
+   through nvcc while leaving the same `-std=c++20 -fopenmp` flag
+   set unchanged.
+
+### Smoke tests on JLSE
+
+9. CUDA smoke (achieves S3):
+
+   ```bash
+   python -m workflow.run test-kernels/cuda/lowerable/saxpy.cu --sig-figs 6 --auto
+   ```
+
+   Expected: 8/8 probe cells pass, comparator ok on 1M/1M outputs,
+   `measure_speedup` writes `baselines/saxpy/rewritten/timing.json`.
+
+10. Kokkos smoke (achieves S4) once Step 8's Kokkos env vars are set:
+
+    ```bash
+    python -m workflow.run test-kernels/kokkos/mixed/nbody_force.cpp --sig-figs 6 --auto
+    ```
+
+    Uses `nbody_force.cpp.testconfig.json` for reproducible inputs.
+    Quad-oracle probe cell runs host-side via g++ + libquadmath;
+    other probe cells and the rewritten driver dispatch through
+    Kokkos-CUDA on the A100.
+
+### Known limitations of the A3 shape
+
+- The whole workflow has to fit inside the interactive allocation's
+  walltime. A 4-hour allocation covers one CUDA smoke + one Kokkos
+  smoke comfortably; longer sweeps or batch-mode `--auto` runs over
+  the whole `test-kernels/` corpus want a proper batch job script
+  (deferred; see "Roadmap" for the async per-tool submission story).
+- Duo prompts once at Argo tunnel setup — you need an approvable
+  device reachable during Step 5.
+- If neither Path A nor Path B works in Step 5 (compute node has
+  no outbound *and* no SSH-back to login node), Option A3 is
+  blocked; fall back to Option A1 (batch job with pre-baked
+  artifacts) or wait for Option B (per-tool scheduler submission,
+  deferred).
+
 ## Workflow
 
 Intended happy path through the orchestrator for a Kokkos `.cpp`
@@ -616,7 +754,7 @@ is a reader-facing summary.
 
 1. **Kernel-extractor agent** — slice a single target kernel out of a multi-kernel translation unit before analyst + baseline_harness run.
 2. **Smoke-validation of HIP / SYCL / OpenMP-offload profiles** — these three profiles ship unit-tested only (no `hipcc` / `icpx` / `clang++ -fopenmp -fopenmp-targets=...` toolchain was available at implementation time). Once a host with the respective runtime is available, drive a real kernel through the full chain and confirm the comparator step passes; remove the "unit-tested but not smoke-validated" caveat from `AGENTS.md`.
-3. **JLSE / async toolchain migration** — move compile/run to a remote scheduler.
+3. **JLSE / async toolchain migration** — Option A (interactive `qsub -I` session, workflow unchanged) landed for A100 as of 2026-07-28; see "Running on JLSE" section above. Option B (async per-tool scheduler submission for scaling beyond interactive walltime) remains future work.
 4. **Emulation library upgrade** — replace inline Dekker float-float with a vendored header.
 5. **Corpus evaluation hardening** — the Layer 2 harness (`evals/layer2/`) already runs the workflow across the 17-kernel `test-kernels/` corpus in `--auto` mode and grades the resulting `orchestrator_trace.jsonl` against the per-variable ground truth in `evals/layer2/expected.py`. Open work: extend the scorer to cover the rework / precision_budget axes (today it grades per-variable verdicts and finish-gate status); add a "regression vs baseline" comparator that takes two `results.json` runs as input; explore re-running the harness under non-default `AGENT_PRECISION_ANALYST_K` / `AGENT_PRECISION_VERIFIER_K` settings to measure the ensemble's effect on judgment quality.
 
