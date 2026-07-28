@@ -39,20 +39,32 @@ git log --oneline -3    # confirm the JLSE bring-up commit is present
 python -m pytest -q     # sanity: 788 passed on laptop
 ```
 
-Rsync the repo (respects `.gitignore`, but explicitly includes
-`baselines/` and `kokkos/` which ARE gitignored — you want them):
+Rsync the repo. Explicit excludes are needed because rsync does NOT
+honor `.gitignore` by default, and several gitignored directories are
+either huge regeneratable output (`poster-results/`, `evals/results/`)
+or Python-version-specific (`.venv*/`) or laptop-only tooling state
+(`.opencode/`, `error_dumps/`). `baselines/` and `kokkos/` ARE
+gitignored but we DO want them on JLSE, so they are deliberately NOT
+excluded:
 
 ```bash
 rsync -avz --progress \
   --exclude='.git/' \
   --exclude='.venv*/' \
-  --exclude='evals/results/' \
   --exclude='__pycache__/' \
+  --exclude='evals/results/' \
+  --exclude='poster-results/' \
+  --exclude='error_dumps/' \
+  --exclude='.opencode/' \
   ~/Agent-Precision/ <user>@<jlse-login>:~/Agent-Precision/
 ```
 
-Total transfer ~4.5 GB (repo + baselines + kokkos install). JLSE home
-is 200 GB per CELS docs, so this fits ~40x over.
+Total transfer ~4.5 GB with the exclude list above (baselines 4.3 GB
++ kokkos 28 MB + code + docs + tests ~5 MB). Without the excludes,
+the laptop tree is ~8 GB (`poster-results/` adds 2.9 GB, `.git/` adds
+900 MB, `error_dumps/` adds 8.5 MB). Either fits comfortably under
+JLSE's 200 GB home quota, but the exclude list matters for rsync
+diff-and-retransmit speed on subsequent updates.
 
 Also rsync the Argo shim (needed if you take Path B in Step 4):
 
@@ -64,13 +76,25 @@ rsync -avz ~/argo-shim-lite/ <user>@<jlse-login>:~/argo-shim-lite/
 
 ```bash
 ssh <user>@<jlse-login>
-du -sh ~/Agent-Precision   # expect ~4.5G
+du -sh ~/Agent-Precision   # expect ~4.5 GB with the exclude list above
 ls ~/Agent-Precision/baselines/ | head -5   # expect kernel-stem dirs
 ls ~/argo-shim-lite/claude-argo-proxy.py    # expect exists, ~2 KB
 ```
 
-If `baselines/` didn't come across, the rsync excluded it — re-run
-without the `--exclude=' .git/'` typo or double-check your exclude list.
+If you see ~7 GB instead of ~4.5 GB, you rsync'd without excluding
+`poster-results/` (2.9 GB of archived poster runs) or `error_dumps/`
+(8.5 MB of argo-proxy failure dumps). Both are safe to delete on JLSE
+(regeneratable historical output, unused by the workflow):
+
+```bash
+rm -rf ~/Agent-Precision/poster-results ~/Agent-Precision/error_dumps
+rm -rf ~/Agent-Precision/.opencode   # if present
+du -sh ~/Agent-Precision             # should now show ~4.5 GB
+```
+
+If `baselines/` didn't come across, the rsync excluded it by mistake —
+re-run and double-check your exclude list does NOT contain `baselines/`
+or `kokkos/`.
 
 ---
 
