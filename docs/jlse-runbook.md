@@ -100,22 +100,32 @@ or `kokkos/`.
 
 ## Step 2: qsub -I allocation
 
-From the JLSE login node, find the A100 queue and project:
+From the JLSE login node, find the queue name. JLSE uses PBS Pro, but
+`pbsnodes` lives in `/opt/pbs/bin/` and is NOT on the default `$PATH`
+for regular users. Use `qstat` instead — it's in `/usr/bin/`:
 
 ```bash
-qstat -Q                         # list queues
-pbsnodes -a | grep -B1 A100      # find A100-tagged nodes
+qstat -Q                         # list all queues
+qstat -Bf 2>&1 | head -30        # server info + node-queue mapping
+qstat -Q gpu_a100                # queue-specific status incl. jobs waiting
 ```
+
+The JLSE-A100 queue is named `gpu_a100` (confirmed 2026-07-28). If your
+CELS project has access to other JLSE testbeds (Polaris, Sunspot, etc.)
+the queue name will differ — inspect `qstat -Q` output.
 
 Grab an allocation. 4 hours covers S1..S4 comfortably:
 
 ```bash
-qsub -I -A <project> -q <a100-queue> -l select=1:ngpus=1,walltime=04:00:00
+qsub -I -A <project> -q gpu_a100 -l select=1:ngpus=1,walltime=04:00:00
 ```
 
-`<project>` is your CELS project name; `<a100-queue>` is whatever
-`qstat -Q` surfaced for A100 hardware (varies per JLSE testbed —
-common names include `arcticus`, `polaris-a100`, `gpu_a100`).
+`<project>` is your CELS project name.
+
+**Note on queue depth:** JLSE-A100 has 2 nodes (`gpu06`, `gpu07`) as
+of 2026-07-28. If both are `allocated` when you submit, your `qsub -I`
+will block in queue until one frees. Estimate wait time before
+submitting with `qstat -Q gpu_a100` (shows queued job count).
 
 **Checkpoint 2a:** once the shell prompt returns (may take seconds to
 minutes depending on queue depth), you're on a compute node. Sanity-check:

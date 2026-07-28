@@ -169,12 +169,14 @@ through `nvcc_wrapper` while the OpenMP-host path stays on `g++`.
 
 ### Interactive session on JLSE
 
-2. Grab an A100 allocation. Consult `qstat -Q` and `pbsnodes -a`
-   inside a login-node session to find the correct queue and
-   project name for A100 hardware; the command shape is:
+2. Grab an A100 allocation. JLSE uses PBS Pro; the A100 queue is
+   named `gpu_a100` (backed by two nodes as of 2026-07-28). Note
+   that `pbsnodes` is not on the default `$PATH` — use `qstat -Q`
+   to list queues instead. See `docs/jlse-runbook.md` Step 2 for the
+   full recipe.
 
    ```bash
-   qsub -I -A <project> -q <a100-queue> -l select=1:ngpus=1,walltime=04:00:00
+   qsub -I -A <project> -q gpu_a100 -l select=1:ngpus=1,walltime=04:00:00
    ```
 
 3. On the compute node, initialize the JLSE Spack + Lmod module
