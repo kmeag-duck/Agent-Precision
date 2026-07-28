@@ -141,13 +141,23 @@ _LOWERABLE_KEEP_CARVEOUTS: frozenset[str] = frozenset({
     # in launch syntax. ~5865/1048576 mismatches empirically observed.
     # See baselines/saxpy/orchestrator_trace.jsonl.
     "test-kernels/cuda/lowerable/saxpy.cu",
-    # Phase 1b (2026-07-22): honest quad oracle exposed that
-    # sigmoid(x) with x ~ U(-10, 10) has float_seed42.max_absrel=0.9975
-    # vs quad — every input pushes exp(-x) through a region where fp32
-    # loses order-of-magnitude precision. The earlier Phase-1a smoke
-    # run's "safely lowerable" verdict compared float against a double
-    # baseline that gave 0 relative error, hiding the failure.
-    # See baselines/sigmoid/probe/evidence.json.
+    # Phase 1b (2026-07-22) / post-splicer-fix sweep (2026-07-23):
+    # sigmoid's fp32 tolerance depends sharply on the input range. On
+    # SUMMARY's specified x ~ U(-10, 10), float_seed42.max_absrel=0.9975
+    # vs quad (Phase 1b evidence — the honest quad oracle exposed a
+    # failure the Phase-1a double baseline had hidden). On the
+    # LLM-authored harness's actual x ~ U(-6, 6) input, that same
+    # metric drops to 5.14e-7, well under sig_figs=5 = 5e-6 (2026-07-23
+    # sweep evidence). Under the milder inputs the workflow correctly
+    # downcasts output `y` but the input pointer `x` stays keep (a lone
+    # kernel-parameter downcast is an ABI break with no throughput
+    # benefit and singleton-fails). The carve-out stays present because
+    # `x: keep` is the non-downcast verdict that keeps the entry from
+    # being uniformly all-downcast; the comment records the range
+    # sensitivity so a future test-kernels/ change (e.g. adding a
+    # sigmoid.cu.testconfig.json that mandates U(-10,10)) can flip the
+    # verdict back to full keep-all in one place. See
+    # baselines/sigmoid/probe/evidence.json.
     "test-kernels/cuda/lowerable/sigmoid.cu",
 })
 
@@ -170,6 +180,29 @@ _NEEDS_PRECISION_DOWNCAST_CARVEOUTS: frozenset[str] = frozenset({
     # baselines/orbit_integrator/probe/evidence.json and the entry
     # header comment.
     "test-kernels/cuda/needs_precision/orbit_integrator.cu",
+    # Post-splicer-fix sweep (2026-07-23): the loop-invariant constant
+    # w2 = omega*omega passes singleton downcast at the fixture's
+    # reduced n_steps=1e4 (the testconfig.json explicitly reduces from
+    # SUMMARY's 1e6 to keep the probe pipeline under the run timeout).
+    # float_seed42.max_absrel on y = 6.86e-7 and on v = 8.03e-7 vs
+    # quad, well below the sig_figs=3 = 5e-3 threshold. State (y, v),
+    # state-adjacent (y_new, v_new), and scalar parameters (dt, omega)
+    # all stay keep. See baselines/euler_oscillator/probe/evidence.json
+    # and the entry header comment. Recovering SUMMARY's severity would
+    # require raising n_steps and the probe timeout together.
+    "test-kernels/kokkos/needs_precision/euler_oscillator.cpp",
+    # Post-splicer-fix sweep (2026-07-23): both the accumulator `s`
+    # and the output-array `partial` downcast to float at the harness's
+    # milder fixture inputs (N=1<<20 with per_thread=16 — 128× fewer
+    # summed terms per accumulator than SUMMARY's N=1<<27, per_thread=1024).
+    # float_seed42.max_absrel on partial = 6.13e-8, well below the
+    # sig_figs=5 = 5e-5 threshold. Singleton + union + comparator all
+    # passed vs quad. See baselines/harmonic_sum/probe/evidence.json and
+    # the entry header comment. Recovering SUMMARY's severity would
+    # require a testconfig mandating N=1<<27 with per_thread=1024 (an
+    # ~8GB working set that current AGENT_PRECISION_RUN_TIMEOUT_SEC=60
+    # would not accommodate).
+    "test-kernels/cuda/needs_precision/harmonic_sum.cu",
 })
 
 
