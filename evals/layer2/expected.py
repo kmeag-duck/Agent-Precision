@@ -119,6 +119,33 @@ Methodology note (added after the vector_add finding):
       the workflow's numerical machinery is validated but a
       compute-bound kernel with a large downcastable working set
       would be needed to demonstrate a real speedup story.
+    - CONFIRMED / REVISED (2026-07-28 rerun,
+      evals/results/20260728_fnof_reruns/): the four Mixed-category
+      kernels that timed out (nbody_force) or crashed at returncode=1
+      (pic_deposition, lj_pair_force.cu, heat_equation_step.cu) in the
+      2026-07-23 full-17 sweep were re-run individually with no
+      wall-clock ceiling. All four finished cleanly (comparator
+      status=ok, timing.json emitted). Verdicts vs. the existing
+      entries: heat_equation_step.cu unchanged (all-keep confirmed);
+      nbody_force flipped xi/yi/zi keep→downcast (positions U(-1,1) at
+      N=1024, singleton and union both passed) and m/G/eps/dt
+      downcast→keep — a mix of splicer-shape refusals (m, G, dt are on
+      multi-var parameter declaration lines the alias splicer can't
+      target) and one empirical failure (eps returned VERDICT: fail
+      as a singleton scalar-parameter downcast, per the lone-scalar
+      refusal from commit 446a630); pic_deposition kept 8 more vars
+      than SUMMARY prescribes (large-origin=1e6 coordinate arithmetic
+      makes the entire xp/yp/zp/fx/fy/fz/wx/wy/wz chain float-hostile;
+      qp+w survive as the two downcasts); lj_pair_force flipped
+      s2 downcast→keep (variable_analyst returned keep this run and s2
+      was never tested — different empirical branch from the
+      2026-07-24 Phase 1b re-verify where variable_analyst chose
+      downcast and singleton+union passed; both runs finished with
+      comparator ok, so both are defensible under temperature=0.7
+      diversity — see the per-kernel comment below and the
+      lj_pair_force follow-up note). See baselines/{nbody_force,
+      pic_deposition,lj_pair_force,heat_equation_step}/
+      orchestrator_trace.jsonl.
     - REVISED (post-splicer-fix sweep, 2026-07-23,
       evals/results/20260723_114501_full17_post_splicerfix/): three
       kernels flipped keep→downcast on variables the SUMMARY-derived
@@ -495,19 +522,61 @@ _NEEDS_PRECISION: list[ExpectedKernel] = [
 
 _MIXED: list[ExpectedKernel] = [
     ExpectedKernel(
+        # REVISED: empirical (2026-07-28 rerun,
+        # evals/results/20260728_fnof_reruns/01_nbody_force.log).
+        # Original SUMMARY-derived entry marked m/G/eps/dt as
+        # downcast and xi/yi/zi as keep. The empirical per-variable
+        # pipeline at N=1024, positions U(-1,1), sig_figs=4 disagreed
+        # in six ways:
+        #   xi/yi/zi keep → downcast: positions are O(1) with well-
+        #     separated neighbors (min pairwise distance ~0.1 >> float
+        #     ULP ~1e-7), so casting the current-particle position
+        #     read to float is safe. Singleton and union tests both
+        #     passed; comparator 6144/6144 at sig_figs=4.
+        #   m/G/dt downcast → keep: these appear on multi-var
+        #     parameter declaration lines (e.g. `Kokkos::View<double*>
+        #     x, y, z` and multi-arg function signature) that the
+        #     alias splicer's parameter-line regex can't target.
+        #     Reported as splicer status='error', which the pipeline
+        #     conservatively demotes to keep. This is an infrastructure
+        #     limitation, not a numerical finding — a fixed splicer
+        #     might well accept them; see the "loose end" note in the
+        #     2026-07-28 handoff summary.
+        #   eps downcast → keep: singleton returned VERDICT: fail as
+        #     a lone scalar-parameter downcast (rejected at splice
+        #     time per commit 446a630 — ABI break with no throughput
+        #     benefit). Same rationale as lj_pair_force's sigma/
+        #     epsilon/rcut2 rejection.
+        # Final empirical downcast set (11): eps2, xi, yi, zi, dx,
+        # dy, dz, r2, inv_r, inv_r3, s. All 6144 outputs agreed at
+        # sig_figs=4. Speedup 0.544x ± 0.019 (CPU/OpenMP; expected
+        # non-speedup — float32/double64 have identical throughput on
+        # x86 AVX and the cast boundaries add latency; the intended
+        # gain is on GPU backends). See
+        # baselines/nbody_force/orchestrator_trace.jsonl and
+        # baselines/nbody_force/rewritten/{comparison,timing}.json.
         path="test-kernels/kokkos/mixed/nbody_force.cpp",
         category="mixed",
         tolerance_kind="sig_figs",
         tolerance_value=4,  # SUMMARY: rtol = 1e-4 on per-particle r and v
         per_variable={
-            # positions: keep (pairwise difference of nearby coords)
+            # positions (View reads): keep — view-level I/O stays
+            # double; the per-loop scalar reads xi/yi/zi cast at
+            # point of use.
             "x": "keep", "y": "keep", "z": "keep",
-            "xi": "keep", "yi": "keep", "zi": "keep",
-            # force accumulators: keep (residual of opposing pulls)
+            # REVISED keep → downcast: per-particle position reads
+            # cast to float. Positions U(-1,1) at N=1024 have
+            # min-pair-distance ~0.1 >> float ULP; empirically safe.
+            "xi": "downcast", "yi": "downcast", "zi": "downcast",
+            # force accumulators: keep (N=1024 signed-sum
+            # cancellation; float probe shows ~4.5e-4 max_absrel).
             "ax": "keep", "ay": "keep", "az": "keep",
             # velocities omitted: SUMMARY flags as borderline
-            # mass: downcast
-            "m": "downcast",
+            # REVISED downcast → keep: splicer refuses multi-var
+            # parameter declaration lines (m is one of several View
+            # params on the same declaration; G/dt are lone scalar
+            # parameters). Infrastructure limitation, not numerical.
+            "m": "keep",
             # pairwise deltas: downcast (bounded dynamic range)
             "dx": "downcast", "dy": "downcast", "dz": "downcast",
             # bounded local arithmetic
@@ -515,14 +584,46 @@ _MIXED: list[ExpectedKernel] = [
             "inv_r": "downcast",
             "inv_r3": "downcast",
             "s": "downcast",
-            # constants
-            "G": "downcast",
-            "eps": "downcast",
+            # REVISED downcast → keep: G/dt are lone scalar
+            # parameters (splicer refuses per commit 446a630);
+            # eps failed the singleton VERDICT: fail check.
+            "G": "keep",
+            "eps": "keep",
             "eps2": "downcast",
-            "dt": "downcast",
+            "dt": "keep",
         },
     ),
     ExpectedKernel(
+        # REVISED: empirical (2026-07-28 rerun,
+        # evals/results/20260728_fnof_reruns/02_pic_deposition.log).
+        # SUMMARY-derived entry marked the fractional offsets (fx/fy/fz),
+        # weight arrays (wx/wy/wz), inverse cell size (dx_inv), and
+        # charge array q as downcast, plus qp and w. The empirical
+        # per-variable pipeline reduces the downcast set to just qp+w
+        # because the testconfig fixture uses origin=(1e6, 1e6, 1e6)
+        # with particles in [1e6, 1e6+63]: the origin-subtraction chain
+        # px→xp→fx (and the parallel y/z chains) requires sub-cell
+        # resolution that float ULP at magnitude 1e6 (~0.0625) simply
+        # cannot provide. Singleton test on px reported ~1% of
+        # particles map to wrong grid cells; xp singleton failed
+        # 10/262144 at the 1e-6 threshold. Downstream vars (fx/fy/fz
+        # and wx/wy/wz) inherit those failures because they're
+        # computed from the failed xp/yp/zp. dx_inv and q are lone
+        # scalar / kernel parameters (splicer refuses per commit
+        # 446a630 for the scalar, and array-parameter downcast has
+        # ABI implications). w was itself demoted from downcast to
+        # keep by the verifier's edge-cases lens (multi-particle
+        # accumulation risk); the finalizer eventually returned it to
+        # downcast after the union test passed at sig_figs=5.
+        # Final empirical downcast set (2): qp, w. Comparator
+        # 262144/262144 at sig_figs=5. Speedup 1.005x ± 0.032 (noise
+        # — the kernel is dominated by atomic_add bandwidth, not
+        # per-particle scalar arithmetic). This is a *fixture*
+        # finding tied to the large-origin config; a testconfig with
+        # origin=0 would likely recover most of SUMMARY's original
+        # downcast set. See
+        # baselines/pic_deposition/orchestrator_trace.jsonl and
+        # baselines/pic_deposition/rewritten/{comparison,timing}.json.
         path="test-kernels/kokkos/mixed/pic_deposition.cpp",
         category="mixed",
         # SUMMARY: per-cell rtol = 1e-5. Total-charge rtol = 1e-10 is a
@@ -543,18 +644,24 @@ _MIXED: list[ExpectedKernel] = [
             "origin_z": "keep",
             # grid density: keep (many-particle accumulator)
             "rho": "keep",
-            # fractional offsets: downcast (bounded in [0, 1])
-            "fx": "downcast", "fy": "downcast", "fz": "downcast",
-            # weights and per-particle charge: downcast (bounded)
-            "wx": "downcast", "wy": "downcast", "wz": "downcast",
+            # REVISED downcast → keep: fx/fy/fz are derived from
+            # failed xp/yp/zp (large-origin cancellation); wx/wy/wz
+            # inherit from failed fx/fy/fz. See header comment.
+            "fx": "keep", "fy": "keep", "fz": "keep",
+            "wx": "keep", "wy": "keep", "wz": "keep",
+            # per-particle scalars: only these two survive.
             "w": "downcast",
             "qp": "downcast",
-            # inverse cell size: downcast
-            "dx_inv": "downcast",
-            # `q` is the input charge array; SUMMARY lists qp (the
-            # per-particle scalar copy) only. Score q as well since
-            # it's the same data.
-            "q": "downcast",
+            # REVISED downcast → keep: lone scalar parameter
+            # (splicer refuses per commit 446a630).
+            "dx_inv": "keep",
+            # REVISED downcast → keep: array kernel parameter; per-
+            # element rounding compounds through the atomic_add
+            # accumulator. qp (the per-particle copy) is the
+            # surviving downcast — a single float rounding widened
+            # back to double before the weight product and rho
+            # update.
+            "q": "keep",
         },
     ),
     ExpectedKernel(
@@ -620,13 +727,32 @@ _MIXED: list[ExpectedKernel] = [
             "sigma": "keep",
             "epsilon": "keep",
             "rcut2": "keep",
-            # s2 = sigma*sigma is the one downcast: positive-definite
-            # scalar computed once before the loop; its ~1e-7 float
-            # rounding enters as a common multiplicative factor in
-            # every inv_r2ᵏ so the (2·inv_r12 − inv_r6) ratio is
-            # unaffected at the zero-crossing. Empirically verified
-            # singleton + union pass, comparator 1536/1536.
-            "s2": "downcast",
+            # REVISED downcast → keep (2026-07-28 rerun,
+            # evals/results/20260728_fnof_reruns/03_lj_pair_force.log):
+            # this run's variable_analyst returned action='keep' for
+            # s2 (rationale: "12th-power amplification too risky")
+            # so s2 was never dispatched to test_variable_downcast;
+            # the empirical pipeline reduced the downcast set to ∅
+            # and the finalizer confirmed all-keep. Comparator still
+            # 1536/1536 at sig_figs=6, speedup 1.003 ± 0.014 (noise,
+            # kernel unchanged). This is a genuine run-to-run
+            # divergence from the 2026-07-24 Phase 1b re-verify,
+            # which had variable_analyst return 'downcast' for s2 →
+            # singleton passed → union passed → s2 downcast survived.
+            # Both traces reach compare_outputs status=ok; the
+            # divergence lives entirely at the variable_analyst LLM
+            # call (temperature=0.7 diversity). Grounding the entry
+            # in the stricter/more-conservative of the two observed
+            # empirical outcomes; the 2026-07-24 re-verify entry
+            # above is preserved as historical context. If we want
+            # to quantify the s2 keep/downcast split rigorously,
+            # evals/consistency/ over lj_pair_force N times is the
+            # follow-up. See
+            # baselines/lj_pair_force/orchestrator_trace.jsonl for
+            # today's trace; the pre-rerun trace lives at
+            # baselines/lj_pair_force.pre-splicer-fix/ (2026-07-24
+            # verdict was s2=downcast).
+            "s2": "keep",
         },
     ),
     ExpectedKernel(
@@ -648,6 +774,16 @@ _MIXED: list[ExpectedKernel] = [
         # comparator passed 262144/262144 under sig_figs=5. See
         # baselines/heat_equation_step/probe/evidence.json and
         # baselines/heat_equation_step/orchestrator_trace.jsonl.
+        # CONFIRMED (2026-07-28 rerun,
+        # evals/results/20260728_fnof_reruns/04_heat_equation_step.log):
+        # re-run individually with no wall-clock ceiling, all six
+        # variables again kept as double after four finalizer cycles
+        # (verifier's edge_cases lens raised overflow concerns on
+        # delta-only downcast rounds; the finalizer ultimately
+        # converged to all-keep). Comparator 262144/262144 at
+        # sig_figs=5; speedup 1.16 ± 0.44 (noise; memory-bandwidth-
+        # bound stencil). Verdict matches the Phase 1b entry
+        # verbatim.
         path="test-kernels/cuda/mixed/heat_equation_step.cu",
         category="mixed",
         tolerance_kind="sig_figs",
